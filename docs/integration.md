@@ -62,7 +62,8 @@ awp resolve --config awp.json [--overlay layer.json]... --profile reviewer
     "effort": "high",
     "instructions": "Review carefully.\n\nCheck the diff.",
     "instructionMode": "first-turn"
-  }
+  },
+  "mechanisms": { /* semantic CAwP declarations, or null */ }
 }
 ```
 
@@ -80,6 +81,45 @@ Host-side flow against `a4aa serve` (`a4aa.v1`, see the a4aa sidecar doc):
 `awp validate` checks the same load + layering rules ahead of time, and
 `awp run` executes one profiled turn end-to-end in-process — a fast smoke
 check for a document before wiring it into a service.
+
+## Mechanism materialization (CAwP)
+
+A profile's `mechanisms` section declares hooks, rules, skills, commands,
+subagents, plugins, permissions, config-file MCP servers and native-profile
+selection in semantic, dialect-free form. `a4aa`'s adaptation layer
+translates them per agent:
+
+```sh
+awp materialize --config awp.json --profile reviewer --dialect codex
+```
+
+```jsonc
+{
+  "dialect": "codex",
+  "artifacts": [
+    {"scope": "user-home", "path": ".codex/hooks.json",
+     "content": "{…}", "mode": {"kind": "json-merge", "at": "hooks"}},
+    {"scope": "project",   "path": "AGENTS.md",
+     "content": "Never guess.\n", "mode": {"kind": "managed-block", "name": "core"}},
+    {"scope": "user-home", "path": ".codex/agents/verifier.toml",
+     "content": "…", "mode": {"kind": "create"}}
+  ],
+  "report": [
+    {"item": "hooks.session-start", "support": "native"},
+    {"item": "permissions", "support": "unsupported",
+     "note": "no declarative permission surface for this dialect"}
+  ]
+}
+```
+
+The plan is data only — the host decides the scope roots (`user-home`,
+`project`) and whether to write. `json-merge` artifacts deep-merge
+`content` (a JSON object) into the target file's document at `at`;
+`managed-block` content belongs inside
+`<!-- awp-managed:<name> -->` … `<!-- /awp-managed:<name> -->` markers in
+the target file; `create` writes verbatim. Items the agent cannot express
+come back `unsupported` with a note rather than failing the plan — the
+host decides whether a missing mechanism is fatal.
 
 ## Typical shapes
 

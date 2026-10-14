@@ -11,6 +11,11 @@
 //!   `[--cwd <dir>] [--prompt <text> | --prompt-file <path|->]` — one
 //!   session, one prompt; events stream to stderr, the agent's full text
 //!   lands on stdout.
+//! - `awp materialize --config <path> [--overlay <path>]...`
+//!   `(--profile <id> | --binding <name>) --dialect <agent>` — translate the
+//!   profile's `mechanisms` declarations into an `a4aa` adaptation plan:
+//!   the artifacts to write plus a per-item native/adapted/unsupported
+//!   report. Emits the plan as JSON; nothing is written to disk.
 //! - `awp fixture-agent` — a deterministic ACP echo agent for tests and
 //!   registry smoke checks. Echoes each prompt back as message chunks;
 //!   `wait-for-cancel` streams until `session/cancel`.
@@ -30,11 +35,13 @@ async fn main() {
         Some("validate") => validate().await,
         Some("resolve") => resolve().await,
         Some("run") => run().await,
+        Some("materialize") => materialize().await,
         Some("fixture-agent") => fixture_agent(),
         _ => {
             eprintln!(
                 "usage: awp inspect|validate|resolve|run --config <path> [--overlay <path>]... \
-                 [--profile <id> | --binding <name>]\n       awp fixture-agent"
+                 [--profile <id> | --binding <name>]\n       awp materialize --config <path> \
+                 (--profile <id> | --binding <name>) --dialect <agent>\n       awp fixture-agent"
             );
             2
         }
@@ -53,6 +60,7 @@ struct Args {
     cwd: Option<PathBuf>,
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
+    dialect: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -71,6 +79,7 @@ fn parse_args() -> Result<Args, String> {
             "--cwd" => args.cwd = Some(PathBuf::from(value("--cwd")?)),
             "--prompt" => args.prompt = Some(value("--prompt")?),
             "--prompt-file" => args.prompt_file = Some(PathBuf::from(value("--prompt-file")?)),
+            "--dialect" => args.dialect = Some(value("--dialect")?),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -206,10 +215,46 @@ async fn resolve() -> i32 {
             "instructions": profile.instructions.clone(),
             "instructionMode": profile.instruction_mode,
         },
+        "mechanisms": serde_json::to_value(&profile.mechanisms).unwrap_or(Value::Null),
     });
     println!(
         "{}",
         serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
+    0
+}
+
+// ----------------------------- materialize -------------------------------
+
+async fn materialize() -> i32 {
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(e) => return usage_error(&e),
+    };
+    let dialect: a4aa::AgentDialect = match args
+        .dialect
+        .as_deref()
+        .ok_or("--dialect is required".to_owned())
+        .and_then(|name| {
+            serde_json::from_value(Value::String(name.to_owned()))
+                .map_err(|_| format!("unknown dialect: {name}"))
+        }) {
+        Ok(dialect) => dialect,
+        Err(e) => return usage_error(&e),
+    };
+    let registry = match load_registry(&args) {
+        Ok(registry) => registry,
+        Err(e) => return failure(&e),
+    };
+    let agent = match select_agent(&args, &registry) {
+        Ok(agent) => agent,
+        Err(e) => return failure(&e),
+    };
+    let mechanisms = agent.profile().mechanisms.clone().unwrap_or_default();
+    let plan = a4aa::adapt(dialect, &mechanisms);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&plan).unwrap_or_default()
     );
     0
 }

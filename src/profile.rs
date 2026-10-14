@@ -16,6 +16,11 @@
 //!   `preferred_capabilities`, `skill_references`, `state_key`,
 //!   `extensions`). The crate never invents a delivery path for advisory
 //!   fields; the host decides what its agent or dispatch layer supports.
+//! - **Mechanisms** — `mechanisms` is the CAwP section: semantic
+//!   declarations (hooks, rules, skills, commands, subagents, plugins,
+//!   permissions, config-file MCP servers, native-profile selection) that
+//!   `a4aa`'s adaptation layer translates into agent-native artifacts.
+//!   Parsing and merging live here; the dialect knowledge lives in a4aa.
 //!
 //! [`ProfilePatch`] is the same shape with every field optional — the wire
 //! and overlay form. Patches layer onto a profile (`None` keeps the value,
@@ -103,6 +108,10 @@ pub struct Profile {
     /// Host-side session-state namespace (advisory).
     #[serde(default)]
     pub state_key: Option<String>,
+    /// CAwP section: semantic mechanism declarations handed to a4aa's
+    /// adaptation layer for materialization into agent-native artifacts.
+    #[serde(default)]
+    pub mechanisms: Option<a4aa::MechanismSet>,
     /// Host-specific extras (avatars, sync manifests, UI hints). The crate
     /// never interprets them.
     #[serde(default)]
@@ -136,6 +145,7 @@ impl Profile {
             preferred_capabilities,
             skill_references,
             state_key,
+            mechanisms,
             extensions,
         } = patch;
         if let Some(value) = name {
@@ -189,6 +199,12 @@ impl Profile {
         if let Some(value) = state_key {
             self.state_key = Some(value);
         }
+        if let Some(patch_set) = mechanisms {
+            match &mut self.mechanisms {
+                Some(set) => set.merge(patch_set),
+                None => self.mechanisms = Some(patch_set),
+            }
+        }
         if let Some(value) = extensions {
             self.extensions.extend(value);
         }
@@ -214,6 +230,7 @@ impl Profile {
             preferred_capabilities: Some(self.preferred_capabilities.clone()),
             skill_references: Some(self.skill_references.clone()),
             state_key: self.state_key.clone(),
+            mechanisms: self.mechanisms.clone(),
             extensions: Some(self.extensions.clone()),
         }
     }
@@ -261,6 +278,8 @@ pub struct ProfilePatch {
     pub skill_references: Option<Vec<String>>,
     #[serde(default)]
     pub state_key: Option<String>,
+    #[serde(default)]
+    pub mechanisms: Option<a4aa::MechanismSet>,
     #[serde(default)]
     pub extensions: Option<BTreeMap<String, serde_json::Value>>,
 }

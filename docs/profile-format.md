@@ -71,7 +71,59 @@ default.
 | `env` | materialized | Merged per key into the spec's environment policy `set` — literals and `{"secret": …}` / `{"hostEnv": …}` indirections resolve at spawn like any spec entry. |
 | `mcpServers` | materialized | Appended to the `acp` lane's `mcpServers` after the spec's own. Ignored on lanes without an MCP surface. |
 | `permission`, `mode`, `contextWindow`, `requiredCapabilities`, `preferredCapabilities`, `skillReferences`, `stateKey` | advisory | Carried verbatim for the host's dispatch, selection or permission policy. The crate never invents a delivery path for them. |
+| `mechanisms` | CAwP | Semantic mechanism declarations — hooks, rules, skills, commands, subagents, plugins, permissions, config-file MCP servers, native-profile selection. awp parses, validates and merges them; `a4aa`'s adaptation layer translates them into agent-native artifacts. See "The `mechanisms` section" below. |
 | `extensions` | advisory | Host-specific extras (avatars, sync manifests, UI hints); merged per key on overlay, never interpreted. |
+
+## The `mechanisms` section (CAwP)
+
+Where the materialized fields above describe *what a session carries*, the
+`mechanisms` section describes *what the agent itself should be configured
+to do* — lifecycle hooks, standing rules, skills, commands, subagents,
+plugins, permission posture, config-file MCP servers, or selecting the
+agent's own native profile. Declarations are **semantic and dialect-free**:
+no agent-specific schema ever enters a profile. `a4aa` owns the mapping
+onto each agent's native surface.
+
+```jsonc
+"mechanisms": {
+  "hooks": [{
+    "event": "pre-tool-use",      // semantic event set, kebab-case
+    "command": "guard.sh",        // shell command the agent's hook runner executes
+    "intent": "enforce",          // "enforce" | "inject" | "rewrite" | "notify"
+    "matcher": "Bash",            // tool filter where the dialect supports it
+    "timeout": 10
+  }],
+  "rules":     [{"name": "core", "content": "Never guess."}],
+  "skills":    [{"name": "audit", "content": "---\nname: audit\n---\nAudit."}],
+  "commands":  [{"name": "ship", "description": "Ship", "content": "Ship it."}],
+  "subagents": [{"name": "verifier", "model": "m", "effort": "high",
+                 "sandbox": "workspace-write", "instructions": "Verify."}],
+  "plugins":   [{"id": "linter", "source": "marketplace/linter", "enabled": true}],
+  "permissions": {"mode": "workspace-write", "allow": ["Shell(ls)"], "deny": []},
+  "mcpServers": {"fs": {"command": "fs-mcp"}},   // agent config-file MCP, not the session lane
+  "nativeProfile": "reviewer"                    // use the agent's own profile mechanism
+}
+```
+
+- `hooks.<event>` — semantic events: `session-start`, `session-end`,
+  `user-prompt-submit`, `pre-tool-use`, `post-tool-use`, `stop`,
+  `subagent-start`, `subagent-stop`, `permission-request`, `notification`.
+  `intent` selects the hook's purpose; the adapter reports `adapted` where
+  a dialect cannot express it.
+- `mcpServers` here targets the agent's **config file** (`.cursor/mcp.json`,
+  `.gemini/settings.json`, project `.mcp.json`, `opencode.json`) — distinct
+  from the profile-level `mcpServers` list, which feeds the `acp` session
+  lane.
+- `nativeProfile` emits no artifacts; it records that the host should select
+  the agent's own profile (`codex --profile`, a DSH profile name).
+
+Merging on overlay is keyed: `rules`/`skills`/`commands`/`subagents`/`plugins`
+merge by name/id (later wins), `hooks` dedupe by `(event, command, matcher)`,
+`permissions` and `nativeProfile` replace. Validation is structural only
+(non-empty names/bodies, no duplicates); whether a declaration is
+**supported** is a per-dialect question the adapter answers — `awp
+materialize --dialect <agent>` emits the artifact plan plus the
+native/adapted/unsupported report without writing anything.
 
 ## Layering
 

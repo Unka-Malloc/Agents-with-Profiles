@@ -149,12 +149,22 @@ impl Registry {
                     next.profiles.insert(id.clone(), profile);
                 }
             }
-            let agent = &next.profiles[&id].agent;
-            if !next.agents.contains_key(agent) {
+            let profile = &next.profiles[&id];
+            if !next.agents.contains_key(&profile.agent) {
                 return Err(
-                    AdapterError::permanent("profile_agent_unknown", "registry/apply")
-                        .with_detail(format!("profile `{id}` references unknown agent `{agent}`")),
+                    AdapterError::permanent("profile_agent_unknown", "registry/apply").with_detail(
+                        format!(
+                            "profile `{id}` references unknown agent `{}`",
+                            profile.agent
+                        ),
+                    ),
                 );
+            }
+            if let Some(mechanisms) = &profile.mechanisms {
+                mechanisms.validate().map_err(|e| {
+                    AdapterError::permanent("profile_mechanisms_invalid", "registry/apply")
+                        .with_detail(format!("profile `{id}`: {e}"))
+                })?;
             }
         }
         for (name, binding) in document.bindings {

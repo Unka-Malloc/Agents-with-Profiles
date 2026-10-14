@@ -1,0 +1,36 @@
+[package]
+name = "agents-with-profiles"
+description = "Agents with Profiles (AwP) — a behavior-profile layer on top of a4aa: a base agent spec plus a named, versioned profile materializes a virtual agent with uniform session and turn semantics. Ships the `awp` CLI for document inspection, profile resolution, and profiled runs usable by hosts in any language."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Unka-Malloc/Agents-With-Profiles"
+readme = "README.md"
+keywords = ["agent", "acp", "profiles", "json-rpc", "cli"]
+categories = ["asynchronous", "network-programming", "os"]
+
+[lib]
+name = "awp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "awp"
+path = "src/bin/awp.rs"
+
+[dependencies]
+a4aa = { path = "../Adapter-For-All-Agents", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

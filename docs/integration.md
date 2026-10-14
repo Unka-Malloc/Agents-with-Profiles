@@ -86,12 +86,32 @@ check for a document before wiring it into a service.
 
 A profile's `mechanisms` section declares hooks, rules, skills, commands,
 subagents, plugins, permissions, config-file MCP servers and native-profile
-selection in semantic, dialect-free form. `a4aa`'s adaptation layer
-translates them per agent:
+selection in semantic, dialect-free form. Adaptation lives in the
+`a4aa-<agent>` crates — each agent's descriptor is its own installable
+package, so a host picks exactly one:
+
+```toml
+[dependencies]
+agents-with-profiles = "0.1"
+a4aa-pi = "0.1"   # the only adapter compiled in
+```
+
+```rust
+// AwP parses and resolves; the adapter crate owns the agent's dialect.
+let mechanisms = agent.profile().mechanisms.clone().unwrap_or_default();
+let plan = a4aa_pi::adapt(&mechanisms); // or a4aa::adapt(a4aa_pi::dialect(), &set)
+```
+
+Multi-agent tooling can instead depend on `a4aa-dialects` (a name→`Dialect`
+registry over all adapter crates) — that is what `awp materialize` does:
 
 ```sh
 awp materialize --config awp.json --profile reviewer --dialect codex
 ```
+
+The `materialize` subcommand is behind the `dialects` cargo feature, on by
+default. Building `agents-with-profiles` with `default-features = false`
+drops `a4aa-dialects` entirely — the library itself needs no adapter crate.
 
 ```jsonc
 {

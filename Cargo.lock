@@ -18,6 +18,229 @@ dependencies = [
 ]
 
 [[package]]
+name = "a4aa-antigravity"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-augment"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-claude"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-code-buddy"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-codex"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-command-code"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-craft-agent"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-cursor"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-devin"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-dialects"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+ "a4aa-antigravity",
+ "a4aa-augment",
+ "a4aa-claude",
+ "a4aa-code-buddy",
+ "a4aa-codex",
+ "a4aa-command-code",
+ "a4aa-craft-agent",
+ "a4aa-cursor",
+ "a4aa-devin",
+ "a4aa-dsh",
+ "a4aa-factory",
+ "a4aa-gemini",
+ "a4aa-grok",
+ "a4aa-hermes",
+ "a4aa-iflow",
+ "a4aa-kilo-code",
+ "a4aa-kimi-code",
+ "a4aa-kiro",
+ "a4aa-lingma",
+ "a4aa-open-claw",
+ "a4aa-opencode",
+ "a4aa-pi",
+ "a4aa-qoder",
+ "a4aa-qwen",
+ "a4aa-roo-code",
+ "a4aa-trae",
+ "a4aa-windsurf",
+]
+
+[[package]]
+name = "a4aa-dsh"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-factory"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-gemini"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-grok"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-hermes"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-iflow"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-kilo-code"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-kimi-code"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-kiro"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-lingma"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-open-claw"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-opencode"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-pi"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-qoder"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-qwen"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-roo-code"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-trae"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
+name = "a4aa-windsurf"
+version = "0.1.0"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
 name = "agent-client-protocol"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -63,6 +286,8 @@ name = "agents-with-profiles"
 version = "0.1.0"
 dependencies = [
  "a4aa",
+ "a4aa-codex",
+ "a4aa-dialects",
  "serde",
  "serde_json",
  "tokio",

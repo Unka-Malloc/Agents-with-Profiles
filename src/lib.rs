@@ -48,10 +48,12 @@ pub use registry::{compose_instructions, Binding, Registry, RegistryDocument, Se
 // Re-export the a4aa surface hosts need to configure and drive sessions,
 // so an awp consumer rarely needs a second dependency import.
 pub use a4aa::{
-    adapt, AdaptationPlan, AdapterError, AgentDialect, AgentEvent, AgentSpec, Artifact,
-    ArtifactScope, BeforeTurn, Capabilities, CliLaneSpec, CommandDecl, CommandSpec, EnvPolicy,
-    EnvSource, EnvValue, HookDecl, HookEvent, HookIntent, LaneKind, LaneSpec, MechanismSet,
-    NoSecrets, Observer, PermissionDecl, PermissionHandler, PluginDecl, PromptChannel, Result,
+    adapt, AdaptationPlan, AdapterError, AgentEvent, AgentSpec, Artifact, ArtifactScope,
+    BeforeTurn, Capabilities, CliLaneSpec, CommandDecl, CommandSpec, CommandSurface, Dialect,
+    EnvPolicy, EnvSource, EnvValue, ExtensionKind, HookDecl, HookEvent, HookIntent, HookSurface,
+    LaneKind, LaneSpec, McpSurface, MechanismSet, NoSecrets, Observer, PermissionDecl,
+    PermissionHandler, PermissionSurface, PluginDecl, PluginSurface, PromptChannel, Result,
     RpcCallSpec, RpcLaneSpec, RuleDecl, SecretResolver, SessionRequest, SharedObserver, SkillDecl,
-    StreamMode, SubagentDecl, Support, SupportEntry, TurnOutcome, TurnRequest, WriteMode,
+    StreamMode, SubagentDecl, SubagentSurface, Support, SupportEntry, Target, TurnOutcome,
+    TurnRequest, WriteMode,
 };

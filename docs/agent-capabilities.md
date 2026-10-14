@@ -122,8 +122,11 @@ inferencesh, reasonix, onwatch, openhands, copilot.
 ## 5. The implemented contract
 
 This split is now implemented: **AwP parses `Profile.mechanisms` into
-semantic declarations; a4aa's `mechanisms` module owns the adaptation**
-(`adapt(dialect, &MechanismSet) -> AdaptationPlan`).
+semantic declarations; the a4aa workspace owns adaptation.** The engine
+lives in `a4aa` (`Dialect::adapt(&MechanismSet) -> AdaptationPlan`); each
+agent's knowledge is a `Dialect` const in its own `a4aa-<agent>` crate
+(`a4aa_codex::DIALECT`, `a4aa_pi::DIALECT`, ...), independently installable.
+`a4aa-dialects` is an optional name registry for multi-agent hosts.
 
 **AwP side (parsing).** The profile `mechanisms` section carries *semantic*
 declarations. The parser validates and normalizes them — it contains no

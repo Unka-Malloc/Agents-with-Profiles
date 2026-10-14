@@ -102,7 +102,9 @@ fn resolved_agent_carries_mechanisms_for_adaptation() {
         .expect("binding resolves");
     let mechanisms = agent.profile().mechanisms.as_ref().unwrap();
 
-    let plan = awp::adapt(awp::AgentDialect::Codex, mechanisms);
+    // A host driving only Codex depends on `a4aa-codex` directly — no
+    // registry, no other adapter compiled in.
+    let plan = a4aa_codex::adapt(mechanisms);
     assert!(!plan.artifacts.is_empty());
     assert!(plan
         .report

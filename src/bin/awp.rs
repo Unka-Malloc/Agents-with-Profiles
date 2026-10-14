@@ -227,36 +227,45 @@ async fn resolve() -> i32 {
 // ----------------------------- materialize -------------------------------
 
 async fn materialize() -> i32 {
+    // `args` is only consumed under the `dialects` feature.
+    #[allow(unused_variables)]
     let args = match parse_args() {
         Ok(args) => args,
         Err(e) => return usage_error(&e),
     };
-    let dialect: a4aa::AgentDialect = match args
-        .dialect
-        .as_deref()
-        .ok_or("--dialect is required".to_owned())
-        .and_then(|name| {
-            serde_json::from_value(Value::String(name.to_owned()))
-                .map_err(|_| format!("unknown dialect: {name}"))
-        }) {
-        Ok(dialect) => dialect,
-        Err(e) => return usage_error(&e),
-    };
-    let registry = match load_registry(&args) {
-        Ok(registry) => registry,
-        Err(e) => return failure(&e),
-    };
-    let agent = match select_agent(&args, &registry) {
-        Ok(agent) => agent,
-        Err(e) => return failure(&e),
-    };
-    let mechanisms = agent.profile().mechanisms.clone().unwrap_or_default();
-    let plan = a4aa::adapt(dialect, &mechanisms);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&plan).unwrap_or_default()
-    );
-    0
+    #[cfg(not(feature = "dialects"))]
+    {
+        return failure(
+            "materialize needs the `dialects` feature (a4aa-dialects); \
+             single-agent hosts can call a4aa_<agent>::adapt() directly",
+        );
+    }
+    #[cfg(feature = "dialects")]
+    {
+        let name = match args.dialect.as_deref() {
+            Some(name) => name,
+            None => return usage_error("--dialect is required"),
+        };
+        let dialect = match a4aa_dialects::dialect(name) {
+            Some(dialect) => dialect,
+            None => return usage_error(&format!("unknown dialect: {name}")),
+        };
+        let registry = match load_registry(&args) {
+            Ok(registry) => registry,
+            Err(e) => return failure(&e),
+        };
+        let agent = match select_agent(&args, &registry) {
+            Ok(agent) => agent,
+            Err(e) => return failure(&e),
+        };
+        let mechanisms = agent.profile().mechanisms.clone().unwrap_or_default();
+        let plan = dialect.adapt(&mechanisms);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).unwrap_or_default()
+        );
+        0
+    }
 }
 
 // --------------------------------- run ----------------------------------

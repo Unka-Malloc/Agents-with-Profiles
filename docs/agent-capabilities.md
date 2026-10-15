@@ -105,7 +105,7 @@ surfaces with no spawnable lane, are deliberately *not* adapted.
 
 | Class | Agents | What a host can do |
 | --- | --- | --- |
-| **Invocable** (CLI / headless process surface) | codex, claude, cursor-agent, devin, opencode, pi, grok, kiro, dsh, hermes, kimi-code, factory, command-code, open-claw, antigravity | Spawn sessions (JSON-RPC, ACP, `exec --json`, `-p` style batch, gateway CLIs) *and* adapt config surfaces |
+| **Invocable** (CLI / headless process surface) | codex, claude, cursor-agent, devin, opencode, pi, grok, kiro, dsh, hermes, kimi-code, factory, command-code, open-claw, kilo-code (`kilo`), antigravity | Spawn sessions (JSON-RPC, ACP, `exec --json`, `-p` style batch, gateway CLIs) *and* adapt config surfaces |
 
 Products such as Trae, Qoder, Lingma, Kilo Code and Roo Code present only a
 GUI/extension surface — no process boundary a host could drive — so they get

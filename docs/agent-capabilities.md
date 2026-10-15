@@ -76,7 +76,7 @@ rewrite | notify`), not just an event name.
 | Claude Code | `CLAUDE.md` | `~/.claude/skills` | `commands/*.md` + plugin commands | `~/.claude/agents/*.md` | `~/.claude/plugins` + marketplaces | `.mcp.json` / settings | `permissions` allow/deny/ask + modes | output styles | `claude -p --output-format stream-json`, ACP adapter |
 | Cursor agent | `.cursor/rules/*.mdc` | `~/.cursor/skills`, `skills-cursor` | custom commands | `~/.cursor/agents/*.md` | `~/.cursor/plugins` | `~/.cursor/mcp.json` | `cli-config.json` `permissions` (Shell patterns), `sandbox-policies/` | — | `cursor-agent`, ACP (`acp-sessions/`) |
 | Devin | `AGENTS.md`, `.devin/` rules | `.devin/skills` | — | — | — | `mcp_config.json` | — | — | `devin` CLI |
-| Gemini CLI | `GEMINI.md` | extension skills | `~/.gemini/commands/*.toml` | — | `~/.gemini/extensions`, `config/plugins` | `settings.json` `mcpServers` | `approvalMode`, sandbox settings | — | `gemini --output-format json`, ACP adapter |
+| Gemini CLI (unmaintained; shared `~/.gemini` surface adapted by `a4aa-antigravity`) | `GEMINI.md` | extension skills | `~/.gemini/commands/*.toml` | — | `~/.gemini/extensions`, `config/plugins` | `settings.json` `mcpServers` | `approvalMode`, sandbox settings | — | `gemini --output-format json`, ACP adapter |
 | Antigravity | `.agent/rules`, `GEMINI.md` | skills | `.agent/workflows` | agents | — | `mcp_config.json` | IDE sandboxed exec | — | IDE Mission Control |
 | Grok | project rules | `~/.grok/skills` | slash commands | subagents | plugins | MCP servers | agent mode | — | `grok` CLI |
 | Kiro | `.kiro/steering/*` | `~/.kiro/skills` | — | `~/.kiro/agents/*.json` (`name,model,tools,mcpServers,prompt`) | — | `mcp.json` | trusted commands | steering modes | `kiro` CLI |
@@ -103,7 +103,7 @@ a host can additionally *drive* the agent as a process is a separate axis:
 
 | Class | Agents | What a host can do |
 | --- | --- | --- |
-| **Invocable** (CLI / headless process surface) | codex, claude, cursor-agent, gemini, devin, opencode, pi, grok, kiro, dsh, hermes, kimi-code, factory, command-code, craft-agent, open-claw, qwen, iflow, augment (`auggie`), code-buddy, antigravity | Spawn sessions (JSON-RPC, ACP, `exec --json`, `-p` style batch, gateway CLIs) *and* adapt config surfaces |
+| **Invocable** (CLI / headless process surface) | codex, claude, cursor-agent, devin, opencode, pi, grok, kiro, dsh, hermes, kimi-code, factory, command-code, craft-agent, open-claw, qwen, iflow, augment (`auggie`), code-buddy, antigravity | Spawn sessions (JSON-RPC, ACP, `exec --json`, `-p` style batch, gateway CLIs) *and* adapt config surfaces |
 | **Config-surface only** (GUI / extension host, no spawnable process) | trae, qoder, lingma, kilo-code, roo-code | Adapt rules/hooks/skills/MCP artifacts; the IDE or VS Code extension loads them on next start. Profiles still apply — there is just no lane to open |
 
 GUI-only adapters are still useful: adaptation writes the same declarative

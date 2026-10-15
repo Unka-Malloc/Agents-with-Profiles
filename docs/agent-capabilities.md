@@ -98,17 +98,19 @@ rewrite | notify`), not just an event name.
 
 ## 3. Interoperability: invocable vs config-surface-only
 
-An `a4aa-<agent>` dialect describes *where adaptation artifacts land*. Whether
-a host can additionally *drive* the agent as a process is a separate axis:
+An `a4aa-<agent>` dialect exists only for products that are **installed,
+actually used, and invocable** — a real binary or CLI on PATH plus runtime
+config/session artifacts. Products that were never run locally, and GUI-only
+surfaces with no spawnable lane, are deliberately *not* adapted.
 
 | Class | Agents | What a host can do |
 | --- | --- | --- |
-| **Invocable** (CLI / headless process surface) | codex, claude, cursor-agent, devin, opencode, pi, grok, kiro, dsh, hermes, kimi-code, factory, command-code, craft-agent, open-claw, qwen, iflow, augment (`auggie`), code-buddy, antigravity | Spawn sessions (JSON-RPC, ACP, `exec --json`, `-p` style batch, gateway CLIs) *and* adapt config surfaces |
-| **Config-surface only** (GUI / extension host, no spawnable process) | trae, qoder, lingma, kilo-code, roo-code | Adapt rules/hooks/skills/MCP artifacts; the IDE or VS Code extension loads them on next start. Profiles still apply — there is just no lane to open |
+| **Invocable** (CLI / headless process surface) | codex, claude, cursor-agent, devin, opencode, pi, grok, kiro, dsh, hermes, kimi-code, factory, command-code, open-claw, antigravity | Spawn sessions (JSON-RPC, ACP, `exec --json`, `-p` style batch, gateway CLIs) *and* adapt config surfaces |
 
-GUI-only adapters are still useful: adaptation writes the same declarative
-mechanisms into each product's native config surface, and the product picks
-them up itself. They simply cannot participate in `AgentSpec`-driven sessions.
+Products such as Trae, Qoder, Lingma, Kilo Code and Roo Code present only a
+GUI/extension surface — no process boundary a host could drive — so they get
+no adapter rather than a config-only descriptor that would claim adaptation
+without evidence.
 
 ## 4. Long tail
 

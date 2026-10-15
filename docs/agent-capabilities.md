@@ -96,16 +96,29 @@ rewrite | notify`), not just an event name.
 | Warp | `WARP.md` | `~/.warp/skills` | — | agents (app) | — | — | — | — | terminal blocks |
 | Craft Agent | workspace config | `SKILL.md` (Claude-SDK-identical, plus globs/`alwaysAllow` fields) | skill slash commands | — | `.claude-plugin` | — | per-skill tool pre-approval | workspaces | `craft-agent` CLI |
 
-## 3. Long tail
+## 3. Interoperability: invocable vs config-surface-only
+
+An `a4aa-<agent>` dialect describes *where adaptation artifacts land*. Whether
+a host can additionally *drive* the agent as a process is a separate axis:
+
+| Class | Agents | What a host can do |
+| --- | --- | --- |
+| **Invocable** (CLI / headless process surface) | codex, claude, cursor-agent, gemini, devin, opencode, pi, grok, kiro, dsh, hermes, kimi-code, factory, command-code, craft-agent, open-claw, qwen, iflow, augment (`auggie`), code-buddy, antigravity | Spawn sessions (JSON-RPC, ACP, `exec --json`, `-p` style batch, gateway CLIs) *and* adapt config surfaces |
+| **Config-surface only** (GUI / extension host, no spawnable process) | trae, qoder, lingma, kilo-code, roo-code | Adapt rules/hooks/skills/MCP artifacts; the IDE or VS Code extension loads them on next start. Profiles still apply — there is just no lane to open |
+
+GUI-only adapters are still useful: adaptation writes the same declarative
+mechanisms into each product's native config surface, and the product picks
+them up itself. They simply cannot participate in `AgentSpec`-driven sessions.
+
+## 4. Long tail
 
 These agents expose at minimum a `~/.<agent>/skills/` surface (and typically a
-rules file); their deeper surfaces are not enumerated here: trae, trae-cn,
-qoder, qoder-cn, zencoder, augment, codebuddy, lingma, qwen, iflow, neovate,
-pochi, vibe, rovodev, zcode, codeartsdoer, ona, terramind, moxby, mux,
-autohand, bob, astrbot, haystack, jazz, kode, tinycloud, codestudio, codewhale,
-inferencesh, reasonix, onwatch, openhands, copilot.
+rules file); their deeper surfaces are not enumerated here: trae-cn, qoder-cn,
+zencoder, neovate, pochi, vibe, rovodev, zcode, codeartsdoer, ona, terramind,
+moxby, mux, autohand, bob, astrbot, haystack, jazz, kode, tinycloud,
+codestudio, codewhale, inferencesh, reasonix, onwatch, openhands, copilot.
 
-## 4. What cross-agent tooling already proves
+## 5. What cross-agent tooling already proves
 
 1. `~/.<agent>/skills/` exists for 40+ agents, all consuming the same
    `SKILL.md` pack format — skills are the de-facto portable mechanism class.
@@ -119,7 +132,7 @@ inferencesh, reasonix, onwatch, openhands, copilot.
    timestamped `.bak` backups, generated-file header banners — adaptation
    should emit marked, restorable artifacts rather than rewriting user config.
 
-## 5. The implemented contract
+## 6. The implemented contract
 
 This split is now implemented: **AwP parses `Profile.mechanisms` into
 semantic declarations; the a4aa workspace owns adaptation.** The engine

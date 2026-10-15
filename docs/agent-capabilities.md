@@ -9,8 +9,8 @@ a4aa adapter, which owns each agent's capability matrix, config dialect, and
 materialization. This document surveys which mechanisms each installed agent
 actually exposes — i.e. the surface a4aa's adaptation layer must cover.
 
-Method: primary evidence from the agents' own config artifacts and shipped docs
-on this device (`~/.<agent>` directories, per-agent user guides). Where an
+Method: primary evidence from the agents' own config artifacts and shipped
+documentation (`~/.<agent>` directories, per-agent user guides). Where an
 agent's surface is only partially observable (IDE-internal state), the table
 says so explicitly rather than extrapolating.
 
@@ -96,7 +96,7 @@ rewrite | notify`), not just an event name.
 | Warp | `WARP.md` | `~/.warp/skills` | — | agents (app) | — | — | — | — | terminal blocks |
 | Craft Agent | workspace config | `SKILL.md` (Claude-SDK-identical, plus globs/`alwaysAllow` fields) | skill slash commands | — | `.claude-plugin` | — | per-skill tool pre-approval | workspaces | `craft-agent` CLI |
 
-## 3. Long tail observed on this device
+## 3. Long tail
 
 These agents expose at minimum a `~/.<agent>/skills/` surface (and typically a
 rules file); their deeper surfaces are not enumerated here: trae, trae-cn,
@@ -105,18 +105,18 @@ pochi, vibe, rovodev, zcode, codeartsdoer, ona, terramind, moxby, mux,
 autohand, bob, astrbot, haystack, jazz, kode, tinycloud, codestudio, codewhale,
 inferencesh, reasonix, onwatch, openhands, copilot.
 
-## 4. What the device itself proves
+## 4. What cross-agent tooling already proves
 
 1. `~/.<agent>/skills/` exists for 40+ agents, all consuming the same
    `SKILL.md` pack format — skills are the de-facto portable mechanism class.
-2. `~/.agents/bin/rules-sync.py` mirrors one rules document into every agent's
+2. Existing dotfile-sync tooling mirrors one rules document into every agent's
    native rules file (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, …) — rules text is
    portable, the *file location and name* is the per-agent variable.
-3. `~/.orca/agent-hooks/<agent>-hook.sh` shows hooks are *installed through*
-   each agent's native store (codex `hooks.json`, cursor `hooks.json`, grok
-   per-file bundles, gemini named bundles) — same logical hook, five dialects.
-4. Managed-artifact discipline is already established: `<!-- agents-core -->`
-   markers, `.bak-*` backups, `@orca-managed-pi-extension` headers — CAwP
+3. Hooks are *installed through* each agent's native store (codex
+   `hooks.json`, cursor `hooks.json`, grok per-file bundles, gemini named
+   bundles) — the same logical hook lands in five different dialects.
+4. Managed-artifact discipline is established practice: marker comments,
+   timestamped `.bak` backups, generated-file header banners — adaptation
    should emit marked, restorable artifacts rather than rewriting user config.
 
 ## 5. The implemented contract

@@ -87,7 +87,7 @@ rewrite | notify`), not just an event name.
 | Factory Droid | `AGENTS.md` | `~/.factory/skills` | slash-command catalogs | `~/.factory/droids/*.md` | `plugins/` | settings `mcp` | autonomy levels, `trustedFolders` | — | `droid` (ACP probe sessions), exec |
 | Command Code | imports `CLAUDE.md`/`AGENTS.md` | skills | — | — | — | `projects/*/mcp.json` | — | — | — |
 | OpenClaw | `workspace/AGENTS.md` | `~/.openclaw/skills` | — | `~/.openclaw/agents` | — | — | — | — | — |
-| Windsurf | `memories/global_rules.md`, `.windsurf/rules` | `~/.codeium/windsurf/skills` | workflows | — | — | `mcp_config.json` | — | `profiles/` | Cascade (IDE) |
+| Windsurf → Devin Desktop (renamed 2026-06; Cascade EOL → Devin Local) | `memories/global_rules.md`, `.windsurf/rules` | `~/.codeium/windsurf/skills` | workflows | — | — | `mcp_config.json` | — | `profiles/` | Cascade (IDE) |
 | Kimi-code | `AGENTS.md` | `~/.kimi-code/skills` | — | — | — | `config.toml` | `[thinking]`, `[secondary_model]`, `[providers.*]` | — | `kimi` CLI sessions |
 | Kilo Code / Roo Code | rules + memories | `~/.kilocode/skills`, `~/.roo/skills` | — | custom modes (IDE `globalStorage`) | — | IDE mcp settings | — | modes | VS Code extension |
 | Aider (Desk) | `CONVENTIONS.md`, `.aider.conf.yml` | `~/.aider-desk/skills` | — | — | — | — | auto-commit flags | — | `aider` CLI |

@@ -45,4 +45,4 @@ tokio = { version = "1", features = [
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Direct single-agent adapter dependency: the tests drive a resolved
 # profile's mechanisms through one adapter crate, no registry involved.
-a4aa-codex = { path = "../Adapter-For-All-Agents/crates/a4aa-codex" }
+a4aa-codex = { path = "../Adapter-For-All-Agents/crates/a4aa-codex", version = "0.1.0" }

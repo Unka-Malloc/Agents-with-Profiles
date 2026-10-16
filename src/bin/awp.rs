@@ -211,9 +211,12 @@ async fn resolve() -> i32 {
         },
         "turn": {
             "model": profile.model.clone(),
+            "mode": profile.mode.clone(),
             "effort": profile.effort.clone(),
+            "permission": profile.permission.clone(),
             "instructions": profile.instructions.clone(),
             "instructionMode": profile.instruction_mode,
+            "stateKey": profile.state_key.clone(),
         },
         "mechanisms": serde_json::to_value(&profile.mechanisms).unwrap_or(Value::Null),
     });
@@ -311,6 +314,7 @@ async fn run() -> i32 {
                 AgentEvent::Plan { .. } => {}
                 AgentEvent::Truncated => eprintln!("\n[truncated]"),
                 AgentEvent::Raw { .. } => {}
+                AgentEvent::Usage { .. } => {}
             }
         }
     });

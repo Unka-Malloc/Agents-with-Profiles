@@ -9,18 +9,18 @@
 //!
 //! [`VirtualSession`] then applies profile semantics per turn: persona
 //! instructions are composed into prompt text under the profile's
-//! [`InstructionMode`], and model/effort defaults fill unset turn fields
-//! for the lanes that accept them.
+//! [`InstructionMode`], and model/effort defaults use the session or turn
+//! selector phase the A4AA lane actually supports.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use a4aa::{
     Adapter, AgentEvent, AgentSession, AgentSpec, BeforeTurn, Capabilities, EnvPolicy, LaneKind,
-    LaneSpec, PermissionHandler, SecretResolver, SessionRequest, SharedObserver, TurnOutcome,
-    TurnRequest,
+    LaneSpec, PermissionHandler, SecretResolver, SelectorPhase, SelectorSupport, SessionRequest,
+    SharedObserver, TurnOutcome, TurnRequest,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::profile::{InstructionMode, Profile};
 
@@ -136,7 +136,10 @@ impl VirtualAgent {
 
     /// Open a session. The profile's `cwd` is the default working directory;
     /// an explicit `request.cwd` wins. `request.env` passes through to the
-    /// adapter untouched.
+    /// adapter untouched. Profile model/effort defaults enter session config
+    /// only when that lane applies them at session establishment; turn-only
+    /// defaults are carried by `VirtualSession`. Explicit session config wins.
+    /// Mode and permission remain session selectors.
     pub async fn open_session(
         &self,
         mut request: SessionRequest,
@@ -145,25 +148,59 @@ impl VirtualAgent {
         if request.cwd.is_none() {
             request.cwd = self.profile.cwd.clone();
         }
+        let session_selectors = self.spec.selector_support(SelectorPhase::Session);
+        let mut turn_model_default = None;
+        let mut turn_effort_default = None;
+        if request.config.model.is_none() {
+            if session_selectors.model != SelectorSupport::Unsupported {
+                request.config.model = self.profile.model.clone();
+            } else {
+                turn_model_default = self.profile.model.clone();
+            }
+        }
+        if request.config.mode.is_none() {
+            request.config.mode = self.profile.mode.clone();
+        }
+        if request.config.effort.is_none() {
+            if session_selectors.effort != SelectorSupport::Unsupported {
+                request.config.effort = self.profile.effort.clone();
+            } else {
+                turn_effort_default = self.profile.effort.clone();
+            }
+        }
+        if request.config.permission.is_none() {
+            request.config.permission = self.profile.permission.clone();
+        }
         let session = self.adapter().open_session(request, events).await?;
         Ok(VirtualSession {
-            session,
+            session: Arc::new(session),
             profile: self.profile.clone(),
+            turn_model_default,
+            turn_effort_default,
             stateless_lane: matches!(self.spec.lane, LaneSpec::Cli(_)),
-            instructions_sent: AtomicBool::new(false),
+            instructions_sent: Arc::new(AtomicBool::new(false)),
+            turn_lock: Arc::new(Mutex::new(())),
         })
     }
 }
 
 /// An open session on a virtual agent. Profile turn semantics apply here:
-/// instructions compose into prompt text, model/effort defaults fill in.
+/// instructions compose into prompt text, and turn-only defaults fill in.
 pub struct VirtualSession {
-    session: AgentSession,
+    session: Arc<AgentSession>,
     profile: Profile,
+    /// Profile defaults for selectors the lane consumes per turn rather than
+    /// at session establishment. Session-applied defaults stay with A4AA's
+    /// SessionRequest so an explicit open-session value is never replaced.
+    turn_model_default: Option<String>,
+    turn_effort_default: Option<String>,
     /// Stateless lanes (cli) start a fresh process per turn, so instructions
     /// are delivered on every prompt regardless of `InstructionMode`.
     stateless_lane: bool,
-    instructions_sent: AtomicBool,
+    instructions_sent: Arc<AtomicBool>,
+    // Composition and submission share one turn boundary. Concurrent callers
+    // must observe the previous turn's confirmed instruction-delivery state.
+    turn_lock: Arc<Mutex<()>>,
 }
 
 impl VirtualSession {
@@ -206,27 +243,53 @@ impl VirtualSession {
     /// Submit one turn with explicit fields. Set model/effort override the
     /// profile defaults; unset fields inherit them.
     pub async fn prompt_with(&self, mut request: TurnRequest) -> a4aa::Result<TurnOutcome> {
+        let turn = self.turn_lock.clone().lock_owned().await;
         if self.instructions_due() {
             request.text = compose_prompt(self.profile.instructions.as_deref(), &request.text);
         }
         if request.model.is_none() {
-            request.model = self.profile.model.clone();
+            request.model = self.turn_model_default.clone();
         }
         if request.effort.is_none() {
-            request.effort = self.profile.effort.clone();
+            request.effort = self.turn_effort_default.clone();
         }
-        let outcome = self.session.prompt(request).await;
-        if outcome.is_ok() {
-            self.instructions_sent.store(true, Ordering::Relaxed);
-        }
-        outcome
+        self.run_owned_prompt(request, turn, true).await
     }
 
     /// Submit one turn exactly as given — no instruction composition, no
     /// default filling. The escape hatch for hosts that deliver profile
     /// context through their own channel (skill files, harness prompts).
     pub async fn prompt_direct(&self, request: TurnRequest) -> a4aa::Result<TurnOutcome> {
-        self.session.prompt(request).await
+        let turn = self.turn_lock.clone().lock_owned().await;
+        self.run_owned_prompt(request, turn, false).await
+    }
+
+    async fn run_owned_prompt(
+        &self,
+        request: TurnRequest,
+        turn: tokio::sync::OwnedMutexGuard<()>,
+        record_instructions: bool,
+    ) -> a4aa::Result<TurnOutcome> {
+        let session = self.session.clone();
+        let instructions_sent = self.instructions_sent.clone();
+        tokio::spawn(async move {
+            let _turn = turn;
+            let outcome = session.prompt(request).await;
+            // Preserve profile state and ordering even when only the caller's
+            // waiter is dropped. A cancelled first attempt remains pending.
+            if record_instructions
+                && outcome.as_ref().is_ok_and(|result| {
+                    !matches!(result.stop_reason.as_str(), "cancelled" | "interrupted")
+                })
+            {
+                instructions_sent.store(true, Ordering::Relaxed);
+            }
+            outcome
+        })
+        .await
+        .map_err(|_| {
+            a4aa::AdapterError::uncertain("agent_profile_driver_failed", "profile/prompt")
+        })?
     }
 
     /// Explicit user cancellation of the in-flight turn.
@@ -235,7 +298,7 @@ impl VirtualSession {
     }
 
     /// Close the session and terminate the agent process tree.
-    pub async fn close(self) -> a4aa::Result<()> {
+    pub async fn close(&self) -> a4aa::Result<()> {
         self.session.close().await
     }
 }

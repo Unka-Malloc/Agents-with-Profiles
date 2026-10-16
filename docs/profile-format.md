@@ -9,13 +9,13 @@ where it comes from.
 {
   "agents": {
     // key = the spec's `id` (validated)
-    "codex": {
-      "id": "codex",
+    "example-agent": {
+      "id": "example-agent",
       "lane": "acp",                    // "acp" | "rpc" | "cli"
       "preferLoad": false,              // acp lane fields
       "mcpServers": [],
       "command": {
-        "program": "codex",
+        "program": "agent-cli",
         "args": ["acp"],
         "env": {"sanitized": {"inherit": [], "set": {}}}
       }
@@ -25,7 +25,7 @@ where it comes from.
     // key = the profile id; value is a ProfilePatch — every field optional,
     // but a *new* profile must set `agent`
     "reviewer": {
-      "agent": "codex",
+      "agent": "example-agent",
       "name": "Reviewer",
       "revision": "3",
       "model": "m-large",
@@ -55,6 +55,8 @@ where it comes from.
 ```
 
 `agents` values are a4aa `AgentSpec`s verbatim (see the a4aa model docs).
+The example uses a hypothetical ACP executable. For a supported real agent,
+use its `a4aa-<agent>::spec()` descriptor and supported selector values.
 `bindings` name which profile serves a role or task slot. Unknown fields
 are rejected (`deny_unknown_fields`) — a typo is a load error, not a silent
 default.
@@ -66,13 +68,23 @@ default.
 | `agent` (required) | identity | Registry key of the backing `AgentSpec`. |
 | `id`, `name`, `revision` | identity | `revision` is an explicit operator-maintained version string — never inferred from content. `principal_id()` returns `profile:<id>`. |
 | `instructions`, `instructionMode` | materialized | Composed into prompt text (`instructions\n\n<text>`). `first-turn` sends once per session-bound lane (`acp`, `rpc`); `every-turn` always. Stateless `cli` lanes deliver on every turn — each turn is a fresh process. |
-| `model`, `effort` | materialized | Per-turn defaults for lanes that accept them (`rpc` params, `cli` `{model}`/`{effort}` argv placeholders). Explicit turn values win. The `acp` lane carries no such field — the values still appear in `resolve` output for the host to route. |
+| `model`, `effort` | materialized | Defaults applied at the session or turn phase supported by the A4AA adapter. Explicit session configuration wins over profile defaults. Explicit turn selectors are honored where the lane supports them; unsupported selections fail before the turn begins. ACP values use negotiated configuration. |
 | `cwd` | materialized | Default session working directory; an explicit `SessionRequest.cwd` wins. |
 | `env` | materialized | Merged per key into the spec's environment policy `set` — literals and `{"secret": …}` / `{"hostEnv": …}` indirections resolve at spawn like any spec entry. |
 | `mcpServers` | materialized | Appended to the `acp` lane's `mcpServers` after the spec's own. Ignored on lanes without an MCP surface. |
-| `permission`, `mode`, `contextWindow`, `requiredCapabilities`, `preferredCapabilities`, `skillReferences`, `stateKey` | advisory | Carried verbatim for the host's dispatch, selection or permission policy. The crate never invents a delivery path for them. |
+| `permission`, `mode` | materialized | Session defaults, applied through A4AA's supported selectors. Explicit `SessionRequest.config` values win. An unsupported preset is an error. |
+| `contextWindow`, `requiredCapabilities`, `preferredCapabilities`, `skillReferences`, `stateKey` | advisory | Carried verbatim for the host's dispatch, selection or state policy. The crate never invents a delivery path for them. |
 | `mechanisms` | CAwP | Semantic mechanism declarations — hooks, rules, skills, commands, subagents, plugins, permissions, config-file MCP servers, native-profile selection. awp parses, validates and merges them; `a4aa`'s adaptation layer translates them into agent-native artifacts. See "The `mechanisms` section" below. |
 | `extensions` | advisory | Host-specific extras (avatars, sync manifests, UI hints); merged per key on overlay, never interpreted. |
+
+First-turn guidance remains pending after a failed or cancelled initial attempt,
+because the agent may not have received that prompt. Once a non-cancelled
+response confirms submission, later turns do not repeat first-turn guidance.
+Concurrent prompt calls are serialized before composition, so queued turns use
+the preceding turn’s confirmed guidance state.
+The session owns submission and guidance bookkeeping until the turn settles;
+dropping a caller's waiting future does not repeat first-turn guidance or admit
+an overlapping turn. `close` is callable through a shared session reference.
 
 ## The `mechanisms` section (CAwP)
 

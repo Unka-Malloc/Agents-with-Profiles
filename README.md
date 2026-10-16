@@ -12,8 +12,9 @@ workflow.
 
 Rust hosts embed the library (`use awp::…`). Hosts in any language run the
 `awp` binary: `awp resolve` emits the effective spec and turn plan as JSON,
-which feeds `a4aa serve` unchanged — identical profile semantics with no
-reimplementation of the merge rules.
+which can drive `a4aa serve`. Registry merge rules are resolved once; a
+foreign-language host still routes session and turn selectors as described
+in the integration guide. `awp run` applies that runtime behavior itself.
 
 ## What it provides
 
@@ -74,9 +75,9 @@ awp fixture-agent                                     # deterministic ACP echo a
 ```
 
 For a foreign-language host the flow is: `awp resolve` → feed `spec` to
-`a4aa serve` `session/open` → per `session/prompt`, compose
-`turn.instructions` into the text per `instructionMode` and pass
-`turn.model` / `turn.effort`. See
+`a4aa serve` `session/open` → route selectors to their supported phase and,
+per `session/prompt`, compose `turn.instructions` into the text per
+`instructionMode`. See
 [docs/integration.md](docs/integration.md).
 
 ## Documentation

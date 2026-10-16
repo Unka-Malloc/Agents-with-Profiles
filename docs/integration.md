@@ -28,7 +28,7 @@ let session = agent
     .await?;
 
 // Profile semantics apply per turn: instructions compose into the text,
-// model/effort defaults fill unset fields.
+// model/effort defaults use the phase supported by the adapter.
 let outcome = session.prompt("task".to_owned()).await?;
 session.close().await?;
 ```
@@ -53,7 +53,7 @@ awp resolve --config awp.json [--overlay layer.json]... --profile reviewer
 
 ```jsonc
 {
-  "profile": { "id": "reviewer", "agent": "codex", /* …verbatim… */ },
+  "profile": { "id": "reviewer", "agent": "example-agent", /* …verbatim… */ },
   "lane": "acp",
   "spec":    { /* effective a4aa AgentSpec — profile env + mcpServers folded in */ },
   "session": { "cwd": "/workspace/repo" },
@@ -69,10 +69,16 @@ awp resolve --config awp.json [--overlay layer.json]... --profile reviewer
 
 Host-side flow against `a4aa serve` (`a4aa.v1`, see the a4aa sidecar doc):
 
-1. `session/open` with `{spec, cwd: session.cwd?, env: {}}`.
+1. `session/open` with `{spec, cwd: session.cwd?, env: {}, options}`.
+   Route `turn.mode` and `turn.permission` to session options. Route model
+   and effort defaults to session options when the selected adapter supports
+   them at session establishment (including negotiated ACP configuration),
+   otherwise use its turn selectors. `resolve` returns profile data; it does
+   not perform this runtime routing for a foreign-language host.
 2. Every `session/prompt`: compose
    `text = turn.instructions ? turn.instructions + "\n\n" + text : text`
-   **when instructions are due**, and pass `turn.model` / `turn.effort`.
+   **when instructions are due**, and pass model/effort values only through
+   supported turn selectors. A4AA rejects unsupported selections.
    Instructions are due when `lane == "cli"`, or
    `turn.instructionMode == "every-turn"`, or it is the first prompt of the
    session.
@@ -93,7 +99,7 @@ package, so a host picks exactly one:
 ```toml
 [dependencies]
 agents-with-profiles = "0.1"
-a4aa-pi = "0.1"   # the only adapter compiled in
+a4aa-pi = "0.2"   # the only adapter compiled in
 ```
 
 ```rust
@@ -144,7 +150,7 @@ host decides whether a missing mechanism is fatal.
 ## Typical shapes
 
 - **Chat host** — one profile per persona the user talks to. `name`,
-  `extensions.avatar`, `instructions`, `permission`, `contextWindow` and
+  `extensions.avatar`, `contextWindow` and
   the capability lists are advisory metadata the host's member/dispatch
   model consumes; `principal_id()` gives each profile a stable
   `profile:<id>` identity.

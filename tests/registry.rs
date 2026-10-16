@@ -11,11 +11,12 @@ fn cli_spec(id: &str, program: &str) -> AgentSpec {
     AgentSpec {
         id: id.to_owned(),
         client_name: None,
-        lane: LaneSpec::Cli(CliLaneSpec {
+        lane: LaneSpec::Cli(Box::new(CliLaneSpec {
             args: vec!["{prompt}".to_owned()],
             prompt_channel: PromptChannel::ArgOnly,
             stream: StreamMode::Stdio,
-        }),
+            ..CliLaneSpec::default()
+        })),
         command: CommandSpec {
             program: program.to_owned(),
             args: vec![],

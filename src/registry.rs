@@ -55,11 +55,17 @@ pub struct RegistryDocument {
 pub enum Binding {
     /// Bare profile reference.
     Profile(String),
-    /// Profile plus an optional standing prompt.
+    /// Profile plus an optional standing prompt and fallback profiles.
     Full {
         profile: String,
         #[serde(default)]
         prompt: Option<String>,
+        /// Ordered fallback profile ids: when the bound profile's agent
+        /// cannot serve (its whole model chain failed, the agent is absent
+        /// or its session cannot be established), the next profile — one
+        /// that may back a different agent — takes over the role.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fallbacks: Vec<String>,
     },
     #[default]
     None,
@@ -78,6 +84,14 @@ impl Binding {
         match self {
             Binding::Full { prompt, .. } => prompt.as_deref(),
             _ => None,
+        }
+    }
+
+    /// Ordered fallback profile ids, empty for the short forms.
+    pub fn fallbacks(&self) -> &[String] {
+        match self {
+            Binding::Full { fallbacks, .. } => fallbacks,
+            _ => &[],
         }
     }
 
@@ -181,6 +195,17 @@ impl Registry {
                         )),
                 );
             }
+            for fallback in binding.fallbacks() {
+                if !next.profiles.contains_key(fallback) {
+                    return Err(AdapterError::permanent(
+                        "binding_profile_unknown",
+                        "registry/apply",
+                    )
+                    .with_detail(format!(
+                        "binding `{name}` references unknown fallback profile `{fallback}`"
+                    )));
+                }
+            }
             next.bindings.insert(name, binding);
         }
         *self = next;
@@ -256,17 +281,45 @@ impl Registry {
     /// Resolve a binding straight to its virtual agent, with the binding's
     /// standing prompt folded into the profile's instructions.
     pub fn resolve_binding(&self, binding_name: &str) -> a4aa::Result<crate::VirtualAgent> {
-        let selection = self.select(binding_name)?;
-        let profile = selection.profile;
-        let spec = self.agents.get(&profile.agent).ok_or_else(|| {
-            AdapterError::permanent("profile_agent_unknown", "registry/resolve").with_detail(
-                format!(
-                    "profile `{}` references unknown agent `{}`",
-                    profile.id, profile.agent
-                ),
-            )
+        Ok(self
+            .resolve_chain(binding_name)?
+            .into_iter()
+            .next()
+            .expect("a resolved binding always has a primary candidate"))
+    }
+
+    /// Resolve a binding to its ordered candidate chain: the bound profile
+    /// first, then each declared fallback profile. Every candidate gets the
+    /// binding's standing prompt composed into its instructions, so the
+    /// role stays identical while the backing agent may differ.
+    pub fn resolve_chain(&self, binding_name: &str) -> a4aa::Result<Vec<crate::VirtualAgent>> {
+        let binding = self.binding(binding_name).ok_or_else(|| {
+            AdapterError::permanent("binding_unknown", "registry/select")
+                .with_detail(format!("unknown binding `{binding_name}`"))
         })?;
-        Ok(crate::VirtualAgent::new(profile, spec.clone()))
+        let prompt = binding.prompt().map(str::to_owned);
+        let mut candidates = Vec::new();
+        for id in
+            std::iter::once(binding.profile()).chain(binding.fallbacks().iter().map(String::as_str))
+        {
+            let mut profile = self
+                .profiles
+                .get(id)
+                .expect("bindings validate against profiles at apply")
+                .clone();
+            profile.instructions =
+                compose_instructions(profile.instructions.as_deref(), prompt.as_deref());
+            let spec = self.agents.get(&profile.agent).ok_or_else(|| {
+                AdapterError::permanent("profile_agent_unknown", "registry/resolve").with_detail(
+                    format!(
+                        "profile `{}` references unknown agent `{}`",
+                        profile.id, profile.agent
+                    ),
+                )
+            })?;
+            candidates.push(crate::VirtualAgent::new(profile, spec.clone()));
+        }
+        Ok(candidates)
     }
 }
 

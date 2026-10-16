@@ -200,6 +200,7 @@ version = "0.1.0"
 dependencies = [
  "a4aa",
  "a4aa-codex",
+ "a4aa-devin",
  "a4aa-dialects",
  "serde",
  "serde_json",

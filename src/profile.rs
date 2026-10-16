@@ -67,6 +67,11 @@ pub struct Profile {
     /// Default model passed to lanes that accept one per turn.
     #[serde(default)]
     pub model: Option<String>,
+    /// Ordered model fallbacks behind `model`: when the active model
+    /// cannot serve a turn (exhausted quota, unavailable, rejected), the
+    /// next entry is selected on the same session and the turn retried.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     /// Default reasoning effort passed to lanes that accept one per turn.
     #[serde(default)]
     pub effort: Option<String>,
@@ -125,6 +130,21 @@ impl Profile {
         format!("profile:{}", self.id)
     }
 
+    /// The ordered model preference list: `model` first, then each
+    /// `models` fallback, deduplicated. Empty when no model is declared.
+    pub fn model_chain(&self) -> Vec<String> {
+        let mut chain = Vec::new();
+        if let Some(model) = &self.model {
+            chain.push(model.clone());
+        }
+        for fallback in &self.models {
+            if !chain.contains(fallback) {
+                chain.push(fallback.clone());
+            }
+        }
+        chain
+    }
+
     /// Apply an overlay: `Some` replaces, `None` keeps; `env` merges per key.
     pub fn apply(&mut self, patch: ProfilePatch) {
         let ProfilePatch {
@@ -132,6 +152,7 @@ impl Profile {
             agent,
             revision,
             model,
+            models,
             effort,
             mode,
             permission,
@@ -159,6 +180,9 @@ impl Profile {
         }
         if let Some(value) = model {
             self.model = Some(value);
+        }
+        if let Some(value) = models {
+            self.models = value;
         }
         if let Some(value) = effort {
             self.effort = Some(value);
@@ -217,6 +241,7 @@ impl Profile {
             agent: Some(self.agent.clone()),
             revision: self.revision.clone(),
             model: self.model.clone(),
+            models: Some(self.models.clone()),
             effort: self.effort.clone(),
             mode: self.mode.clone(),
             permission: self.permission.clone(),
@@ -252,6 +277,8 @@ pub struct ProfilePatch {
     pub revision: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]

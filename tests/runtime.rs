@@ -6,9 +6,9 @@
 
 use a4aa::SessionConfig;
 use awp::{
-    AgentEvent, AgentSpec, CliLaneSpec, CommandSpec, InstructionMode, LaneSpec, ProfilePatch,
-    PromptChannel, Registry, RegistryDocument, RpcCallSpec, RpcLaneSpec, SessionRequest,
-    StreamMode, TurnRequest,
+    AgentEvent, AgentSpec, CliLaneSpec, CommandSpec, EnvValue, InstructionMode, LaneSpec,
+    ProfilePatch, PromptChannel, Registry, RegistryDocument, RpcCallSpec, RpcLaneSpec,
+    SessionRequest, StreamMode, TurnRequest,
 };
 #[cfg(unix)]
 use serde_json::json;
@@ -148,6 +148,7 @@ fn fixture_spec() -> AgentSpec {
         lane: LaneSpec::Acp {
             mcp_servers: vec![],
             prefer_load: false,
+            auth_key: None,
         },
         command: CommandSpec {
             program: env!("CARGO_BIN_EXE_awp").to_owned(),
@@ -639,4 +640,81 @@ for line in sys.stdin:
         assert_eq!(second.await.unwrap().text, "second");
     }).await.expect("concurrent turn ordering did not finish");
     }
+}
+
+// --------------------------- model fallback -----------------------------
+
+/// A fixture spec whose agent advertises a select `model` configOption and
+/// answers prompts under `quota` models with a provider rate-limit error.
+#[cfg(unix)]
+fn quota_fixture_spec(models: &str, quota: &str) -> AgentSpec {
+    let mut spec = fixture_spec();
+    spec.command.env = awp::EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [
+            (
+                "AWP_FIXTURE_MODELS".to_owned(),
+                EnvValue::Literal(models.to_owned()),
+            ),
+            (
+                "AWP_FIXTURE_QUOTA".to_owned(),
+                EnvValue::Literal(quota.to_owned()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    spec
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_model_chain_advances_on_quota_failure() {
+    let registry = registry_with(
+        quota_fixture_spec("prime,fallback", "prime"),
+        ProfilePatch {
+            agent: Some("fixture".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+
+    // The quota-rejected turn is retried on the same session with the next
+    // chain entry applied through session/set_config_option.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "end_turn");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_exhausted_model_chain_propagates_the_error() {
+    let registry = registry_with(
+        quota_fixture_spec("only", "only"),
+        ProfilePatch {
+            agent: Some("fixture".to_owned()),
+            model: Some("only".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_protocol_failed");
+    session.close().await.unwrap();
 }

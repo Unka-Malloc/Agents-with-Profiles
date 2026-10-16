@@ -53,6 +53,7 @@ fn document(
             awp::Binding::Full {
                 profile: profile.to_string(),
                 prompt: None,
+                fallbacks: vec![],
             },
         );
     }
@@ -169,6 +170,7 @@ fn binding_prompt_composes_after_profile_instructions() {
         awp::Binding::Full {
             profile: "p".to_owned(),
             prompt: Some("check the diff".to_owned()),
+            fallbacks: vec![],
         },
     );
     let registry = Registry::from_document(document).unwrap();
@@ -186,6 +188,7 @@ fn resolve_materializes_env_and_mcp_into_spec() {
     spec.lane = LaneSpec::Acp {
         mcp_servers: vec![json!({"name": "base-mcp"})],
         prefer_load: false,
+        auth_key: None,
     };
     document.agents.insert("base".to_owned(), spec);
 
@@ -242,4 +245,66 @@ fn compose_instructions_drops_empty_layers() {
         awp::compose_instructions(Some("a"), Some("b")).as_deref(),
         Some("a\n\nb")
     );
+}
+
+#[test]
+fn binding_fallbacks_validate_against_profiles() {
+    let mut document = document(&["a"], &[("p", "a")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full {
+            profile: "p".to_owned(),
+            prompt: None,
+            fallbacks: vec!["missing".to_owned()],
+        },
+    );
+    let error = Registry::from_document(document).unwrap_err();
+    assert_eq!(error.code, "binding_profile_unknown");
+}
+
+#[test]
+fn resolve_chain_orders_primary_then_fallbacks_with_shared_prompt() {
+    let mut document = document(&["a", "b"], &[("p", "a"), ("q", "b")], &[]);
+    document.profiles.insert(
+        "q".to_owned(),
+        ProfilePatch {
+            agent: Some("b".to_owned()),
+            instructions: Some("stand-in".to_owned()),
+            ..Default::default()
+        },
+    );
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full {
+            profile: "p".to_owned(),
+            prompt: Some("the task".to_owned()),
+            fallbacks: vec!["q".to_owned()],
+        },
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let chain = registry.resolve_chain("role").unwrap();
+
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].profile().id, "p");
+    assert_eq!(chain[0].spec().id, "a");
+    assert_eq!(chain[1].profile().id, "q");
+    assert_eq!(chain[1].spec().id, "b");
+    // The binding's standing prompt rides every candidate, not just the
+    // primary — the role is identical while the agent differs.
+    assert_eq!(
+        chain[1].profile().instructions.as_deref(),
+        Some("stand-in\n\nthe task")
+    );
+}
+
+#[test]
+fn short_form_bindings_resolve_to_single_candidate_chains() {
+    let mut document = document(&["a"], &[("p", "a")], &[]);
+    document
+        .bindings
+        .insert("role".to_owned(), awp::Binding::Profile("p".to_owned()));
+    let registry = Registry::from_document(document).unwrap();
+    let chain = registry.resolve_chain("role").unwrap();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].profile().id, "p");
 }

@@ -140,6 +140,10 @@ impl VirtualAgent {
     /// only when that lane applies them at session establishment; turn-only
     /// defaults are carried by `VirtualSession`. Explicit session config wins.
     /// Mode and permission remain session selectors.
+    ///
+    /// The profile's model chain is seeded here: the first chain entry the
+    /// lane accepts becomes the session model, the rest stay as turn-level
+    /// fallbacks a failed prompt may advance to on the same session.
     pub async fn open_session(
         &self,
         mut request: SessionRequest,
@@ -151,11 +155,12 @@ impl VirtualAgent {
         let session_selectors = self.spec.selector_support(SelectorPhase::Session);
         let mut turn_model_default = None;
         let mut turn_effort_default = None;
+        let chain = self.profile.model_chain();
         if request.config.model.is_none() {
             if session_selectors.model != SelectorSupport::Unsupported {
-                request.config.model = self.profile.model.clone();
+                request.config.model = chain.first().cloned();
             } else {
-                turn_model_default = self.profile.model.clone();
+                turn_model_default = chain.first().cloned();
             }
         }
         if request.config.mode.is_none() {
@@ -171,17 +176,120 @@ impl VirtualAgent {
         if request.config.permission.is_none() {
             request.config.permission = self.profile.permission.clone();
         }
-        let session = self.adapter().open_session(request, events).await?;
+        // A requested model the agent cannot express at establishment
+        // advances the chain before the first turn is even attempted.
+        let session = loop {
+            let result = self
+                .adapter()
+                .open_session(request.clone(), events.clone())
+                .await;
+            match result {
+                Err(error) if model_failure(&error) => {
+                    let Some(next) = next_model(&chain, request.config.model.as_deref()) else {
+                        return Err(error);
+                    };
+                    request.config.model = Some(next);
+                }
+                result => break result?,
+            }
+        };
+        let active_model = request
+            .config
+            .model
+            .clone()
+            .or_else(|| turn_model_default.clone());
+        let remaining_models = remaining_models(&chain, active_model.as_deref());
         Ok(VirtualSession {
             session: Arc::new(session),
             profile: self.profile.clone(),
             turn_model_default,
             turn_effort_default,
+            model_state: Arc::new(std::sync::Mutex::new(ModelChain {
+                active: active_model,
+                remaining: remaining_models,
+            })),
             stateless_lane: matches!(self.spec.lane, LaneSpec::Cli(_)),
             instructions_sent: Arc::new(AtomicBool::new(false)),
             turn_lock: Arc::new(Mutex::new(())),
         })
     }
+}
+
+/// Model fallback state for one session: the model currently selected and
+/// the remaining chain entries a failed turn may advance to.
+#[derive(Default)]
+struct ModelChain {
+    active: Option<String>,
+    remaining: Vec<String>,
+}
+
+/// Chain entries that remain after `active` — every entry once `active` is
+/// not part of the chain.
+fn remaining_models(chain: &[String], active: Option<&str>) -> Vec<String> {
+    match active.and_then(|value| chain.iter().position(|entry| entry == value)) {
+        Some(index) => chain[index + 1..].to_vec(),
+        None => chain.to_vec(),
+    }
+}
+
+/// The next chain entry after `current`, or the chain head when `current`
+/// is outside the chain.
+fn next_model(chain: &[String], current: Option<&str>) -> Option<String> {
+    match current.and_then(|value| chain.iter().position(|entry| entry == value)) {
+        Some(index) => chain.get(index + 1).cloned(),
+        None => chain.first().cloned(),
+    }
+}
+
+/// Provider-side model exhaustion or rejection signatures. Matched against
+/// the error detail — agents report quota and availability failures as
+/// free-form protocol errors, so the patterns stay conservative: a match
+/// means the turn provably could not complete on this model.
+const MODEL_EXHAUSTION: &[&str] = &[
+    "rate limit",
+    "ratelimit",
+    "quota",
+    "insufficient",
+    "overloaded",
+    "capacity",
+    "429",
+    "too many requests",
+    "resource_exhausted",
+    "model unavailable",
+    "model not found",
+    "no such model",
+    "does not exist",
+    "unsupported model",
+];
+
+/// A requested model the agent cannot express (`agent_configuration_unavailable`
+/// names the rejected slot in its detail).
+fn model_rejected(error: &a4aa::AdapterError) -> bool {
+    error.code == "agent_configuration_unavailable"
+        && error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("model "))
+}
+
+/// A failure worth retrying on the session's next model: explicit model
+/// rejection, or a protocol failure at the prompt/model-selection stage
+/// whose detail reads as provider-side exhaustion or unavailability.
+fn model_failure(error: &a4aa::AdapterError) -> bool {
+    if model_rejected(error) {
+        return true;
+    }
+    error.code == "agent_protocol_failed"
+        && matches!(
+            error.stage,
+            "session/prompt" | "session/set_model" | "session/set_config_option"
+        )
+        && error.detail.as_deref().is_some_and(|detail| {
+            let detail = detail.to_lowercase();
+            MODEL_EXHAUSTION
+                .iter()
+                .any(|pattern| detail.contains(pattern))
+        })
 }
 
 /// An open session on a virtual agent. Profile turn semantics apply here:
@@ -194,6 +302,9 @@ pub struct VirtualSession {
     /// SessionRequest so an explicit open-session value is never replaced.
     turn_model_default: Option<String>,
     turn_effort_default: Option<String>,
+    /// The session's model chain: a turn that fails on the active model is
+    /// retried against the next entry — same session, same composed prompt.
+    model_state: Arc<std::sync::Mutex<ModelChain>>,
     /// Stateless lanes (cli) start a fresh process per turn, so instructions
     /// are delivered on every prompt regardless of `InstructionMode`.
     stateless_lane: bool,
@@ -211,6 +322,17 @@ impl VirtualSession {
     /// The profile this session runs.
     pub fn profile(&self) -> &Profile {
         &self.profile
+    }
+
+    /// The model currently serving this session — the profile's first
+    /// accepted chain entry at establishment, or the entry a failed turn
+    /// most recently fell back to.
+    pub fn active_model(&self) -> Option<String> {
+        self.model_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active
+            .clone()
     }
 
     /// The text a prompt would send for `text` under the profile's
@@ -272,9 +394,35 @@ impl VirtualSession {
     ) -> a4aa::Result<TurnOutcome> {
         let session = self.session.clone();
         let instructions_sent = self.instructions_sent.clone();
+        let model_state = self.model_state.clone();
         tokio::spawn(async move {
             let _turn = turn;
-            let outcome = session.prompt(request).await;
+            let mut request = request;
+            let outcome = loop {
+                let outcome = session.prompt(request.clone()).await;
+                let next = match &outcome {
+                    // The model itself could not serve this turn: advance
+                    // the chain and resubmit on the same session — ACP
+                    // applies a per-turn model through the session's own
+                    // configuration surface before dispatch.
+                    Err(error) if model_failure(error) => model_state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remaining
+                        .first()
+                        .cloned(),
+                    _ => None,
+                };
+                let Some(next) = next else { break outcome };
+                {
+                    let mut chain = model_state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    chain.remaining.remove(0);
+                    chain.active = Some(next.clone());
+                }
+                request.model = Some(next);
+            };
             // Preserve profile state and ordering even when only the caller's
             // waiter is dropped. A cancelled first attempt remains pending.
             if record_instructions

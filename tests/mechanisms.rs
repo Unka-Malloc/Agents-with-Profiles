@@ -3,6 +3,7 @@
 //! mechanisms tests — here only the profile-side wiring is exercised.
 
 use awp::{HookEvent, Registry, RegistryDocument, Support};
+use std::path::Path;
 
 const DOC: &str = r#"{
   "agents": {
@@ -110,4 +111,43 @@ fn resolved_agent_carries_mechanisms_for_adaptation() {
         .report
         .iter()
         .all(|entry| entry.support != Support::Unsupported || entry.item == "permissions"));
+}
+
+#[test]
+fn semantic_mechanisms_materialize_through_devin() {
+    // The same agent-neutral declarations drive a4aa-devin's surfaces:
+    // Claude-dialect hooks (incl. PostCompaction), skill-form commands,
+    // markdown subagents, `permissions` allow/deny/ask, mcp_config.
+    let mechanisms: awp::MechanismSet = serde_json::from_value(serde_json::json!({
+        "hooks": [
+            {"event": "user-prompt-submit", "command": "inject.sh"},
+            {"event": "post-compaction", "command": "compact.sh"},
+            {"event": "notification", "command": "notify.sh"}
+        ],
+        "commands": [{"name": "review", "content": "Run the review."}],
+        "subagents": [{"name": "verifier", "model": "opus", "instructions": "Verify."}],
+        "permissions": {
+            "allow": ["Exec(git)"],
+            "deny": ["Exec(rm)"],
+            "ask": ["Write(.env*)"]
+        },
+        "mcpServers": {"fs": {"command": "fs-mcp"}}
+    }))
+    .unwrap();
+    let plan = a4aa_devin::adapt(&mechanisms);
+    let has = |path: &str| plan.artifacts.iter().any(|a| a.path == Path::new(path));
+    assert!(has(".config/devin/config.json"));
+    assert!(has(".config/devin/skills/review/SKILL.md"));
+    assert!(has(".config/devin/agents/verifier.md"));
+    assert!(has(".config/devin/mcp_config.json"));
+    let support = |item: &str| {
+        plan.report
+            .iter()
+            .find(|e| e.item == item)
+            .unwrap_or_else(|| panic!("{item} reported"))
+            .support
+    };
+    assert_eq!(support("hooks.post-compaction"), Support::Native);
+    // Devin's hook store has no Notification event — reported, not dropped.
+    assert_eq!(support("hooks.notification"), Support::Unsupported);
 }

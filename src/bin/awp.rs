@@ -376,16 +376,40 @@ fn failure(message: &str) -> i32 {
 ///   text, then `{"stopReason":"end_turn"}`. Magic words:
 ///   `wait-for-cancel` streams chunks until `session/cancel`, answered with
 ///   `{"stopReason":"cancelled"}`.
+/// - `AWP_FIXTURE_MODELS=m1,m2` advertises a select `model` configOption
+///   and honors `session/set_config_option`; `AWP_FIXTURE_QUOTA=m1` makes
+///   prompts answered while `m1` is current fail with a provider
+///   rate-limit error — the model-fallback test surface.
 fn fixture_agent() -> i32 {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut deferred_prompt: Option<(Value, String)> = None;
+    let models: Vec<String> = std::env::var("AWP_FIXTURE_MODELS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let quota: Vec<String> = std::env::var("AWP_FIXTURE_QUOTA")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut current_model = models.first().cloned().unwrap_or_default();
 
     let write = |value: Value| {
         let mut out = stdout.lock();
         let _ = out.write_all(value.to_string().as_bytes());
         let _ = out.write_all(b"\n");
         let _ = out.flush();
+    };
+    let model_option = |current: &str| -> Value {
+        json!({
+            "id": "model", "category": "model", "name": "Model", "type": "select",
+            "currentValue": current,
+            "options": models.iter().map(|m| json!({"value": m, "name": m})).collect::<Vec<_>>()
+        })
     };
 
     for line in stdin.lock().lines() {
@@ -416,8 +440,27 @@ fn fixture_agent() -> i32 {
             })),
             "session/new" => write(json!({
                 "jsonrpc": "2.0", "id": id,
-                "result": {"sessionId": "fixture-session-1"}
+                "result": {
+                    "sessionId": "fixture-session-1",
+                    "configOptions": if models.is_empty() { json!([]) } else { json!([model_option(&current_model)]) },
+                }
             })),
+            "session/set_config_option" | "session/setConfigOption" => {
+                let config_id = params.get("configId").and_then(Value::as_str).unwrap_or("");
+                let value = params.get("value").and_then(Value::as_str).unwrap_or("");
+                if config_id == "model" && models.iter().any(|m| m == value) {
+                    current_model = value.to_owned();
+                    write(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"configOptions": [model_option(&current_model)]}
+                    }));
+                } else {
+                    write(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32602, "message": "unknown config option or value"}
+                    }));
+                }
+            }
             "session/load" | "session/resume" => write(json!({
                 "jsonrpc": "2.0", "id": id,
                 "result": {"sessionId": params.get("sessionId").cloned().unwrap_or(json!("fixture-resumed"))}
@@ -446,6 +489,14 @@ fn fixture_agent() -> i32 {
                     .to_owned();
                 if prompt_text.contains("wait-for-cancel") {
                     deferred_prompt = Some((id.unwrap_or(Value::Null), session_id));
+                    continue;
+                }
+                if quota.iter().any(|m| m == &current_model) {
+                    write(json!({
+                        "jsonrpc": "2.0", "id": id.unwrap_or(Value::Null),
+                        "error": {"code": -32000,
+                                  "message": "AI.Error: Rate limit exceeded. Please try again later."}
+                    }));
                     continue;
                 }
                 let chunk = format!("echo: {prompt_text}");

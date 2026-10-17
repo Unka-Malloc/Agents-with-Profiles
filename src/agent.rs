@@ -325,22 +325,23 @@ fn next_model(chain: &[String], current: Option<&str>) -> Option<String> {
 
 /// Provider-side model exhaustion or rejection signatures. Matched against
 /// the error detail — agents report quota and availability failures as
-/// free-form protocol errors, so the patterns stay conservative: a match
-/// means the turn provably could not complete on this model.
+/// free-form protocol errors, so the patterns stay narrow: a match means
+/// the turn provably could not complete on this model. Bare status codes
+/// and generic phrases ("insufficient", "capacity", "does not exist") are
+/// excluded — they describe permissions and unrelated objects too often
+/// to reroute a turn.
 const MODEL_EXHAUSTION: &[&str] = &[
     "rate limit",
     "ratelimit",
-    "quota",
-    "insufficient",
-    "overloaded",
-    "capacity",
-    "429",
     "too many requests",
     "resource_exhausted",
+    "quota",
+    "insufficient_quota",
+    "overloaded",
     "model unavailable",
     "model not found",
     "no such model",
-    "does not exist",
+    "model does not exist",
     "unsupported model",
 ];
 

@@ -147,16 +147,24 @@ agent's knowledge is a `Dialect` const in its own `a4aa-<agent>` crate
 declarations. The parser validates and normalizes them — it contains no
 per-agent schema knowledge:
 
-- `hooks.<event>` — semantic event set (`session_start`, `user_prompt`,
-  `pre_tool`, `post_tool`, `stop`, `session_end`, `subagent_*`, `permission`);
-  `intent: enforce | inject | rewrite | notify` selects the semantics;
-  `match` carries the caller's filter expression.
-- `rules`, `skills`, `commands` — content references, dialect-free.
-- `subagents` — declarative role entries (name, model, instructions,
-  sandbox), dialect-free.
-- `plugins` — installable references (package, marketplace name, local path).
-- `mcpServers`, `permissions`, `env`, `nativeProfile` — already-shaped
-  declarations that pass through to the adapter.
+- `hooks` — array of `{event, command, intent, matcher, timeout}`. `event`
+  uses the kebab-case wire set `session-start`, `session-end`,
+  `user-prompt-submit`, `pre-tool-use`, `post-tool-use`, `stop`,
+  `subagent-start`, `subagent-stop`, `permission-request`, `notification`,
+  `post-compaction`; `intent: enforce | inject | rewrite | notify` selects
+  the semantics; `matcher` carries the tool filter where the dialect
+  supports it.
+- `rules` — `{name, content}` entries materialized into a managed block.
+- `skills` — `{name, content}` entries, one `SKILL.md` each.
+- `commands` — `{name, description?, content}` slash commands.
+- `subagents` — `{name, description?, model?, effort?, sandbox?,
+  instructions}` role entries, dialect-free.
+- `plugins` — `{id, source?, enabled}` installable references (package,
+  marketplace name, local path).
+- `permissions` — `{mode?, allow[], deny[], ask[]}` posture declarations.
+- `mcpServers` — config-file MCP servers keyed by name (distinct from the
+  profile's per-session `mcpServers`, which flow through the ACP lane).
+- `nativeProfile` — selects the agent's own profile mechanism.
 
 **A4AA side (adaptation).** `adapt` translates the normalized declarations
 into the agent's dialect and returns an `AdaptationPlan` — artifacts plus a

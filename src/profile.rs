@@ -154,7 +154,7 @@ impl RetryPolicy {
     pub fn wakeup(&self, now: &jiff::Zoned, reset: Option<jiff::Zoned>) -> Option<jiff::Zoned> {
         if let Some(reset) = reset {
             let grace = self.reset_grace.unwrap_or_default();
-            return Some(reset.checked_add(grace).ok()?);
+            return reset.checked_add(grace).ok();
         }
         now.checked_add(self.interval?).ok()
     }

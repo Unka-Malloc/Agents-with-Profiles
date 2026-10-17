@@ -323,6 +323,9 @@ async fn run() -> i32 {
 
     let outcome = session.prompt(text).await;
     let close = session.close().await;
+    // The session's lane still holds an event sender; only its drop lets
+    // the drainer's `recv` observe quiescence and exit.
+    drop(session);
     let _ = drainer.await;
     match outcome {
         Ok(outcome) => {

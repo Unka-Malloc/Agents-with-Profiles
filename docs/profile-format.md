@@ -46,18 +46,27 @@ where it comes from.
     }
   },
   "bindings": {
-    // full form — profile plus a standing prompt
-    "review": {"profile": "reviewer", "prompt": "Check the diff."},
+    // full form — profile plus a standing prompt and ordered fallbacks
+    "review": {"profile": "reviewer", "prompt": "Check the diff.",
+               "fallbacks": ["reviewer-backup"]},
     // shorthand — a bare profile id
     "implement": "implementer"
   }
 }
 ```
 
-`agents` values are a4aa `AgentSpec`s verbatim (see the a4aa model docs).
+`agents` values are `AgentEntry` documents: the a4aa `AgentSpec` fields
+inline (flattened) plus an optional `alternates` array of further
+`AgentSpec`s — ordered protocol lanes for the same agent, tried after the
+primary lane cannot establish or finish a turn (for example a native
+`serve` lane ahead of the `acp` bridge). An absent `alternates` is a
+single-lane entry.
 The example uses a hypothetical ACP executable. For a supported real agent,
 use its `a4aa-<agent>::spec()` descriptor and supported selector values.
-`bindings` name which profile serves a role or task slot. Unknown fields
+`bindings` name which profile serves a role or task slot; the full form
+may add `fallbacks`: an ordered list of profile ids tried when the primary
+profile's candidates cannot open or complete (cross-agent fallback). A
+`null` binding value removes the slot on overlay. Unknown fields
 are rejected (`deny_unknown_fields`) — a typo is a load error, not a silent
 default.
 
@@ -69,6 +78,9 @@ default.
 | `id`, `name`, `revision` | identity | `revision` is an explicit operator-maintained version string — never inferred from content. `principal_id()` returns `profile:<id>`. |
 | `instructions`, `instructionMode` | materialized | Composed into prompt text (`instructions\n\n<text>`). `first-turn` sends once per session-bound lane (`acp`, `rpc`); `every-turn` always. Stateless `cli` lanes deliver on every turn — each turn is a fresh process. |
 | `model`, `effort` | materialized | Defaults applied at the session or turn phase supported by the A4AA adapter. Explicit session configuration wins over profile defaults. Explicit turn selectors are honored where the lane supports them; unsupported selections fail before the turn begins. ACP values use negotiated configuration. |
+| `models` | materialized | Same-agent fallback chain behind `model`: when the head model's provider answers exhaustion, the next chain entry serves the turn. |
+| `windows` | materialized | Time-windowed model routing — `[{timezone, from, to, model, models}]`. `from`/`to` are `"HH:MM"` in the named IANA zone; a `to` earlier than `from` wraps midnight. While a window covers now its own `model`/`models` chain heads selection; uncovered minutes fall back to the profile's plain `model`/`models`. |
+| `retry` | materialized | Quota-recovery schedule declared for the host orchestrator — `{interval, resetGrace}` durations (`"3h1m"` or ISO 8601). Nothing sleeps inside the crate; `wakeup()` computes the earliest eligible next attempt after chain exhaustion. |
 | `cwd` | materialized | Default session working directory; an explicit `SessionRequest.cwd` wins. |
 | `env` | materialized | Merged per key into the spec's environment policy `set` — literals and `{"secret": …}` / `{"hostEnv": …}` indirections resolve at spawn like any spec entry. |
 | `mcpServers` | materialized | Appended to the `acp` lane's `mcpServers` after the spec's own. Ignored on lanes without an MCP surface. |

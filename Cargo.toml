@@ -29,6 +29,7 @@ dialects = ["dep:a4aa-dialects"]
 [dependencies]
 a4aa = { path = "../Adapter-For-All-Agents", version = "0.2.0" }
 a4aa-dialects = { path = "../Adapter-For-All-Agents/crates/a4aa-dialects", version = "0.2.0", optional = true }
+jiff = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [

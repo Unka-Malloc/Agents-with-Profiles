@@ -34,15 +34,56 @@ use crate::profile::{Profile, ProfilePatch};
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegistryDocument {
-    /// Agent specs keyed by spec id.
+    /// Agent entries keyed by spec id.
     #[serde(default)]
-    pub agents: BTreeMap<String, AgentSpec>,
+    pub agents: BTreeMap<String, AgentEntry>,
     /// Profile patches keyed by profile id.
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfilePatch>,
     /// Role/task bindings keyed by binding name.
     #[serde(default)]
     pub bindings: BTreeMap<String, Binding>,
+}
+
+/// One agent entry: the primary spec plus ordered protocol alternates for
+/// the same agent. When the primary lane cannot carry the work — the
+/// transport fails to start, the handshake never completes, or the lane
+/// dies mid-turn for reasons a model change cannot fix — the next
+/// alternate spec drives the same agent over its own protocol. Every
+/// alternate is a complete spec (own lane, own command line), declared
+/// rather than merged.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentEntry {
+    #[serde(flatten)]
+    pub spec: AgentSpec,
+    /// Ordered lane alternates tried after the primary spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternates: Vec<AgentSpec>,
+}
+
+impl AgentEntry {
+    /// An entry with a single lane — the common case in documents and
+    /// tests.
+    pub fn single(spec: AgentSpec) -> Self {
+        Self {
+            spec,
+            alternates: Vec::new(),
+        }
+    }
+
+    /// Every lane variant in fallback order: primary first, alternates
+    /// next — one entry per protocol the same agent speaks.
+    pub fn lane_specs(&self) -> Vec<AgentSpec> {
+        std::iter::once(self.spec.clone())
+            .chain(self.alternates.iter().cloned())
+            .collect()
+    }
+}
+
+impl From<AgentSpec> for AgentEntry {
+    fn from(spec: AgentSpec) -> Self {
+        Self::single(spec)
+    }
 }
 
 /// A role or task slot: which profile serves it, plus a standing prompt
@@ -112,7 +153,7 @@ pub struct Selection {
 /// A validated, layered store of agents, profiles and bindings.
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
-    agents: BTreeMap<String, AgentSpec>,
+    agents: BTreeMap<String, AgentEntry>,
     profiles: BTreeMap<String, Profile>,
     bindings: BTreeMap<String, Binding>,
 }
@@ -142,18 +183,18 @@ impl Registry {
     /// validation leaves the registry untouched.
     pub fn apply(&mut self, document: RegistryDocument) -> a4aa::Result<()> {
         let mut next = self.clone();
-        for (id, spec) in document.agents {
-            if spec.id != id {
+        for (id, entry) in document.agents {
+            if entry.spec.id != id {
                 return Err(AdapterError::permanent(
                     "registry_agent_id_mismatch",
                     "registry/apply",
                 )
                 .with_detail(format!(
                     "agent key `{id}` does not match spec id `{}`",
-                    spec.id
+                    entry.spec.id
                 )));
             }
-            next.agents.insert(id, spec);
+            next.agents.insert(id, entry);
         }
         for (id, patch) in document.profiles {
             match next.profiles.get_mut(&id) {
@@ -212,8 +253,11 @@ impl Registry {
         Ok(())
     }
 
+    /// The primary spec of one agent entry. Lane alternates are part of
+    /// materialization, so callers resolving the agent for execution use
+    /// [`Registry::resolve`]; this getter exists for inspection.
     pub fn agent(&self, id: &str) -> Option<&AgentSpec> {
-        self.agents.get(id)
+        self.agents.get(id).map(|entry| &entry.spec)
     }
 
     pub fn profile(&self, id: &str) -> Option<&Profile> {
@@ -227,7 +271,7 @@ impl Registry {
     }
 
     pub fn agents(&self) -> impl ExactSizeIterator<Item = &AgentSpec> {
-        self.agents.values()
+        self.agents.values().map(|entry| &entry.spec)
     }
 
     pub fn profiles(&self) -> impl ExactSizeIterator<Item = &Profile> {
@@ -246,7 +290,7 @@ impl Registry {
             AdapterError::permanent("profile_unknown", "registry/resolve")
                 .with_detail(format!("unknown profile `{profile_id}`"))
         })?;
-        let spec = self.agents.get(&profile.agent).ok_or_else(|| {
+        let entry = self.agents.get(&profile.agent).ok_or_else(|| {
             AdapterError::permanent("profile_agent_unknown", "registry/resolve").with_detail(
                 format!(
                     "profile `{profile_id}` references unknown agent `{}`",
@@ -254,7 +298,10 @@ impl Registry {
                 ),
             )
         })?;
-        Ok(crate::VirtualAgent::new(profile.clone(), spec.clone()))
+        Ok(crate::VirtualAgent::new(
+            profile.clone(),
+            entry.lane_specs(),
+        ))
     }
 
     /// Resolve a binding: the profile plus its composed standing
@@ -309,7 +356,7 @@ impl Registry {
                 .clone();
             profile.instructions =
                 compose_instructions(profile.instructions.as_deref(), prompt.as_deref());
-            let spec = self.agents.get(&profile.agent).ok_or_else(|| {
+            let entry = self.agents.get(&profile.agent).ok_or_else(|| {
                 AdapterError::permanent("profile_agent_unknown", "registry/resolve").with_detail(
                     format!(
                         "profile `{}` references unknown agent `{}`",
@@ -317,7 +364,7 @@ impl Registry {
                     ),
                 )
             })?;
-            candidates.push(crate::VirtualAgent::new(profile, spec.clone()));
+            candidates.push(crate::VirtualAgent::new(profile, entry.lane_specs()));
         }
         Ok(candidates)
     }

@@ -36,39 +36,54 @@ pub fn compose_prompt(instructions: Option<&str>, text: &str) -> String {
     }
 }
 
-/// One base agent spec materialized with one profile.
+/// One base agent materialized with one profile: the profile's resolved
+/// profile plus every lane variant the agent declares, in fallback order.
 ///
-/// The agent holds the effective spec and the adapter hooks; each
+/// The agent holds the effective specs and the adapter hooks; each
 /// `open_session` builds a fresh [`a4aa::Adapter`] on the caller's runtime.
 pub struct VirtualAgent {
     profile: Profile,
-    spec: AgentSpec,
+    /// Lane variants in fallback order — index 0 is the declared primary.
+    specs: Vec<AgentSpec>,
     secrets: Arc<dyn SecretResolver>,
     observer: SharedObserver,
     permission: Option<Arc<dyn PermissionHandler>>,
     before_turn: Option<Arc<dyn BeforeTurn>>,
 }
 
-impl VirtualAgent {
-    /// Materialize `profile` onto `spec`: profile environment entries merge
-    /// into the command's environment policy `set`, profile MCP servers
-    /// append to the `acp` lane (other lanes keep none — they have no MCP
-    /// surface).
-    pub fn new(profile: Profile, mut spec: AgentSpec) -> Self {
-        if !profile.env.is_empty() {
-            let set = match &mut spec.command.env {
-                EnvPolicy::Sanitized { set, .. } | EnvPolicy::InheritAll { set } => set,
-            };
-            for (name, value) in &profile.env {
-                set.insert(name.clone(), value.clone());
-            }
+/// Fold the profile into one spec: environment entries merge into the
+/// command's environment policy `set`, profile MCP servers append to any
+/// lane that carries an MCP surface (`acp` session/new, `serve` config
+/// document) — lanes without one keep none.
+fn materialize(profile: &Profile, spec: &mut AgentSpec) {
+    if !profile.env.is_empty() {
+        let set = match &mut spec.command.env {
+            EnvPolicy::Sanitized { set, .. } | EnvPolicy::InheritAll { set } => set,
+        };
+        for (name, value) in &profile.env {
+            set.insert(name.clone(), value.clone());
         }
-        if let LaneSpec::Acp { mcp_servers, .. } = &mut spec.lane {
-            mcp_servers.extend(profile.mcp_servers.iter().cloned());
+    }
+    let servers = match &mut spec.lane {
+        LaneSpec::Acp { mcp_servers, .. } | LaneSpec::Serve { mcp_servers } => mcp_servers,
+        _ => return,
+    };
+    servers.extend(profile.mcp_servers.iter().cloned());
+}
+
+impl VirtualAgent {
+    /// Materialize `profile` onto every declared lane variant. `specs` is
+    /// the agent's lane list in fallback order: primary first, then each
+    /// protocol alternate — the first entry is the effective spec reported
+    /// by [`VirtualAgent::spec`].
+    pub fn new(profile: Profile, specs: Vec<AgentSpec>) -> Self {
+        let mut specs = specs;
+        for spec in &mut specs {
+            materialize(&profile, spec);
         }
         Self {
             profile,
-            spec,
+            specs,
             secrets: Arc::new(a4aa::NoSecrets),
             observer: a4aa::observe::none(),
             permission: None,
@@ -101,28 +116,34 @@ impl VirtualAgent {
         &self.profile
     }
 
-    /// The effective spec after materialization — the same value a
-    /// `resolve` call emits for foreign hosts.
+    /// The effective spec after materialization — the primary lane variant,
+    /// the same value a `resolve` call emits for foreign hosts.
     pub fn spec(&self) -> &AgentSpec {
-        &self.spec
+        &self.specs[0]
     }
 
-    /// The lane this agent speaks.
+    /// Every lane variant in fallback order.
+    pub fn lane_specs(&self) -> &[AgentSpec] {
+        &self.specs
+    }
+
+    /// The primary lane this agent speaks.
     pub fn lane_kind(&self) -> LaneKind {
-        match &self.spec.lane {
+        match &self.specs[0].lane {
             LaneSpec::Acp { .. } => LaneKind::Acp,
             LaneSpec::Rpc(_) => LaneKind::Rpc,
             LaneSpec::Cli(_) => LaneKind::Cli,
+            LaneSpec::Serve { .. } => LaneKind::Serve,
         }
     }
 
     /// Negotiated-static capability picture, straight from the adapter.
     pub fn capabilities(&self) -> Capabilities {
-        self.adapter().capabilities()
+        self.adapter(&self.specs[0]).capabilities()
     }
 
-    fn adapter(&self) -> Adapter {
-        let mut adapter = Adapter::new(self.spec.clone())
+    fn adapter(&self, spec: &AgentSpec) -> Adapter {
+        let mut adapter = Adapter::new(spec.clone())
             .secrets(self.secrets.clone())
             .observer(self.observer.clone());
         if let Some(handler) = &self.permission {
@@ -141,9 +162,12 @@ impl VirtualAgent {
     /// defaults are carried by `VirtualSession`. Explicit session config wins.
     /// Mode and permission remain session selectors.
     ///
-    /// The profile's model chain is seeded here: the first chain entry the
-    /// lane accepts becomes the session model, the rest stay as turn-level
-    /// fallbacks a failed prompt may advance to on the same session.
+    /// Lane fallback happens here: each declared lane variant gets the full
+    /// model chain, and a failure the model chain cannot explain (transport,
+    /// handshake, a lane that cannot express a requested selector) advances
+    /// to the next lane. Provider-side model exhaustion skips the remaining
+    /// lanes — the same account answers every protocol, so the caller's
+    /// profile fallback is the right next step.
     pub async fn open_session(
         &self,
         mut request: SessionRequest,
@@ -152,66 +176,124 @@ impl VirtualAgent {
         if request.cwd.is_none() {
             request.cwd = self.profile.cwd.clone();
         }
-        let session_selectors = self.spec.selector_support(SelectorPhase::Session);
-        let mut turn_model_default = None;
-        let mut turn_effort_default = None;
-        let chain = self.profile.model_chain();
-        if request.config.model.is_none() {
-            if session_selectors.model != SelectorSupport::Unsupported {
-                request.config.model = chain.first().cloned();
-            } else {
-                turn_model_default = chain.first().cloned();
-            }
-        }
-        if request.config.mode.is_none() {
-            request.config.mode = self.profile.mode.clone();
-        }
-        if request.config.effort.is_none() {
-            if session_selectors.effort != SelectorSupport::Unsupported {
-                request.config.effort = self.profile.effort.clone();
-            } else {
-                turn_effort_default = self.profile.effort.clone();
-            }
-        }
-        if request.config.permission.is_none() {
-            request.config.permission = self.profile.permission.clone();
-        }
-        // A requested model the agent cannot express at establishment
-        // advances the chain before the first turn is even attempted.
-        let session = loop {
-            let result = self
-                .adapter()
-                .open_session(request.clone(), events.clone())
-                .await;
-            match result {
-                Err(error) if model_failure(&error) => {
-                    let Some(next) = next_model(&chain, request.config.model.as_deref()) else {
-                        return Err(error);
-                    };
-                    request.config.model = Some(next);
+        let chain = self.profile.effective_chain(&jiff::Zoned::now());
+        let mut lane_error = None;
+        for (lane_index, spec) in self.specs.iter().enumerate() {
+            let session_selectors = spec.selector_support(SelectorPhase::Session);
+            let mut turn_model_default = None;
+            let mut turn_effort_default = None;
+            let mut lane_request = request.clone();
+            if lane_request.config.model.is_none() {
+                if session_selectors.model != SelectorSupport::Unsupported {
+                    lane_request.config.model = chain.first().cloned();
+                } else {
+                    turn_model_default = chain.first().cloned();
                 }
-                result => break result?,
             }
-        };
-        let active_model = request
-            .config
-            .model
-            .clone()
-            .or_else(|| turn_model_default.clone());
-        let remaining_models = remaining_models(&chain, active_model.as_deref());
-        Ok(VirtualSession {
-            session: Arc::new(session),
-            profile: self.profile.clone(),
-            turn_model_default,
-            turn_effort_default,
-            model_state: Arc::new(std::sync::Mutex::new(ModelChain {
-                active: active_model,
-                remaining: remaining_models,
-            })),
-            stateless_lane: matches!(self.spec.lane, LaneSpec::Cli(_)),
-            instructions_sent: Arc::new(AtomicBool::new(false)),
-            turn_lock: Arc::new(Mutex::new(())),
-        })
+            if lane_request.config.mode.is_none() {
+                lane_request.config.mode = self.profile.mode.clone();
+            }
+            if lane_request.config.effort.is_none() {
+                if session_selectors.effort != SelectorSupport::Unsupported {
+                    lane_request.config.effort = self.profile.effort.clone();
+                } else {
+                    turn_effort_default = self.profile.effort.clone();
+                }
+            }
+            if lane_request.config.permission.is_none() {
+                lane_request.config.permission = self.profile.permission.clone();
+            }
+            // A requested model the lane cannot express at establishment
+            // advances the chain before the first turn is even attempted.
+            let session = loop {
+                let result = self
+                    .adapter(spec)
+                    .open_session(lane_request.clone(), events.clone())
+                    .await;
+                match result {
+                    Err(error) if model_failure(&error) => {
+                        let Some(next) = next_model(&chain, lane_request.config.model.as_deref())
+                        else {
+                            // Model exhaustion is provider-side: remaining
+                            // lanes answer from the same account, so the
+                            // failure belongs to the caller's next profile.
+                            return Err(error);
+                        };
+                        lane_request.config.model = Some(next);
+                    }
+                    Err(error) => {
+                        lane_error = Some(error);
+                        break None;
+                    }
+                    Ok(session) => break Some((session, lane_request)),
+                }
+            };
+            let Some((session, effective_request)) = session else {
+                continue;
+            };
+            let active_model = effective_request
+                .config
+                .model
+                .clone()
+                .or_else(|| turn_model_default.clone());
+            let remaining_models = remaining_models(&chain, active_model.as_deref());
+            return Ok(VirtualSession {
+                session: Arc::new(tokio::sync::RwLock::new(session)),
+                profile: self.profile.clone(),
+                turn_model_default,
+                turn_effort_default,
+                model_state: Arc::new(std::sync::Mutex::new(ModelChain {
+                    active: active_model,
+                    remaining: remaining_models,
+                })),
+                lane: LaneState {
+                    specs: self.specs.clone(),
+                    index: lane_index,
+                    open: effective_request,
+                    events: events.clone(),
+                    secrets: self.secrets.clone(),
+                    observer: self.observer.clone(),
+                    permission: self.permission.clone(),
+                    before_turn: self.before_turn.clone(),
+                },
+                stateless_lane: Arc::new(AtomicBool::new(matches!(spec.lane, LaneSpec::Cli(_)))),
+                instructions_sent: Arc::new(AtomicBool::new(false)),
+                turn_lock: Arc::new(Mutex::new(())),
+            });
+        }
+        Err(lane_error
+            .unwrap_or_else(|| a4aa::AdapterError::permanent("agent_unavailable", "session/open")))
+    }
+}
+
+/// The lane-fallback state one open session carries: every declared spec
+/// plus everything needed to reopen the session on the next lane when the
+/// current one fails for non-model reasons.
+#[derive(Clone)]
+struct LaneState {
+    specs: Vec<AgentSpec>,
+    index: usize,
+    /// The request the active lane opened with — replayed on the next lane.
+    open: SessionRequest,
+    events: mpsc::UnboundedSender<AgentEvent>,
+    secrets: Arc<dyn SecretResolver>,
+    observer: SharedObserver,
+    permission: Option<Arc<dyn PermissionHandler>>,
+    before_turn: Option<Arc<dyn BeforeTurn>>,
+}
+
+impl LaneState {
+    fn adapter(&self, index: usize) -> Adapter {
+        let mut adapter = Adapter::new(self.specs[index].clone())
+            .secrets(self.secrets.clone())
+            .observer(self.observer.clone());
+        if let Some(handler) = &self.permission {
+            adapter = adapter.permission(handler.clone());
+        }
+        if let Some(hook) = &self.before_turn {
+            adapter = adapter.before_turn(hook.clone());
+        }
+        adapter
     }
 }
 
@@ -273,8 +355,10 @@ fn model_rejected(error: &a4aa::AdapterError) -> bool {
 }
 
 /// A failure worth retrying on the session's next model: explicit model
-/// rejection, or a protocol failure at the prompt/model-selection stage
-/// whose detail reads as provider-side exhaustion or unavailability.
+/// rejection, or a protocol failure at the session/model-selection stage
+/// whose detail reads as provider-side exhaustion or unavailability. An
+/// open-stage failure with that signature means the provider declined the
+/// session's model — same treatment, never a lane fault.
 fn model_failure(error: &a4aa::AdapterError) -> bool {
     if model_rejected(error) {
         return true;
@@ -282,7 +366,7 @@ fn model_failure(error: &a4aa::AdapterError) -> bool {
     error.code == "agent_protocol_failed"
         && matches!(
             error.stage,
-            "session/prompt" | "session/set_model" | "session/set_config_option"
+            "session/open" | "session/prompt" | "session/set_model" | "session/set_config_option"
         )
         && error.detail.as_deref().is_some_and(|detail| {
             let detail = detail.to_lowercase();
@@ -295,7 +379,7 @@ fn model_failure(error: &a4aa::AdapterError) -> bool {
 /// An open session on a virtual agent. Profile turn semantics apply here:
 /// instructions compose into prompt text, and turn-only defaults fill in.
 pub struct VirtualSession {
-    session: Arc<AgentSession>,
+    session: Arc<tokio::sync::RwLock<AgentSession>>,
     profile: Profile,
     /// Profile defaults for selectors the lane consumes per turn rather than
     /// at session establishment. Session-applied defaults stay with A4AA's
@@ -305,9 +389,13 @@ pub struct VirtualSession {
     /// The session's model chain: a turn that fails on the active model is
     /// retried against the next entry — same session, same composed prompt.
     model_state: Arc<std::sync::Mutex<ModelChain>>,
+    /// The lane variants behind this session and the material needed to
+    /// reopen it on the next lane after a transport-level failure.
+    lane: LaneState,
     /// Stateless lanes (cli) start a fresh process per turn, so instructions
-    /// are delivered on every prompt regardless of `InstructionMode`.
-    stateless_lane: bool,
+    /// are delivered on every prompt regardless of `InstructionMode`. A lane
+    /// switch re-evaluates this against the new lane's spec.
+    stateless_lane: Arc<AtomicBool>,
     instructions_sent: Arc<AtomicBool>,
     // Composition and submission share one turn boundary. Concurrent callers
     // must observe the previous turn's confirmed instruction-delivery state.
@@ -315,8 +403,11 @@ pub struct VirtualSession {
 }
 
 impl VirtualSession {
-    pub fn session_id(&self) -> &str {
-        self.session.session_id()
+    /// The native session id of the currently active lane. Empty while a
+    /// lane switch is in flight; callers needing a stable identity read it
+    /// once per completed turn.
+    pub async fn session_id(&self) -> String {
+        self.session.read().await.session_id().to_owned()
     }
 
     /// The profile this session runs.
@@ -346,7 +437,7 @@ impl VirtualSession {
     }
 
     fn instructions_due(&self) -> bool {
-        self.stateless_lane
+        self.stateless_lane.load(Ordering::Relaxed)
             || self.profile.instruction_mode == InstructionMode::EveryTurn
             || !self.instructions_sent.load(Ordering::Relaxed)
     }
@@ -366,7 +457,8 @@ impl VirtualSession {
     /// profile defaults; unset fields inherit them.
     pub async fn prompt_with(&self, mut request: TurnRequest) -> a4aa::Result<TurnOutcome> {
         let turn = self.turn_lock.clone().lock_owned().await;
-        if self.instructions_due() {
+        let instructions_included = self.instructions_due();
+        if instructions_included {
             request.text = compose_prompt(self.profile.instructions.as_deref(), &request.text);
         }
         if request.model.is_none() {
@@ -375,7 +467,8 @@ impl VirtualSession {
         if request.effort.is_none() {
             request.effort = self.turn_effort_default.clone();
         }
-        self.run_owned_prompt(request, turn, true).await
+        self.run_owned_prompt(request, turn, true, instructions_included)
+            .await
     }
 
     /// Submit one turn exactly as given — no instruction composition, no
@@ -383,7 +476,7 @@ impl VirtualSession {
     /// context through their own channel (skill files, harness prompts).
     pub async fn prompt_direct(&self, request: TurnRequest) -> a4aa::Result<TurnOutcome> {
         let turn = self.turn_lock.clone().lock_owned().await;
-        self.run_owned_prompt(request, turn, false).await
+        self.run_owned_prompt(request, turn, false, false).await
     }
 
     async fn run_owned_prompt(
@@ -391,37 +484,104 @@ impl VirtualSession {
         request: TurnRequest,
         turn: tokio::sync::OwnedMutexGuard<()>,
         record_instructions: bool,
+        instructions_included: bool,
     ) -> a4aa::Result<TurnOutcome> {
         let session = self.session.clone();
         let instructions_sent = self.instructions_sent.clone();
         let model_state = self.model_state.clone();
+        let mut lane = self.lane.clone();
+        let stateless = self.stateless_lane.clone();
+        let profile = self.profile.clone();
         tokio::spawn(async move {
             let _turn = turn;
             let mut request = request;
-            let outcome = loop {
-                let outcome = session.prompt(request.clone()).await;
-                let next = match &outcome {
-                    // The model itself could not serve this turn: advance
-                    // the chain and resubmit on the same session — ACP
-                    // applies a per-turn model through the session's own
-                    // configuration surface before dispatch.
-                    Err(error) if model_failure(error) => model_state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .remaining
-                        .first()
-                        .cloned(),
-                    _ => None,
+            let mut instructions_included = instructions_included;
+            let outcome = 'lanes: loop {
+                // The model loop on the current lane: provider-side model
+                // failures advance the chain and resubmit on the same
+                // session.
+                let outcome = loop {
+                    let outcome = session.read().await.prompt(request.clone()).await;
+                    let next = match &outcome {
+                        // The model itself could not serve this turn:
+                        // advance the chain and resubmit — the lane's own
+                        // configuration surface applies the per-turn model
+                        // before dispatch.
+                        Err(error) if model_failure(error) => model_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .remaining
+                            .first()
+                            .cloned(),
+                        _ => None,
+                    };
+                    let Some(next) = next else { break outcome };
+                    {
+                        let mut chain = model_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        chain.remaining.remove(0);
+                        chain.active = Some(next.clone());
+                    }
+                    request.model = Some(next);
                 };
-                let Some(next) = next else { break outcome };
-                {
-                    let mut chain = model_state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    chain.remaining.remove(0);
-                    chain.active = Some(next.clone());
+                let lane_failed = match &outcome {
+                    // The whole model chain exhausted on this lane — the
+                    // failure is provider-side, so the caller's next
+                    // profile is the right escalation, not another lane.
+                    Err(error) if model_failure(error) => break 'lanes outcome,
+                    Err(_) => true,
+                    // A lane that reports the turn as failed without an
+                    // error channel — cli's nonzero exit surfaces as
+                    // `stop_reason: "error"` — could not serve this turn.
+                    Ok(result) => result.stop_reason == "error",
+                };
+                if !lane_failed {
+                    break 'lanes outcome;
                 }
-                request.model = Some(next);
+                // A failure no model change can fix — transport, protocol,
+                // a crashed server. Reopen the session on the next lane
+                // and replay the turn there.
+                loop {
+                    lane.index += 1;
+                    let Some(spec) = lane.specs.get(lane.index) else {
+                        break 'lanes outcome;
+                    };
+                    {
+                        let mut guard = session.write().await;
+                        let _ = guard.close().await;
+                        match lane
+                            .adapter(lane.index)
+                            .open_session(lane.open.clone(), lane.events.clone())
+                            .await
+                        {
+                            Ok(new_session) => {
+                                *guard = new_session;
+                            }
+                            Err(open_error) if model_failure(&open_error) => {
+                                break 'lanes Err(open_error);
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    lane.open.config.model.clone_from(
+                        &model_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .active,
+                    );
+                    stateless.store(matches!(spec.lane, LaneSpec::Cli(_)), Ordering::Relaxed);
+                    instructions_sent.store(false, Ordering::Relaxed);
+                    // The fresh session never heard this profile: if the
+                    // composed text skipped instructions on the old lane's
+                    // behalf, re-compose them into the replayed turn.
+                    if record_instructions && !instructions_included {
+                        request.text =
+                            compose_prompt(profile.instructions.as_deref(), &request.text);
+                        instructions_included = true;
+                    }
+                    continue 'lanes;
+                }
             };
             // Preserve profile state and ordering even when only the caller's
             // waiter is dropped. A cancelled first attempt remains pending.
@@ -442,11 +602,11 @@ impl VirtualSession {
 
     /// Explicit user cancellation of the in-flight turn.
     pub async fn cancel(&self) -> a4aa::Result<()> {
-        self.session.cancel().await
+        self.session.read().await.cancel().await
     }
 
     /// Close the session and terminate the agent process tree.
     pub async fn close(&self) -> a4aa::Result<()> {
-        self.session.close().await
+        self.session.read().await.close().await
     }
 }

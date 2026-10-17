@@ -49,6 +49,143 @@ pub enum InstructionMode {
     EveryTurn,
 }
 
+/// A peak/off-peak window for model selection: `timezone` is an IANA zone
+/// name (`"Asia/Shanghai"`), `from`/`to` are `"HH:MM"` wall-clock bounds in
+/// that zone. `from == to` covers the whole day; a range whose `from` is
+/// later than `to` wraps midnight. An unparseable window never matches.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelWindow {
+    pub timezone: String,
+    pub from: String,
+    pub to: String,
+    /// Window head model: selected first while the window covers now.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Window-local fallbacks behind `model`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+}
+
+impl ModelWindow {
+    /// Minutes after midnight in this window's timezone at `now`; `None`
+    /// when the zone name does not resolve.
+    pub fn minute_of_day(&self, now: &jiff::Zoned) -> Option<u16> {
+        let zone = jiff::tz::TimeZone::get(&self.timezone).ok()?;
+        let local = now.with_time_zone(zone).datetime().time();
+        Some(local.hour() as u16 * 60 + local.minute() as u16)
+    }
+
+    /// Whether `minute_of_day` (minutes after midnight, zone-local) is
+    /// covered. Normal ranges cover `from <= m < to`; wrapped ranges cover
+    /// `m >= from || m < to`; equal bounds cover every minute.
+    pub fn covers(&self, minute_of_day: u16) -> bool {
+        let (Some(from), Some(to)) = (minute(&self.from), minute(&self.to)) else {
+            return false;
+        };
+        if from == to {
+            true
+        } else if from < to {
+            (from..to).contains(&minute_of_day)
+        } else {
+            minute_of_day >= from || minute_of_day < to
+        }
+    }
+
+    /// The window's own chain: `model` first, then `models`, deduplicated.
+    fn model_chain(&self) -> Vec<String> {
+        let mut chain = Vec::new();
+        if let Some(model) = &self.model {
+            chain.push(model.clone());
+        }
+        for fallback in &self.models {
+            if !chain.contains(fallback) {
+                chain.push(fallback.clone());
+            }
+        }
+        chain
+    }
+}
+
+/// `"HH:MM"` as minutes after midnight; `None` for any other shape.
+fn minute(hhmm: &str) -> Option<u16> {
+    let (h, m) = hhmm.split_once(':')?;
+    if h.len() != 2 || m.len() != 2 {
+        return None;
+    }
+    let (h, m) = (h.parse::<u16>().ok()?, m.parse::<u16>().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+/// Quota-recovery policy: how an orchestrator schedules the next attempt
+/// after every candidate's model chain exhausted. Declarative — nothing
+/// sleeps here; the caller owns the clock and decides whether to poll or
+/// wake.
+///
+/// Durations accept the friendly form (`"3h1m"`, `"45s"`) or ISO 8601
+/// (`"PT3H1M"`); both serialize as ISO 8601.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetryPolicy {
+    /// Poll interval for an unknown reset window: the next attempt becomes
+    /// eligible `interval` after the last failure.
+    #[serde(
+        default,
+        with = "duration_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub interval: Option<jiff::SignedDuration>,
+    /// Grace added to a known reset instant — provider-reported or
+    /// caller-estimated — before resuming: a reset "3 hours from now"
+    /// wakes at 3h + `resetGrace`.
+    #[serde(
+        default,
+        with = "duration_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reset_grace: Option<jiff::SignedDuration>,
+}
+
+impl RetryPolicy {
+    /// The earliest instant the next attempt becomes eligible: a known
+    /// `reset` wins and is shifted by `resetGrace`; otherwise `interval`
+    /// after `now`. `None` means the policy carries no schedule for the
+    /// situation at hand — the caller decides what that means.
+    pub fn wakeup(&self, now: &jiff::Zoned, reset: Option<jiff::Zoned>) -> Option<jiff::Zoned> {
+        if let Some(reset) = reset {
+            let grace = self.reset_grace.unwrap_or_default();
+            return Some(reset.checked_add(grace).ok()?);
+        }
+        now.checked_add(self.interval?).ok()
+    }
+}
+
+/// `Option<jiff::SignedDuration>` as a duration string: friendly or
+/// ISO 8601 on the way in, ISO 8601 on the way out.
+mod duration_opt {
+    use jiff::SignedDuration;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        duration: &Option<SignedDuration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match duration {
+            Some(duration) => serializer.serialize_str(&duration.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<SignedDuration>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|raw| raw.parse::<SignedDuration>())
+            .transpose()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// A resolved profile: `id` + `agent` plus every optional preference.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -72,6 +209,17 @@ pub struct Profile {
     /// next entry is selected on the same session and the turn retried.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// Ordered peak/off-peak windows: the first window covering the current
+    /// wall-clock time in its named zone leads the effective model chain
+    /// with its own `model`/`models`; the declared chain trails as
+    /// fallback. Evaluated at session establishment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<ModelWindow>,
+    /// Quota-recovery schedule for a fully exhausted attempt — see
+    /// [`RetryPolicy`]. Advisory to the orchestrator driving the
+    /// candidate chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
     /// Default reasoning effort passed to lanes that accept one per turn.
     #[serde(default)]
     pub effort: Option<String>,
@@ -145,6 +293,28 @@ impl Profile {
         chain
     }
 
+    /// The chain in effect at `now`: the first covering window leads with
+    /// its own `model`/`models`; the declared chain trails, deduplicated.
+    /// Equal to [`model_chain`](Self::model_chain) when no window matches.
+    pub fn effective_chain(&self, now: &jiff::Zoned) -> Vec<String> {
+        let mut chain = self
+            .windows
+            .iter()
+            .find(|window| {
+                window
+                    .minute_of_day(now)
+                    .is_some_and(|minute| window.covers(minute))
+            })
+            .map(ModelWindow::model_chain)
+            .unwrap_or_default();
+        for entry in self.model_chain() {
+            if !chain.contains(&entry) {
+                chain.push(entry);
+            }
+        }
+        chain
+    }
+
     /// Apply an overlay: `Some` replaces, `None` keeps; `env` merges per key.
     pub fn apply(&mut self, patch: ProfilePatch) {
         let ProfilePatch {
@@ -153,6 +323,8 @@ impl Profile {
             revision,
             model,
             models,
+            windows,
+            retry,
             effort,
             mode,
             permission,
@@ -183,6 +355,12 @@ impl Profile {
         }
         if let Some(value) = models {
             self.models = value;
+        }
+        if let Some(value) = windows {
+            self.windows = value;
+        }
+        if let Some(value) = retry {
+            self.retry = Some(value);
         }
         if let Some(value) = effort {
             self.effort = Some(value);
@@ -242,6 +420,8 @@ impl Profile {
             revision: self.revision.clone(),
             model: self.model.clone(),
             models: Some(self.models.clone()),
+            windows: Some(self.windows.clone()),
+            retry: self.retry.clone(),
             effort: self.effort.clone(),
             mode: self.mode.clone(),
             permission: self.permission.clone(),
@@ -279,6 +459,10 @@ pub struct ProfilePatch {
     pub model: Option<String>,
     #[serde(default)]
     pub models: Option<Vec<String>>,
+    #[serde(default)]
+    pub windows: Option<Vec<ModelWindow>>,
+    #[serde(default)]
+    pub retry: Option<RetryPolicy>,
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]

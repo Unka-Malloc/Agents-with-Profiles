@@ -162,7 +162,7 @@ fn fixture_spec() -> AgentSpec {
 
 fn registry_with(spec: AgentSpec, patch: ProfilePatch) -> Registry {
     let mut document = RegistryDocument::default();
-    document.agents.insert(spec.id.clone(), spec);
+    document.agents.insert(spec.id.clone(), spec.into());
     document.profiles.insert("p".to_owned(), patch);
     Registry::from_document(document).unwrap()
 }
@@ -442,7 +442,7 @@ async fn acp_first_turn_delivers_instructions_once() {
         .open_session(SessionRequest::default(), tx)
         .await
         .unwrap();
-    assert_eq!(session.session_id(), "fixture-session-1");
+    assert_eq!(session.session_id().await, "fixture-session-1");
 
     session.prompt("one".to_owned()).await.unwrap();
     session.prompt("two".to_owned()).await.unwrap();
@@ -716,5 +716,145 @@ async fn acp_exhausted_model_chain_propagates_the_error() {
 
     let error = session.prompt("work".to_owned()).await.unwrap_err();
     assert_eq!(error.code, "agent_protocol_failed");
+    session.close().await.unwrap();
+}
+
+// ---------------------------- lane fallback -----------------------------
+
+/// One document whose agent declares two lanes in fallback order: the
+/// primary first, one alternate.
+#[cfg(unix)]
+fn registry_with_lanes(primary: AgentSpec, alternate: AgentSpec, patch: ProfilePatch) -> Registry {
+    let mut document = RegistryDocument::default();
+    document.agents.insert(
+        primary.id.clone(),
+        awp::AgentEntry {
+            spec: primary,
+            alternates: vec![alternate],
+        },
+    );
+    document.profiles.insert("p".to_owned(), patch);
+    Registry::from_document(document).unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dead_primary_lane_falls_back_to_alternate() {
+    // `false` exits 1 on every prompt — a transport-level failure no model
+    // change can fix. The alternate echo lane must serve the same turn.
+    let registry = registry_with_lanes(
+        cli_spec("dead", "false", &[], PromptChannel::ArgOnly),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("dead".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mid_turn_lane_death_replays_on_alternate_with_instructions() {
+    // The primary works exactly once: a marker file makes the second spawn
+    // fail. The replayed turn on the alternate lane must re-compose the
+    // profile's instructions — the fresh session never heard them.
+    let dir = TestDirectory::new("lane-death");
+    let marker = dir.path().join("primary-ran");
+    let primary = cli_spec(
+        "once",
+        "sh",
+        &[
+            "-c",
+            &format!(
+                "test ! -f {0} && touch {0} && echo primary:$1 || exit 1",
+                marker.display()
+            ),
+            "sh",
+            "{prompt}",
+        ],
+        PromptChannel::ArgOnly,
+    );
+    let alternate = cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("once".to_owned()),
+            instructions: Some("PERSONA".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = session.prompt("one".to_owned()).await.unwrap();
+    assert_eq!(normalized(&first.text), "primary:PERSONA one");
+
+    let second = session.prompt("two".to_owned()).await.unwrap();
+    assert_eq!(normalized(&second.text), "alt|PERSONA two");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exhausted_model_chain_never_reaches_alternate_lane() {
+    // Provider-side exhaustion is account-level: every lane answers from
+    // the same account, so the chain end propagates to the caller's next
+    // profile rather than reopening on the alternate.
+    let registry = registry_with_lanes(
+        quota_fixture_spec("only", "only"),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("fixture".to_owned()),
+            model: Some("only".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_protocol_failed");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn all_lanes_dead_propagates_the_last_error() {
+    let registry = registry_with_lanes(
+        cli_spec("dead", "false", &[], PromptChannel::ArgOnly),
+        cli_spec("dead2", "false", &[], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("dead".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    session.prompt("work".to_owned()).await.unwrap_err();
     session.close().await.unwrap();
 }

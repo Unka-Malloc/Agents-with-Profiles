@@ -130,6 +130,7 @@ async fn inspect() -> i32 {
                     a4aa::LaneSpec::Acp { .. } => "acp",
                     a4aa::LaneSpec::Rpc(_) => "rpc",
                     a4aa::LaneSpec::Cli(_) => "cli",
+                    a4aa::LaneSpec::Serve { .. } => "serve",
                 },
                 "program": spec.command.program,
             })
@@ -204,6 +205,7 @@ async fn resolve() -> i32 {
             LaneKind::Acp => "acp",
             LaneKind::Rpc => "rpc",
             LaneKind::Cli => "cli",
+            LaneKind::Serve => "serve",
         },
         "spec": serde_json::to_value(agent.spec()).unwrap_or(Value::Null),
         "session": {

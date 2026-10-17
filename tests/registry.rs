@@ -36,7 +36,7 @@ fn document(
     for id in agents {
         document
             .agents
-            .insert(id.to_string(), cli_spec(id, "program"));
+            .insert(id.to_string(), cli_spec(id, "program").into());
     }
     for (id, agent) in profiles {
         document.profiles.insert(
@@ -86,7 +86,7 @@ fn agent_key_must_match_spec_id() {
     let mut document = RegistryDocument::default();
     document
         .agents
-        .insert("alias".to_owned(), cli_spec("different", "program"));
+        .insert("alias".to_owned(), cli_spec("different", "program").into());
     let error = Registry::from_document(document).unwrap_err();
     assert_eq!(error.code, "registry_agent_id_mismatch");
 }
@@ -190,7 +190,7 @@ fn resolve_materializes_env_and_mcp_into_spec() {
         prefer_load: false,
         auth_key: None,
     };
-    document.agents.insert("base".to_owned(), spec);
+    document.agents.insert("base".to_owned(), spec.into());
 
     let mut env = BTreeMap::new();
     env.insert("EXTRA".to_owned(), EnvValue::Literal("1".to_owned()));
@@ -307,4 +307,109 @@ fn short_form_bindings_resolve_to_single_candidate_chains() {
     let chain = registry.resolve_chain("role").unwrap();
     assert_eq!(chain.len(), 1);
     assert_eq!(chain[0].profile().id, "p");
+}
+
+#[test]
+fn a_covering_window_leads_the_effective_chain() {
+    let patch = ProfilePatch {
+        agent: Some("a".to_owned()),
+        model: Some("peak-model".to_owned()),
+        models: Some(vec!["tail-model".to_owned()]),
+        windows: Some(vec![
+            awp::ModelWindow {
+                timezone: "Asia/Shanghai".to_owned(),
+                from: "00:00".to_owned(),
+                to: "12:00".to_owned(),
+                model: Some("offpeak-model".to_owned()),
+                models: vec!["offpeak-alt".to_owned()],
+            },
+            awp::ModelWindow {
+                timezone: "Asia/Shanghai".to_owned(),
+                from: "12:00".to_owned(),
+                to: "00:00".to_owned(),
+                model: Some("peak-window-model".to_owned()),
+                models: vec![],
+            },
+        ]),
+        ..Default::default()
+    };
+    // 06:00 Asia/Shanghai == 22:00 UTC the day before; 16:00 == 08:00 UTC.
+    let morning = "2026-10-17T22:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .to_zoned(jiff::tz::TimeZone::UTC);
+    let evening = "2026-10-18T08:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .to_zoned(jiff::tz::TimeZone::UTC);
+
+    let window = &patch.windows.clone().unwrap()[0];
+    assert!(window.covers(window.minute_of_day(&morning).unwrap()));
+    let second = &patch.windows.clone().unwrap()[1];
+    assert!(second.covers(second.minute_of_day(&evening).unwrap()));
+
+    let profile = awp::Profile::from_patch("p", patch).unwrap();
+    assert_eq!(
+        profile.effective_chain(&morning),
+        vec!["offpeak-model", "offpeak-alt", "peak-model", "tail-model"]
+    );
+    assert_eq!(
+        profile.effective_chain(&evening),
+        vec!["peak-window-model", "peak-model", "tail-model"]
+    );
+}
+
+#[test]
+fn window_bounds_cover_normal_wrapped_and_whole_day_ranges() {
+    let w = |from: &str, to: &str| awp::ModelWindow {
+        timezone: "Asia/Shanghai".to_owned(),
+        from: from.to_owned(),
+        to: to.to_owned(),
+        ..Default::default()
+    };
+    // Normal range: from inclusive, to exclusive.
+    assert!(w("09:00", "17:00").covers(9 * 60));
+    assert!(!w("09:00", "17:00").covers(17 * 60));
+    // Wrapped range covers the late evening and the early morning.
+    let night = w("22:00", "06:00");
+    assert!(night.covers(23 * 60));
+    assert!(night.covers(5 * 60));
+    assert!(!night.covers(12 * 60));
+    // Equal bounds cover the entire day.
+    assert!(w("08:00", "08:00").covers(0));
+    assert!(w("08:00", "08:00").covers(23 * 60 + 59));
+    // Malformed bounds never match.
+    assert!(!w("9:00", "17:00").covers(10 * 60));
+    assert!(!w("25:00", "26:00").covers(10 * 60));
+}
+
+#[test]
+fn retry_policy_parses_durations_and_computes_wakeup() {
+    let patch: ProfilePatch = serde_json::from_value(serde_json::json!({
+        "agent": "a",
+        "retry": {"interval": "30m", "resetGrace": "PT1M"}
+    }))
+    .unwrap();
+    let policy = patch.retry.clone().unwrap();
+    assert_eq!(policy.interval.unwrap(), jiff::SignedDuration::from_mins(30));
+    assert_eq!(policy.reset_grace.unwrap(), jiff::SignedDuration::from_mins(1));
+
+    // Unknown reset window: poll `interval` after now.
+    let now: jiff::Zoned = "2025-06-01T00:00:00Z[UTC]".parse().unwrap();
+    let wake = policy.wakeup(&now, None).unwrap();
+    assert_eq!(wake.timestamp().as_second(), now.timestamp().as_second() + 30 * 60);
+
+    // A known reset wins and takes the declared grace — "reset in 3h"
+    // wakes at 3h01m.
+    let reset = now.checked_add(jiff::SignedDuration::from_hours(3)).unwrap();
+    let wake = policy.wakeup(&now, Some(reset.clone())).unwrap();
+    assert_eq!(
+        wake.timestamp().as_second(),
+        reset.timestamp().as_second() + 60
+    );
+
+    // No schedule for the situation at hand yields None — the caller
+    // decides what unscheduled exhaustion means.
+    let unscheduled = awp::RetryPolicy::default();
+    assert!(unscheduled.wakeup(&now, None).is_none());
 }

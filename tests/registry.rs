@@ -391,17 +391,28 @@ fn retry_policy_parses_durations_and_computes_wakeup() {
     }))
     .unwrap();
     let policy = patch.retry.clone().unwrap();
-    assert_eq!(policy.interval.unwrap(), jiff::SignedDuration::from_mins(30));
-    assert_eq!(policy.reset_grace.unwrap(), jiff::SignedDuration::from_mins(1));
+    assert_eq!(
+        policy.interval.unwrap(),
+        jiff::SignedDuration::from_mins(30)
+    );
+    assert_eq!(
+        policy.reset_grace.unwrap(),
+        jiff::SignedDuration::from_mins(1)
+    );
 
     // Unknown reset window: poll `interval` after now.
     let now: jiff::Zoned = "2025-06-01T00:00:00Z[UTC]".parse().unwrap();
     let wake = policy.wakeup(&now, None).unwrap();
-    assert_eq!(wake.timestamp().as_second(), now.timestamp().as_second() + 30 * 60);
+    assert_eq!(
+        wake.timestamp().as_second(),
+        now.timestamp().as_second() + 30 * 60
+    );
 
     // A known reset wins and takes the declared grace — "reset in 3h"
     // wakes at 3h01m.
-    let reset = now.checked_add(jiff::SignedDuration::from_hours(3)).unwrap();
+    let reset = now
+        .checked_add(jiff::SignedDuration::from_hours(3))
+        .unwrap();
     let wake = policy.wakeup(&now, Some(reset.clone())).unwrap();
     assert_eq!(
         wake.timestamp().as_second(),

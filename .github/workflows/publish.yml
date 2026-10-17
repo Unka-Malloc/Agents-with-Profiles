@@ -15,15 +15,27 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
+      # `a4aa` deps are path+version: verify compiles against the sibling
+      # checkout, publish strips the paths for the crates.io versions.
       - uses: actions/checkout@v4
+        with:
+          path: Agents-With-Profiles
+      - uses: actions/checkout@v4
+        with:
+          repository: Unka-Malloc/Adapter-For-All-Agents
+          path: Adapter-For-All-Agents
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: scripts/verify.sh
+        working-directory: Agents-With-Profiles
 
   publish:
     needs: verify

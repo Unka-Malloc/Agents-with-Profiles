@@ -208,6 +208,7 @@ async fn resolve() -> i32 {
             LaneKind::Serve => "serve",
         },
         "spec": serde_json::to_value(agent.spec()).unwrap_or(Value::Null),
+        "alternates": serde_json::to_value(&agent.lane_specs()[1..]).unwrap_or(Value::Null),
         "session": {
             "cwd": profile.cwd.clone(),
         },

@@ -56,6 +56,7 @@ awp resolve --config awp.json [--overlay layer.json]... --profile reviewer
   "profile": { "id": "reviewer", "agent": "example-agent", /* …verbatim… */ },
   "lane": "acp",
   "spec":    { /* effective a4aa AgentSpec — profile env + mcpServers folded in */ },
+  "alternates": [ /* ordered lane fallbacks after the primary spec, same shape */ ],
   "session": { "cwd": "/workspace/repo" },
   "turn": {
     "model": "m-large",

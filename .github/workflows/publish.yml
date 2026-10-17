@@ -48,6 +48,14 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
+          # Idempotent: a re-run on an already-released version must pass
+          # instead of failing on "already uploaded".
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c "import json,sys; print([p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='agents-with-profiles'][0])")
+          if cargo info "agents-with-profiles@$version" 2>/dev/null | grep -q "^version: $version"; then
+            echo "agents-with-profiles $version already published — nothing to do"
+            exit 0
+          fi
           for attempt in 1 2 3 4 5; do
             if cargo publish --token "$CARGO_REGISTRY_TOKEN"; then
               exit 0

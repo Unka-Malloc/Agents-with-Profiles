@@ -42,8 +42,10 @@ pub mod profile;
 pub mod registry;
 
 pub use agent::{compose_prompt, VirtualAgent, VirtualSession};
-pub use profile::{InstructionMode, Profile, ProfilePatch};
-pub use registry::{compose_instructions, Binding, Registry, RegistryDocument, Selection};
+pub use profile::{InstructionMode, ModelWindow, Profile, ProfilePatch, RetryPolicy};
+pub use registry::{
+    compose_instructions, AgentEntry, Binding, Registry, RegistryDocument, Selection,
+};
 
 // Re-export the a4aa surface hosts need to configure and drive sessions,
 // so an awp consumer rarely needs a second dependency import.

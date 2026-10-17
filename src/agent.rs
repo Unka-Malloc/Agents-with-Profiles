@@ -179,30 +179,8 @@ impl VirtualAgent {
         let chain = self.profile.effective_chain(&jiff::Zoned::now());
         let mut lane_error = None;
         for (lane_index, spec) in self.specs.iter().enumerate() {
-            let session_selectors = spec.selector_support(SelectorPhase::Session);
-            let mut turn_model_default = None;
-            let mut turn_effort_default = None;
-            let mut lane_request = request.clone();
-            if lane_request.config.model.is_none() {
-                if session_selectors.model != SelectorSupport::Unsupported {
-                    lane_request.config.model = chain.first().cloned();
-                } else {
-                    turn_model_default = chain.first().cloned();
-                }
-            }
-            if lane_request.config.mode.is_none() {
-                lane_request.config.mode = self.profile.mode.clone();
-            }
-            if lane_request.config.effort.is_none() {
-                if session_selectors.effort != SelectorSupport::Unsupported {
-                    lane_request.config.effort = self.profile.effort.clone();
-                } else {
-                    turn_effort_default = self.profile.effort.clone();
-                }
-            }
-            if lane_request.config.permission.is_none() {
-                lane_request.config.permission = self.profile.permission.clone();
-            }
+            let (mut lane_request, turn_model_default, turn_effort_default) =
+                lane_open(spec, &request, &self.profile, chain.first().cloned());
             // A requested model the lane cannot express at establishment
             // advances the chain before the first turn is even attempted.
             let session = loop {
@@ -240,22 +218,23 @@ impl VirtualAgent {
             return Ok(VirtualSession {
                 session: Arc::new(tokio::sync::RwLock::new(session)),
                 profile: self.profile.clone(),
-                turn_model_default,
-                turn_effort_default,
+                turn_model_default: Arc::new(std::sync::Mutex::new(turn_model_default)),
+                turn_effort_default: Arc::new(std::sync::Mutex::new(turn_effort_default)),
                 model_state: Arc::new(std::sync::Mutex::new(ModelChain {
                     active: active_model,
                     remaining: remaining_models,
                 })),
-                lane: LaneState {
+                lane: Arc::new(tokio::sync::Mutex::new(LaneState {
                     specs: self.specs.clone(),
                     index: lane_index,
+                    requested: request.clone(),
                     open: effective_request,
                     events: events.clone(),
                     secrets: self.secrets.clone(),
                     observer: self.observer.clone(),
                     permission: self.permission.clone(),
                     before_turn: self.before_turn.clone(),
-                },
+                })),
                 stateless_lane: Arc::new(AtomicBool::new(matches!(spec.lane, LaneSpec::Cli(_)))),
                 instructions_sent: Arc::new(AtomicBool::new(false)),
                 turn_lock: Arc::new(Mutex::new(())),
@@ -269,10 +248,12 @@ impl VirtualAgent {
 /// The lane-fallback state one open session carries: every declared spec
 /// plus everything needed to reopen the session on the next lane when the
 /// current one fails for non-model reasons.
-#[derive(Clone)]
 struct LaneState {
     specs: Vec<AgentSpec>,
     index: usize,
+    /// The caller's request before lane normalization — re-projected
+    /// against each next lane's selector support on a switch.
+    requested: SessionRequest,
     /// The request the active lane opened with — replayed on the next lane.
     open: SessionRequest,
     events: mpsc::UnboundedSender<AgentEvent>,
@@ -377,6 +358,45 @@ fn model_failure(error: &a4aa::AdapterError) -> bool {
         })
 }
 
+/// Project a session request onto one lane. Profile defaults (and the
+/// chain's head model) enter session config only where the lane applies
+/// them at establishment; selectors the lane consumes per turn surface as
+/// the returned `(request, turn_model, turn_effort)` defaults instead.
+/// Used at open and again on every lane switch — a request normalized for
+/// one lane is never replayed verbatim onto another.
+fn lane_open(
+    spec: &AgentSpec,
+    request: &SessionRequest,
+    profile: &Profile,
+    head_model: Option<String>,
+) -> (SessionRequest, Option<String>, Option<String>) {
+    let session_selectors = spec.selector_support(SelectorPhase::Session);
+    let mut turn_model_default = None;
+    let mut turn_effort_default = None;
+    let mut lane_request = request.clone();
+    if lane_request.config.model.is_none() {
+        if session_selectors.model != SelectorSupport::Unsupported {
+            lane_request.config.model = head_model;
+        } else {
+            turn_model_default = head_model;
+        }
+    }
+    if lane_request.config.mode.is_none() {
+        lane_request.config.mode = profile.mode.clone();
+    }
+    if lane_request.config.effort.is_none() {
+        if session_selectors.effort != SelectorSupport::Unsupported {
+            lane_request.config.effort = profile.effort.clone();
+        } else {
+            turn_effort_default = profile.effort.clone();
+        }
+    }
+    if lane_request.config.permission.is_none() {
+        lane_request.config.permission = profile.permission.clone();
+    }
+    (lane_request, turn_model_default, turn_effort_default)
+}
+
 /// An open session on a virtual agent. Profile turn semantics apply here:
 /// instructions compose into prompt text, and turn-only defaults fill in.
 pub struct VirtualSession {
@@ -385,14 +405,17 @@ pub struct VirtualSession {
     /// Profile defaults for selectors the lane consumes per turn rather than
     /// at session establishment. Session-applied defaults stay with A4AA's
     /// SessionRequest so an explicit open-session value is never replaced.
-    turn_model_default: Option<String>,
-    turn_effort_default: Option<String>,
+    /// A mid-session lane switch recomputes both against the new lane.
+    turn_model_default: Arc<std::sync::Mutex<Option<String>>>,
+    turn_effort_default: Arc<std::sync::Mutex<Option<String>>>,
     /// The session's model chain: a turn that fails on the active model is
     /// retried against the next entry — same session, same composed prompt.
     model_state: Arc<std::sync::Mutex<ModelChain>>,
     /// The lane variants behind this session and the material needed to
-    /// reopen it on the next lane after a transport-level failure.
-    lane: LaneState,
+    /// reopen it on the next lane after a transport-level failure. Shared
+    /// and locked: a mid-turn switch persists the active lane index for
+    /// every later turn instead of rescanning dead lanes.
+    lane: Arc<tokio::sync::Mutex<LaneState>>,
     /// Stateless lanes (cli) start a fresh process per turn, so instructions
     /// are delivered on every prompt regardless of `InstructionMode`. A lane
     /// switch re-evaluates this against the new lane's spec.
@@ -463,10 +486,18 @@ impl VirtualSession {
             request.text = compose_prompt(self.profile.instructions.as_deref(), &request.text);
         }
         if request.model.is_none() {
-            request.model = self.turn_model_default.clone();
+            request.model = self
+                .turn_model_default
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
         }
         if request.effort.is_none() {
-            request.effort = self.turn_effort_default.clone();
+            request.effort = self
+                .turn_effort_default
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
         }
         self.run_owned_prompt(request, turn, true, instructions_included)
             .await
@@ -490,7 +521,9 @@ impl VirtualSession {
         let session = self.session.clone();
         let instructions_sent = self.instructions_sent.clone();
         let model_state = self.model_state.clone();
-        let mut lane = self.lane.clone();
+        let lane = self.lane.clone();
+        let turn_model_default = self.turn_model_default.clone();
+        let turn_effort_default = self.turn_effort_default.clone();
         let stateless = self.stateless_lane.clone();
         let profile = self.profile.clone();
         tokio::spawn(async move {
@@ -544,20 +577,30 @@ impl VirtualSession {
                 // a crashed server. Reopen the session on the next lane
                 // and replay the turn there.
                 loop {
+                    let mut lane = lane.lock().await;
                     lane.index += 1;
-                    let Some(spec) = lane.specs.get(lane.index) else {
+                    let Some(spec) = lane.specs.get(lane.index).cloned() else {
                         break 'lanes outcome;
                     };
+                    // Re-project the caller's request against this lane:
+                    // selectors the previous lane applied at establishment
+                    // may belong on turns here, and vice versa.
+                    let active = model_state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .active
+                        .clone();
+                    let (new_open, turn_model, turn_effort) =
+                        lane_open(&spec, &lane.requested, &profile, active);
+                    let adapter = lane.adapter(lane.index);
+                    let reopen = adapter.open_session(new_open.clone(), lane.events.clone());
                     {
                         let mut guard = session.write().await;
                         let _ = guard.close().await;
-                        match lane
-                            .adapter(lane.index)
-                            .open_session(lane.open.clone(), lane.events.clone())
-                            .await
-                        {
+                        match reopen.await {
                             Ok(new_session) => {
                                 *guard = new_session;
+                                lane.open = new_open;
                             }
                             Err(open_error) if model_failure(&open_error) => {
                                 break 'lanes Err(open_error);
@@ -565,12 +608,13 @@ impl VirtualSession {
                             Err(_) => continue,
                         }
                     }
-                    lane.open.config.model.clone_from(
-                        &model_state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .active,
-                    );
+                    *turn_model_default
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = turn_model;
+                    *turn_effort_default
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = turn_effort;
+                    drop(lane);
                     stateless.store(matches!(spec.lane, LaneSpec::Cli(_)), Ordering::Relaxed);
                     instructions_sent.store(false, Ordering::Relaxed);
                     // The fresh session never heard this profile: if the

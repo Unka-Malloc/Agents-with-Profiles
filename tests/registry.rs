@@ -50,11 +50,11 @@ fn document(
     for (name, profile) in bindings {
         document.bindings.insert(
             name.to_string(),
-            awp::Binding::Full {
+            awp::Binding::Full(awp::BindingFull {
                 profile: profile.to_string(),
                 prompt: None,
                 fallbacks: vec![],
-            },
+            }),
         );
     }
     document
@@ -167,11 +167,11 @@ fn binding_prompt_composes_after_profile_instructions() {
     );
     document.bindings.insert(
         "review".to_owned(),
-        awp::Binding::Full {
+        awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
             prompt: Some("check the diff".to_owned()),
             fallbacks: vec![],
-        },
+        }),
     );
     let registry = Registry::from_document(document).unwrap();
     let selection = registry.select("review").unwrap();
@@ -252,11 +252,11 @@ fn binding_fallbacks_validate_against_profiles() {
     let mut document = document(&["a"], &[("p", "a")], &[]);
     document.bindings.insert(
         "role".to_owned(),
-        awp::Binding::Full {
+        awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
             prompt: None,
             fallbacks: vec!["missing".to_owned()],
-        },
+        }),
     );
     let error = Registry::from_document(document).unwrap_err();
     assert_eq!(error.code, "binding_profile_unknown");
@@ -275,11 +275,11 @@ fn resolve_chain_orders_primary_then_fallbacks_with_shared_prompt() {
     );
     document.bindings.insert(
         "role".to_owned(),
-        awp::Binding::Full {
+        awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
             prompt: Some("the task".to_owned()),
             fallbacks: vec!["q".to_owned()],
-        },
+        }),
     );
     let registry = Registry::from_document(document).unwrap();
     let chain = registry.resolve_chain("role").unwrap();
@@ -307,6 +307,18 @@ fn short_form_bindings_resolve_to_single_candidate_chains() {
     let chain = registry.resolve_chain("role").unwrap();
     assert_eq!(chain.len(), 1);
     assert_eq!(chain[0].profile().id, "p");
+}
+
+#[test]
+fn misspelled_full_binding_field_is_a_load_error() {
+    // `promt` — not `prompt` — must not silently drop the standing prompt.
+    let doc = r#"{
+        "agents": {"a": {"id": "a", "lane": "cli",
+            "command": {"program": "true"}}},
+        "profiles": {"p": {"agent": "a"}},
+        "bindings": {"role": {"profile": "p", "promt": "typo"}}
+    }"#;
+    assert!(awp::Registry::from_json(doc).is_err());
 }
 
 #[test]

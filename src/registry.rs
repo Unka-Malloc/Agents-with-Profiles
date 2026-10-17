@@ -97,33 +97,40 @@ pub enum Binding {
     /// Bare profile reference.
     Profile(String),
     /// Profile plus an optional standing prompt and fallback profiles.
-    Full {
-        profile: String,
-        #[serde(default)]
-        prompt: Option<String>,
-        /// Ordered fallback profile ids: when the bound profile's agent
-        /// cannot serve (its whole model chain failed, the agent is absent
-        /// or its session cannot be established), the next profile — one
-        /// that may back a different agent — takes over the role.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        fallbacks: Vec<String>,
-    },
+    Full(BindingFull),
     #[default]
     None,
+}
+
+/// The full binding payload — a named struct so `deny_unknown_fields`
+/// applies: `{"profile":"p","promt":"x"}` is a load error, not a silently
+/// dropped prompt.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BindingFull {
+    pub profile: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Ordered fallback profile ids: when the bound profile's agent
+    /// cannot serve (its whole model chain failed, the agent is absent
+    /// or its session cannot be established), the next profile — one
+    /// that may back a different agent — takes over the role.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<String>,
 }
 
 impl Binding {
     pub fn profile(&self) -> &str {
         match self {
             Binding::Profile(profile) => profile,
-            Binding::Full { profile, .. } => profile,
+            Binding::Full(full) => &full.profile,
             Binding::None => "",
         }
     }
 
     pub fn prompt(&self) -> Option<&str> {
         match self {
-            Binding::Full { prompt, .. } => prompt.as_deref(),
+            Binding::Full(full) => full.prompt.as_deref(),
             _ => None,
         }
     }
@@ -131,7 +138,7 @@ impl Binding {
     /// Ordered fallback profile ids, empty for the short forms.
     pub fn fallbacks(&self) -> &[String] {
         match self {
-            Binding::Full { fallbacks, .. } => fallbacks,
+            Binding::Full(full) => &full.fallbacks,
             _ => &[],
         }
     }

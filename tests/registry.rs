@@ -1,31 +1,11 @@
 //! Registry merge, overlay and resolution semantics.
 
-use awp::{
-    AgentSpec, CliLaneSpec, CommandSpec, EnvValue, LaneSpec, Profile, ProfilePatch, PromptChannel,
-    Registry, RegistryDocument, StreamMode,
-};
+use awp::{EnvValue, LaneSpec, Profile, ProfilePatch, PromptChannel, Registry, RegistryDocument};
 use serde_json::json;
 use std::collections::BTreeMap;
 
-fn cli_spec(id: &str, program: &str) -> AgentSpec {
-    AgentSpec {
-        id: id.to_owned(),
-        client_name: None,
-        lane: LaneSpec::Cli(Box::new(CliLaneSpec {
-            args: vec!["{prompt}".to_owned()],
-            prompt_channel: PromptChannel::ArgOnly,
-            stream: StreamMode::Stdio,
-            ..CliLaneSpec::default()
-        })),
-        command: CommandSpec {
-            program: program.to_owned(),
-            args: vec![],
-            cwd: None,
-            env: Default::default(),
-        },
-        max_output_bytes: None,
-    }
-}
+mod common;
+use common::cli_spec;
 
 fn document(
     agents: &[&str],
@@ -34,9 +14,10 @@ fn document(
 ) -> RegistryDocument {
     let mut document = RegistryDocument::default();
     for id in agents {
-        document
-            .agents
-            .insert(id.to_string(), cli_spec(id, "program").into());
+        document.agents.insert(
+            id.to_string(),
+            cli_spec(id, "program", &["{prompt}"], PromptChannel::ArgOnly).into(),
+        );
     }
     for (id, agent) in profiles {
         document.profiles.insert(
@@ -84,9 +65,16 @@ fn unknown_agent_reference_rejected() {
 #[test]
 fn agent_key_must_match_spec_id() {
     let mut document = RegistryDocument::default();
-    document
-        .agents
-        .insert("alias".to_owned(), cli_spec("different", "program").into());
+    document.agents.insert(
+        "alias".to_owned(),
+        cli_spec(
+            "different",
+            "program",
+            &["{prompt}"],
+            PromptChannel::ArgOnly,
+        )
+        .into(),
+    );
     let error = Registry::from_document(document).unwrap_err();
     assert_eq!(error.code, "registry_agent_id_mismatch");
 }
@@ -184,7 +172,7 @@ fn binding_prompt_composes_after_profile_instructions() {
 #[test]
 fn resolve_materializes_env_and_mcp_into_spec() {
     let mut document = RegistryDocument::default();
-    let mut spec = cli_spec("base", "prog");
+    let mut spec = cli_spec("base", "prog", &["{prompt}"], PromptChannel::ArgOnly);
     spec.lane = LaneSpec::Acp {
         mcp_servers: vec![json!({"name": "base-mcp"})],
         prefer_load: false,

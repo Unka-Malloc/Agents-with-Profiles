@@ -6,9 +6,9 @@
 
 use a4aa::SessionConfig;
 use awp::{
-    AgentEvent, AgentSpec, CliLaneSpec, CommandSpec, EnvValue, InstructionMode, LaneSpec,
-    ProfilePatch, PromptChannel, Registry, RegistryDocument, RpcCallSpec, RpcLaneSpec,
-    SessionRequest, StreamMode, TurnRequest,
+    AgentEvent, AgentSpec, CommandSpec, EnvValue, InstructionMode, LaneSpec, ProfilePatch,
+    PromptChannel, Registry, RegistryDocument, RpcCallSpec, RpcLaneSpec, SessionRequest,
+    TurnRequest,
 };
 #[cfg(unix)]
 use serde_json::json;
@@ -55,25 +55,8 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
 "#;
 
-fn cli_spec(id: &str, program: &str, args: &[&str], channel: PromptChannel) -> AgentSpec {
-    AgentSpec {
-        id: id.to_owned(),
-        client_name: None,
-        lane: LaneSpec::Cli(Box::new(CliLaneSpec {
-            args: args.iter().map(|a| a.to_string()).collect(),
-            prompt_channel: channel,
-            stream: StreamMode::Stdio,
-            ..CliLaneSpec::default()
-        })),
-        command: CommandSpec {
-            program: program.to_owned(),
-            args: vec![],
-            cwd: None,
-            env: Default::default(),
-        },
-        max_output_bytes: None,
-    }
-}
+mod common;
+use common::cli_spec;
 
 #[cfg(unix)]
 fn rpc_spec(

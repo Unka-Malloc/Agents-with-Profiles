@@ -16,6 +16,12 @@ which can drive `a4aa serve`. Registry merge rules are resolved once; a
 foreign-language host still routes session and turn selectors as described
 in the integration guide. `awp run` applies that runtime behavior itself.
 
+Design premise: **the native agent is maximal** — profiles compose and
+shape what base agents natively offer, bottom-up; a profile cannot confer
+a capability the agent lacks. The opposite direction (a standard runtime
+language projected onto hosts, top-down) is AgentOps-Runtime's. See
+[docs/design-direction.md](docs/design-direction.md).
+
 ## What it provides
 
 | Piece | Type | Responsibility |

@@ -111,12 +111,115 @@ pub struct BindingFull {
     pub profile: String,
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Ordered fallback profile ids: when the bound profile's agent
-    /// cannot serve (its whole model chain failed, the agent is absent
-    /// or its session cannot be established), the next profile — one
-    /// that may back a different agent — takes over the role.
+    /// When the primary candidate may serve at all — a promo lane whose
+    /// free window the vendor published expires on its own; absence is
+    /// unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<Availability>,
+    /// Ordered fallback candidates: a bare profile id stays unconditional,
+    /// a `{"profile": ..., "availability": ...}` entry may carry the same
+    /// bounds as the primary. When the bound profile's agent cannot serve
+    /// (its whole model chain failed, the agent is absent, its session
+    /// cannot be established, or its availability excludes now), the next
+    /// profile — one that may back a different agent — takes over the role.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallbacks: Vec<String>,
+    pub fallbacks: Vec<Fallback>,
+}
+
+/// One fallback candidate in a binding chain. The short `"profile-id"`
+/// form deserializes as [`Fallback::Id`]; the full form adds availability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Fallback {
+    /// Bare profile reference.
+    Id(String),
+    /// Profile plus availability bounds.
+    Windowed(FallbackEntry),
+}
+
+/// The full fallback payload — `deny_unknown_fields` keeps a typo'd key a
+/// load error, same contract as [`BindingFull`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FallbackEntry {
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<Availability>,
+}
+
+impl Fallback {
+    pub fn profile(&self) -> &str {
+        match self {
+            Fallback::Id(id) => id,
+            Fallback::Windowed(entry) => &entry.profile,
+        }
+    }
+
+    pub fn availability(&self) -> Option<&Availability> {
+        match self {
+            Fallback::Id(_) => None,
+            Fallback::Windowed(entry) => entry.availability.as_ref(),
+        }
+    }
+}
+
+/// Time bounds on when a candidate may serve: `notBefore` inclusive,
+/// `notAfter` exclusive — a promo "until 2026-11-01" stops being selectable
+/// the moment that date arrives. Bounds accept RFC 3339 timestamps or a
+/// bare `YYYY-MM-DD`, which reads as that day's 00:00 UTC. An absent bound
+/// is unbounded: a free lane whose end the vendor never published stays
+/// selectable until a request failure pushes it aside.
+///
+/// A malformed bound covers nothing: expiry must expire the lane, never
+/// accidentally extend it. `apply` rejects the document at load for the
+/// same reason — see [`Availability::is_well_formed`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Availability {
+    /// Inclusive lower bound — candidates are not selectable before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    /// Exclusive upper bound — the first instant the lane is no longer
+    /// selectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<String>,
+}
+
+impl Availability {
+    /// Whether `now` falls inside the bounds; a bound that cannot be parsed
+    /// never covers.
+    pub fn covers(&self, now: &jiff::Timestamp) -> bool {
+        let lower = self
+            .not_before
+            .as_deref()
+            .is_none_or(|raw| parse_bound(raw).is_some_and(|b| *now >= b));
+        let upper = self
+            .not_after
+            .as_deref()
+            .is_none_or(|raw| parse_bound(raw).is_some_and(|b| *now < b));
+        lower && upper
+    }
+
+    /// Every declared bound parses — documents carrying a malformed bound
+    /// are rejected at `apply` rather than expiring silently at resolve.
+    pub fn is_well_formed(&self) -> bool {
+        [&self.not_before, &self.not_after]
+            .into_iter()
+            .flatten()
+            .all(|raw| parse_bound(raw).is_some())
+    }
+}
+
+/// One availability bound: RFC 3339, or a bare date at 00:00 UTC.
+fn parse_bound(raw: &str) -> Option<jiff::Timestamp> {
+    if let Ok(timestamp) = raw.parse::<jiff::Timestamp>() {
+        return Some(timestamp);
+    }
+    jiff::civil::Date::strptime("%Y-%m-%d", raw)
+        .ok()?
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .ok()
+        .map(|zoned| zoned.timestamp())
 }
 
 impl Binding {
@@ -135,11 +238,19 @@ impl Binding {
         }
     }
 
-    /// Ordered fallback profile ids, empty for the short forms.
-    pub fn fallbacks(&self) -> &[String] {
+    /// Ordered fallback candidates, empty for the short forms.
+    pub fn fallbacks(&self) -> &[Fallback] {
         match self {
             Binding::Full(full) => &full.fallbacks,
             _ => &[],
+        }
+    }
+
+    /// The primary candidate's availability bounds, if the full form set them.
+    pub fn availability(&self) -> Option<&Availability> {
+        match self {
+            Binding::Full(full) => full.availability.as_ref(),
+            _ => None,
         }
     }
 
@@ -243,15 +354,32 @@ impl Registry {
                         )),
                 );
             }
+            let malformed = |what: &str| {
+                AdapterError::permanent("binding_availability_malformed", "registry/apply")
+                    .with_detail(format!(
+                        "binding `{name}` {what} declares an availability bound that is neither RFC 3339 nor YYYY-MM-DD"
+                    ))
+            };
+            if let Some(availability) = binding.availability() {
+                if !availability.is_well_formed() {
+                    return Err(malformed("the primary candidate"));
+                }
+            }
             for fallback in binding.fallbacks() {
-                if !next.profiles.contains_key(fallback) {
+                if !next.profiles.contains_key(fallback.profile()) {
                     return Err(AdapterError::permanent(
                         "binding_profile_unknown",
                         "registry/apply",
                     )
                     .with_detail(format!(
-                        "binding `{name}` references unknown fallback profile `{fallback}`"
+                        "binding `{name}` references unknown fallback profile `{}`",
+                        fallback.profile()
                     )));
+                }
+                if let Some(availability) = fallback.availability() {
+                    if !availability.is_well_formed() {
+                        return Err(malformed("a fallback candidate"));
+                    }
                 }
             }
             next.bindings.insert(name, binding);
@@ -333,29 +461,54 @@ impl Registry {
     }
 
     /// Resolve a binding straight to its virtual agent, with the binding's
-    /// standing prompt folded into the profile's instructions.
+    /// standing prompt folded into the profile's instructions. Errors when
+    /// every candidate's availability excludes now — a chain that expired
+    /// is a lane that no longer exists, not a panic.
     pub fn resolve_binding(&self, binding_name: &str) -> a4aa::Result<crate::VirtualAgent> {
-        Ok(self
-            .resolve_chain(binding_name)?
+        self.resolve_chain(binding_name)?
             .into_iter()
             .next()
-            .expect("a resolved binding always has a primary candidate"))
+            .ok_or_else(|| {
+                AdapterError::permanent("binding_chain_expired", "registry/resolve").with_detail(
+                    format!("binding `{binding_name}` has no candidate available now"),
+                )
+            })
     }
 
     /// Resolve a binding to its ordered candidate chain: the bound profile
-    /// first, then each declared fallback profile. Every candidate gets the
-    /// binding's standing prompt composed into its instructions, so the
-    /// role stays identical while the backing agent may differ.
+    /// first, then each declared fallback profile. Candidates whose
+    /// availability excludes the current instant are skipped outright —
+    /// an expired promo lane fails over before it can spend a request.
+    /// Every surviving candidate gets the binding's standing prompt
+    /// composed into its instructions, so the role stays identical while
+    /// the backing agent may differ.
     pub fn resolve_chain(&self, binding_name: &str) -> a4aa::Result<Vec<crate::VirtualAgent>> {
+        self.resolve_chain_at(binding_name, &jiff::Timestamp::now())
+    }
+
+    /// `resolve_chain` against an explicit instant — the deterministic
+    /// form tests and schedulers use.
+    pub fn resolve_chain_at(
+        &self,
+        binding_name: &str,
+        now: &jiff::Timestamp,
+    ) -> a4aa::Result<Vec<crate::VirtualAgent>> {
         let binding = self.binding(binding_name).ok_or_else(|| {
             AdapterError::permanent("binding_unknown", "registry/select")
                 .with_detail(format!("unknown binding `{binding_name}`"))
         })?;
         let prompt = binding.prompt().map(str::to_owned);
         let mut candidates = Vec::new();
-        for id in
-            std::iter::once(binding.profile()).chain(binding.fallbacks().iter().map(String::as_str))
-        {
+        let entries = std::iter::once((binding.profile(), binding.availability())).chain(
+            binding
+                .fallbacks()
+                .iter()
+                .map(|f| (f.profile(), f.availability())),
+        );
+        for (id, availability) in entries {
+            if availability.is_some_and(|a| !a.covers(now)) {
+                continue;
+            }
             let mut profile = self
                 .profiles
                 .get(id)

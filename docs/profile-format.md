@@ -48,7 +48,9 @@ where it comes from.
   "bindings": {
     // full form — profile plus a standing prompt and ordered fallbacks
     "review": {"profile": "reviewer", "prompt": "Check the diff.",
-               "fallbacks": ["reviewer-backup"]},
+               "fallbacks": ["reviewer-backup",
+                  {"profile": "promo-lane",
+                   "availability": {"notAfter": "2026-11-01"}}]},
     // shorthand — a bare profile id
     "implement": "implementer"
   }
@@ -64,9 +66,17 @@ single-lane entry.
 The example uses a hypothetical ACP executable. For a supported real agent,
 use its `a4aa-<agent>::spec()` descriptor and supported selector values.
 `bindings` name which profile serves a role or task slot; the full form
-may add `fallbacks`: an ordered list of profile ids tried when the primary
-profile's candidates cannot open or complete (cross-agent fallback). A
-`null` binding value removes the slot on overlay. Unknown fields
+may add `fallbacks`: an ordered list of candidates tried when the primary
+profile's candidates cannot open or complete (cross-agent fallback). Each
+fallback is either a bare profile id or `{"profile", "availability"}`; the
+primary accepts `availability` too. `availability` bounds when a candidate
+is selectable at all: `notBefore` inclusive, `notAfter` exclusive, each an
+RFC 3339 timestamp or a bare `YYYY-MM-DD` read as that day's 00:00 UTC. An
+absent bound is unbounded — a promo lane whose end the vendor never
+published stays selectable until request failure pushes it aside — and a
+malformed bound rejects the document at load. Resolution skips expired
+candidates outright, so expiry is semantic and needs no scheduled cleanup.
+A `null` binding value removes the slot on overlay. Unknown fields
 are rejected (`deny_unknown_fields`) — a typo is a load error, not a silent
 default.
 

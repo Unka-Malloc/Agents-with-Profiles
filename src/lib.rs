@@ -44,7 +44,8 @@ pub mod registry;
 pub use agent::{compose_prompt, VirtualAgent, VirtualSession};
 pub use profile::{InstructionMode, ModelWindow, Profile, ProfilePatch, RetryPolicy};
 pub use registry::{
-    compose_instructions, AgentEntry, Binding, BindingFull, Registry, RegistryDocument, Selection,
+    compose_instructions, AgentEntry, Availability, Binding, BindingFull, Fallback, FallbackEntry,
+    Registry, RegistryDocument, Selection,
 };
 
 // Re-export the a4aa surface hosts need to configure and drive sessions,

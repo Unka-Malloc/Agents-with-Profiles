@@ -34,6 +34,7 @@ fn document(
             awp::Binding::Full(awp::BindingFull {
                 profile: profile.to_string(),
                 prompt: None,
+                availability: None,
                 fallbacks: vec![],
             }),
         );
@@ -158,6 +159,7 @@ fn binding_prompt_composes_after_profile_instructions() {
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
             prompt: Some("check the diff".to_owned()),
+            availability: None,
             fallbacks: vec![],
         }),
     );
@@ -243,7 +245,8 @@ fn binding_fallbacks_validate_against_profiles() {
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
             prompt: None,
-            fallbacks: vec!["missing".to_owned()],
+            availability: None,
+            fallbacks: vec![awp::Fallback::Id("missing".to_owned())],
         }),
     );
     let error = Registry::from_document(document).unwrap_err();
@@ -266,7 +269,8 @@ fn resolve_chain_orders_primary_then_fallbacks_with_shared_prompt() {
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
             prompt: Some("the task".to_owned()),
-            fallbacks: vec!["q".to_owned()],
+            availability: None,
+            fallbacks: vec![awp::Fallback::Id("q".to_owned())],
         }),
     );
     let registry = Registry::from_document(document).unwrap();
@@ -423,4 +427,118 @@ fn retry_policy_parses_durations_and_computes_wakeup() {
     // decides what unscheduled exhaustion means.
     let unscheduled = awp::RetryPolicy::default();
     assert!(unscheduled.wakeup(&now, None).is_none());
+}
+
+#[test]
+fn availability_bounds_filter_expired_candidates() {
+    let mut document = document(&["a", "b", "c"], &[("p", "a"), ("q", "b"), ("r", "c")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            prompt: None,
+            availability: None,
+            fallbacks: vec![
+                awp::Fallback::Windowed(awp::FallbackEntry {
+                    profile: "q".to_owned(),
+                    availability: Some(awp::Availability {
+                        not_before: None,
+                        not_after: Some("2026-11-01".to_owned()),
+                    }),
+                }),
+                awp::Fallback::Id("r".to_owned()),
+            ],
+        }),
+    );
+    let registry = Registry::from_document(document.clone()).unwrap();
+    let id_of = |chain: &[awp::VirtualAgent]| {
+        chain
+            .iter()
+            .map(|agent| agent.profile().id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Inside the promo window the lane serves; past `notAfter` it is
+    // skipped outright and the unconditional fallback takes the slot.
+    let during: jiff::Timestamp = "2026-06-01T12:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(&registry.resolve_chain_at("role", &during).unwrap()),
+        vec!["p", "q", "r"]
+    );
+    let after: jiff::Timestamp = "2026-11-02T00:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(&registry.resolve_chain_at("role", &after).unwrap()),
+        vec!["p", "r"]
+    );
+    // `notAfter` is exclusive: the first instant of that date is already out.
+    let edge: jiff::Timestamp = "2026-11-01T00:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(&registry.resolve_chain_at("role", &edge).unwrap()),
+        vec!["p", "r"]
+    );
+    // An expired primary drops the whole chain — resolve_binding reports it.
+    document.bindings.insert(
+        "solo".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            prompt: None,
+            availability: Some(awp::Availability {
+                not_before: Some("2026-05-01".to_owned()),
+                not_after: Some("2026-06-01".to_owned()),
+            }),
+            fallbacks: vec![],
+        }),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let error = registry.resolve_binding("solo").err().unwrap();
+    assert_eq!(error.code, "binding_chain_expired");
+    // And before `notBefore` the lane does not exist either.
+    let early: jiff::Timestamp = "2026-04-30T23:59:00Z".parse().unwrap();
+    assert!(registry
+        .resolve_chain_at("solo", &early)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn malformed_availability_fails_the_document() {
+    let mut document = document(&["a"], &[("p", "a"), ("q", "a")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            prompt: None,
+            availability: None,
+            fallbacks: vec![awp::Fallback::Windowed(awp::FallbackEntry {
+                profile: "q".to_owned(),
+                availability: Some(awp::Availability {
+                    not_before: None,
+                    not_after: Some("not-a-date".to_owned()),
+                }),
+            })],
+        }),
+    );
+    let error = Registry::from_document(document).unwrap_err();
+    assert_eq!(error.code, "binding_availability_malformed");
+}
+
+#[test]
+fn windowed_fallback_deserializes_from_json() {
+    let binding: awp::Binding = serde_json::from_str(
+        r#"{
+            "profile": "p",
+            "fallbacks": [
+                "bare-id",
+                {"profile": "q", "availability": {"notAfter": "2026-11-01"}}
+            ]
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(binding.fallbacks()[0].profile(), "bare-id");
+    let windowed = &binding.fallbacks()[1];
+    assert_eq!(windowed.profile(), "q");
+    assert_eq!(
+        windowed.availability().and_then(|a| a.not_after.as_deref()),
+        Some("2026-11-01")
+    );
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `availability` on binding candidates: `notBefore`/`notAfter` bounds (RFC
+  3339 or `YYYY-MM-DD` at 00:00 UTC) make time-limited lanes — vendor promo
+  windows — expire semantically at resolution instead of failing per
+  request or needing scheduled removal. Bounds live on the binding's
+  primary and on full-form fallback entries; absent means unbounded and a
+  malformed bound rejects the document at load.
+
 ## 0.1.0
 
 Initial registry release, built on A4AA 0.2.0.

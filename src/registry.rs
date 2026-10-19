@@ -43,6 +43,35 @@ pub struct RegistryDocument {
     /// Role/task bindings keyed by binding name.
     #[serde(default)]
     pub bindings: BTreeMap<String, Binding>,
+    /// Host secret recipes keyed by the environment variable they feed.
+    /// Custody (va) resolves these at spawn time and injects the values
+    /// into the `a4aa serve` child environment, so spec `auth_key` /
+    /// `hostEnv` references resolve without storing credentials here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, Vec<SecretRecipe>>,
+}
+
+/// One way to obtain a secret value: a host environment variable, or a
+/// `{home}`-expanded TOML file key. Recipes are tried in order and the
+/// first that yields a non-empty value wins.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SecretRecipe {
+    /// `{"env": "NAME"}` — read the named host variable.
+    Env { env: String },
+    /// `{"toml": {"path": "...", "key": "..."}}` — read a `key = "value"`
+    /// entry from a TOML file (basic `key = value` scanning, no deps).
+    Toml { toml: TomlSecret },
+}
+
+/// File-key recipe target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TomlSecret {
+    /// TOML file path; `{home}` expands to the user's home directory.
+    pub path: String,
+    /// Key inside the file.
+    pub key: String,
 }
 
 /// One agent entry: the primary spec plus ordered protocol alternates for

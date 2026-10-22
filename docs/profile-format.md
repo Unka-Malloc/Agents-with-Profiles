@@ -80,6 +80,19 @@ A `null` binding value removes the slot on overlay. Unknown fields
 are rejected (`deny_unknown_fields`) — a typo is a load error, not a silent
 default.
 
+`strict: true` marks a binding whose sessions must run on a sealed surface:
+every ambient code and instruction channel the agent would otherwise
+discover — extension loaders, skill directories, prompt templates,
+context files — is cut at materialization so the declared surface equals
+the surface that actually runs. Each candidate in the chain seals
+independently: a candidate whose agent has no sealing recipe, or whose
+declared args would reopen an ambient channel, drops out like an
+unavailable one, and a chain where nothing can seal refuses the resolve
+outright — strict never silently runs ambient. A `session/open` patch
+cannot weaken it: the flag lives on the stored binding, not on the
+patched profile. Short-form bindings and `profile`-selector sessions are
+always non-strict — declare the full form where the guarantee is needed.
+
 ## Profile fields: materialized vs advisory
 
 | Field | Class | Effect |

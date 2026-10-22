@@ -33,6 +33,7 @@ fn document(
             name.to_string(),
             awp::Binding::Full(awp::BindingFull {
                 profile: profile.to_string(),
+                strict: false,
                 prompt: None,
                 availability: None,
                 fallbacks: vec![],
@@ -158,6 +159,7 @@ fn binding_prompt_composes_after_profile_instructions() {
         "review".to_owned(),
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
+            strict: false,
             prompt: Some("check the diff".to_owned()),
             availability: None,
             fallbacks: vec![],
@@ -244,6 +246,7 @@ fn binding_fallbacks_validate_against_profiles() {
         "role".to_owned(),
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
+            strict: false,
             prompt: None,
             availability: None,
             fallbacks: vec![awp::Fallback::Id("missing".to_owned())],
@@ -268,6 +271,7 @@ fn resolve_chain_orders_primary_then_fallbacks_with_shared_prompt() {
         "role".to_owned(),
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
+            strict: false,
             prompt: Some("the task".to_owned()),
             availability: None,
             fallbacks: vec![awp::Fallback::Id("q".to_owned())],
@@ -436,6 +440,7 @@ fn availability_bounds_filter_expired_candidates() {
         "role".to_owned(),
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
+            strict: false,
             prompt: None,
             availability: None,
             fallbacks: vec![
@@ -481,6 +486,7 @@ fn availability_bounds_filter_expired_candidates() {
         "solo".to_owned(),
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
+            strict: false,
             prompt: None,
             availability: Some(awp::Availability {
                 not_before: Some("2026-05-01".to_owned()),
@@ -507,6 +513,7 @@ fn malformed_availability_fails_the_document() {
         "role".to_owned(),
         awp::Binding::Full(awp::BindingFull {
             profile: "p".to_owned(),
+            strict: false,
             prompt: None,
             availability: None,
             fallbacks: vec![awp::Fallback::Windowed(awp::FallbackEntry {
@@ -541,4 +548,180 @@ fn windowed_fallback_deserializes_from_json() {
         windowed.availability().and_then(|a| a.not_after.as_deref()),
         Some("2026-11-01")
     );
+}
+
+// ------------------------------- strict bindings -------------------------
+
+fn strict_binding(profile: &str, fallbacks: Vec<awp::Fallback>) -> awp::Binding {
+    awp::Binding::Full(awp::BindingFull {
+        profile: profile.to_owned(),
+        strict: true,
+        prompt: None,
+        availability: None,
+        fallbacks,
+    })
+}
+
+#[test]
+fn strict_binding_seals_sealable_candidates() {
+    let mut document = document(&["pi"], &[("p", "pi")], &[]);
+    document
+        .bindings
+        .insert("role".to_owned(), strict_binding("p", vec![]));
+    // The pi program name is what the recipe keys on.
+    document.agents.insert(
+        "pi".to_owned(),
+        cli_spec("pi", "pi", &["--mode", "rpc"], PromptChannel::ArgOnly).into(),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let chain = registry.resolve_chain("role").unwrap();
+    let args = &chain[0].spec().command.args;
+    for flag in [
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-context-files",
+        "builtin:mcp",
+        "builtin:codemode",
+        "builtin:tool-search",
+    ] {
+        assert!(args.contains(&flag.to_string()), "missing seal flag {flag}");
+    }
+}
+
+#[test]
+fn strict_binding_refuses_a_chain_nothing_can_seal() {
+    let mut document = document(&["a", "b"], &[("p", "a"), ("q", "b")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        strict_binding("p", vec![awp::Fallback::Id("q".to_owned())]),
+    );
+    let error = Registry::from_document(document)
+        .unwrap()
+        .resolve_chain("role")
+        .err()
+        .expect("a chain nothing can seal must refuse");
+    assert_eq!(error.code, "agent_unsealable");
+}
+
+#[test]
+fn strict_binding_degrades_to_a_sealable_fallback() {
+    let mut document = document(&["a"], &[("p", "a"), ("q", "pi")], &[]);
+    document.agents.insert(
+        "pi".to_owned(),
+        cli_spec("pi", "pi", &[], PromptChannel::ArgOnly).into(),
+    );
+    document.bindings.insert(
+        "role".to_owned(),
+        strict_binding("p", vec![awp::Fallback::Id("q".to_owned())]),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let chain = registry.resolve_chain("role").unwrap();
+    // The unsealable primary drops; the sealable fallback serves — never
+    // an ambient primary.
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].profile().id, "q");
+    assert!(chain[0]
+        .spec()
+        .command
+        .args
+        .contains(&"--no-extensions".to_string()));
+}
+
+#[test]
+fn strict_binding_skips_unsealable_fallbacks() {
+    let mut document = document(&["pi", "b"], &[("p", "pi"), ("q", "b")], &[]);
+    document.agents.insert(
+        "pi".to_owned(),
+        cli_spec("pi", "pi", &[], PromptChannel::ArgOnly).into(),
+    );
+    document.bindings.insert(
+        "role".to_owned(),
+        strict_binding("p", vec![awp::Fallback::Id("q".to_owned())]),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let chain = registry.resolve_chain("role").unwrap();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].profile().id, "p");
+}
+
+#[test]
+fn strict_binding_refuses_specs_reopening_ambient_channels() {
+    let mut document = document(&["pi"], &[("p", "pi")], &[]);
+    document.agents.insert(
+        "pi".to_owned(),
+        cli_spec(
+            "pi",
+            "pi",
+            &["-e", "./ambient-extension.ts"],
+            PromptChannel::ArgOnly,
+        )
+        .into(),
+    );
+    document
+        .bindings
+        .insert("role".to_owned(), strict_binding("p", vec![]));
+    let error = Registry::from_document(document)
+        .unwrap()
+        .resolve_chain("role")
+        .err()
+        .expect("ambient-surface args must refuse a strict session");
+    assert_eq!(error.code, "agent_unsealable");
+}
+
+#[test]
+fn non_strict_bindings_keep_the_ambient_surface() {
+    let mut document = document(&["pi"], &[("p", "pi")], &[]);
+    document.agents.insert(
+        "pi".to_owned(),
+        cli_spec(
+            "pi",
+            "pi",
+            &["-e", "./ambient-extension.ts"],
+            PromptChannel::ArgOnly,
+        )
+        .into(),
+    );
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: None,
+            fallbacks: vec![],
+        }),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let chain = registry.resolve_chain("role").unwrap();
+    let spec = chain[0].spec();
+    let LaneSpec::Cli(lane) = &spec.lane else {
+        panic!("cli spec expected");
+    };
+    assert_eq!(
+        lane.args,
+        vec!["-e".to_string(), "./ambient-extension.ts".to_string()]
+    );
+    assert!(spec.command.args.is_empty());
+}
+
+#[test]
+fn strict_defaults_off_and_roundtrips() {
+    let doc = r#"{
+        "agents": {"a": {"id": "a", "lane": "cli",
+            "command": {"program": "true"}}},
+        "profiles": {"p": {"agent": "a"}},
+        "bindings": {"plain": "p", "full": {"profile": "p"}}
+    }"#;
+    let registry = awp::Registry::from_json(doc).unwrap();
+    assert!(!registry.binding("plain").unwrap().strict());
+    assert!(!registry.binding("full").unwrap().strict());
+    let strict_doc = r#"{
+        "agents": {"a": {"id": "a", "lane": "cli",
+            "command": {"program": "true"}}},
+        "profiles": {"p": {"agent": "a"}},
+        "bindings": {"role": {"profile": "p", "strict": true}}
+    }"#;
+    let registry = awp::Registry::from_json(strict_doc).unwrap();
+    assert!(registry.binding("role").unwrap().strict());
 }

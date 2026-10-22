@@ -51,6 +51,103 @@ pub struct VirtualAgent {
     before_turn: Option<Arc<dyn BeforeTurn>>,
 }
 
+/// The sealing recipe for one agent's command line: the flags that close
+/// every ambient code and instruction channel — extension discovery,
+/// skill and prompt-template loading, context-file injection — while the
+/// builtins the session still needs load explicitly by name. An agent
+/// without a recipe cannot serve a strict session at all.
+fn strict_recipe(spec: &AgentSpec) -> Option<Vec<String>> {
+    let program = std::path::Path::new(&spec.command.program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    match (spec.id.as_str(), program) {
+        ("pi", _) | (_, "pi") => Some(
+            [
+                "--no-extensions",
+                "-e",
+                "builtin:mcp",
+                "-e",
+                "builtin:codemode",
+                "-e",
+                "builtin:tool-search",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+            ]
+            .iter()
+            .map(|flag| flag.to_string())
+            .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Every argv vector a spec can place on the agent's command line: the
+/// spawn prefix plus, for the `cli` lane, the turn template and its
+/// resume/open variants. `resume_spawn_args` replaces the spawn prefix
+/// wholesale on a resumed turn, so it both gets its own seal copy and
+/// is scanned like any other vector.
+fn spec_arg_vectors(spec: &mut AgentSpec) -> Vec<&mut Vec<String>> {
+    let mut vectors: Vec<&mut Vec<String>> = vec![&mut spec.command.args];
+    if let LaneSpec::Cli(lane) = &mut spec.lane {
+        vectors.extend([
+            &mut lane.args,
+            &mut lane.resume_args,
+            &mut lane.resume_spawn_args,
+            &mut lane.open_args,
+        ]);
+    }
+    vectors
+}
+
+/// Apply strict sealing to one lane spec: the recipe lands on the spawn
+/// prefix — and on `resume_spawn_args` when that vector replaces the
+/// prefix on resumed turns — while every argv vector is refused when it
+/// declares an ambient channel a seal cannot honor: an explicit
+/// non-builtin `-e` extension, `--skill`, or `--prompt-template`.
+/// Sealing over such a spec would silently change the document's
+/// meaning instead of honoring it.
+fn seal_lane_spec(spec: &mut AgentSpec) -> a4aa::Result<()> {
+    let recipe = strict_recipe(spec).ok_or_else(|| {
+        a4aa::AdapterError::permanent("agent_unsealable", "profile/strict").with_detail(format!(
+            "agent `{}` (`{}`) has no declared strict-sealing recipe",
+            spec.id, spec.command.program
+        ))
+    })?;
+    let id = spec.id.clone();
+    for args in spec_arg_vectors(spec) {
+        for (index, arg) in args.iter().enumerate() {
+            let ambient = matches!(arg.as_str(), "--skill" | "--prompt-template")
+                || (matches!(arg.as_str(), "-e" | "--extension")
+                    && !args
+                        .get(index + 1)
+                        .is_some_and(|path| path.starts_with("builtin:")));
+            if ambient {
+                return Err(a4aa::AdapterError::permanent(
+                    "agent_unsealable",
+                    "profile/strict",
+                )
+                .with_detail(format!(
+                    "agent `{id}` declares ambient-surface arg `{arg}` a strict session cannot honor"
+                )));
+            }
+        }
+    }
+    let seal = |args: &mut Vec<String>| {
+        if !recipe.iter().all(|flag| args.contains(flag)) {
+            args.extend(recipe.iter().cloned());
+        }
+    };
+    seal(&mut spec.command.args);
+    if let LaneSpec::Cli(lane) = &mut spec.lane {
+        if !lane.resume_spawn_args.is_empty() {
+            seal(&mut lane.resume_spawn_args);
+        }
+    }
+    Ok(())
+}
+
 /// Fold the profile into one spec: environment entries merge into the
 /// command's environment policy `set`, profile MCP servers append to any
 /// lane that carries an MCP surface (`acp` session/new, `serve` config
@@ -89,6 +186,20 @@ impl VirtualAgent {
             permission: None,
             before_turn: None,
         }
+    }
+
+    /// Seal every lane variant for a strict session: each spec gets the
+    /// agent's isolation recipe — ambient extension, skill, prompt
+    /// template and context-file channels closed — so the declared
+    /// surface is the surface that actually runs. Every variant must
+    /// seal: a mid-session lane switch landing on an unsealed lane would
+    /// silently drop the guarantee, so one unsealable variant fails the
+    /// whole agent.
+    pub fn strict(mut self) -> a4aa::Result<Self> {
+        for spec in &mut self.specs {
+            seal_lane_spec(spec)?;
+        }
+        Ok(self)
     }
 
     pub fn secrets(mut self, secrets: Arc<dyn SecretResolver>) -> Self {

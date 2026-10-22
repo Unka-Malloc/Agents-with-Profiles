@@ -131,6 +131,10 @@ pub enum Binding {
     None,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The full binding payload — a named struct so `deny_unknown_fields`
 /// applies: `{"profile":"p","promt":"x"}` is a load error, not a silently
 /// dropped prompt.
@@ -140,6 +144,14 @@ pub struct BindingFull {
     pub profile: String,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Strict mode: sessions for this role must run on a sealed surface —
+    /// every ambient code and instruction channel the agent would
+    /// otherwise discover (extensions, skills, prompt templates, context
+    /// files) is cut so the declared surface equals the actual one. A
+    /// candidate that cannot seal is refused rather than served
+    /// unsealed. Non-strict sessions run the ambient environment as-is.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict: bool,
     /// When the primary candidate may serve at all — a promo lane whose
     /// free window the vendor published expires on its own; absence is
     /// unbounded.
@@ -264,6 +276,14 @@ impl Binding {
         match self {
             Binding::Full(full) => full.prompt.as_deref(),
             _ => None,
+        }
+    }
+
+    /// Whether the binding requires a sealed session surface.
+    pub fn strict(&self) -> bool {
+        match self {
+            Binding::Full(full) => full.strict,
+            _ => false,
         }
     }
 
@@ -527,6 +547,14 @@ impl Registry {
                 .with_detail(format!("unknown binding `{binding_name}`"))
         })?;
         let prompt = binding.prompt().map(str::to_owned);
+        // A strict binding may only be served by candidates that can
+        // seal their session surface: an unsealable candidate is
+        // skipped like an unavailable one — the role degrades to the
+        // candidates that keep the declared surface instead of
+        // silently running ambient — and only a chain where nothing
+        // can seal refuses the resolution outright.
+        let strict = binding.strict();
+        let mut strict_error = None;
         let mut candidates = Vec::new();
         let entries = std::iter::once((binding.profile(), binding.availability())).chain(
             binding
@@ -553,7 +581,24 @@ impl Registry {
                     ),
                 )
             })?;
-            candidates.push(crate::VirtualAgent::new(profile, entry.lane_specs()));
+            let agent = crate::VirtualAgent::new(profile, entry.lane_specs());
+            if !strict {
+                candidates.push(agent);
+                continue;
+            }
+            match agent.strict() {
+                Ok(agent) => candidates.push(agent),
+                Err(error) => {
+                    if candidates.is_empty() && strict_error.is_none() {
+                        strict_error = Some(error);
+                    }
+                }
+            }
+        }
+        if strict && candidates.is_empty() {
+            if let Some(error) = strict_error {
+                return Err(error);
+            }
         }
         Ok(candidates)
     }

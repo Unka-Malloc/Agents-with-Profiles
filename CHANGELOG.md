@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Optional profile `stateScope`: absent means fully parallel sessions;
+  `project` serializes within one project; `global` single-flights the
+  profile. Carried as advisory for hosts; omitted from the document when
+  unset.
+- Canonical headless-agent presets (`codex`, `cursor`, `dsh`, `hermes`,
+  `opencode`, `pi`): verified program, spawn argv, and required env
+  resolution as structs. `dsh` launches `dsh acp`; leftover `--profile sdk`
+  is not a preset.
 - `availability` on binding candidates: `notBefore`/`notAfter` bounds (RFC
   3339 or `YYYY-MM-DD` at 00:00 UTC) make time-limited lanes — vendor promo
   windows — expire semantically at resolution instead of failing per

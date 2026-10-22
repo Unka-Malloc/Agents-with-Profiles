@@ -199,7 +199,7 @@ async fn resolve() -> i32 {
         Err(e) => return failure(&e),
     };
     let profile = agent.profile();
-    let output = json!({
+    let mut output = json!({
         "profile": serde_json::to_value(profile).unwrap_or(Value::Null),
         "lane": match agent.lane_kind() {
             LaneKind::Acp => "acp",
@@ -223,6 +223,9 @@ async fn resolve() -> i32 {
         },
         "mechanisms": serde_json::to_value(&profile.mechanisms).unwrap_or(Value::Null),
     });
+    if let Some(scope) = profile.state_scope {
+        output["turn"]["stateScope"] = json!(scope);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&output).unwrap_or_default()

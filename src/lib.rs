@@ -19,6 +19,9 @@
 //!   profile environment and MCP servers fold into the effective
 //!   [`a4aa::AgentSpec`]; sessions compose instructions into prompt text
 //!   and fill model/effort defaults per turn.
+//! - [`AgentPreset`] — verified headless launch templates (`codex`,
+//!   `cursor`, `dsh`, `hermes`, `opencode`, `pi`) so hosts fill program,
+//!   argv and required env from structs instead of hand-assembled CLI.
 //! - The `awp` binary — `inspect`, `validate`, `resolve` and `run` for
 //!   document-driven operation, plus an `awp fixture-agent` test double.
 //!   `awp resolve` emits the effective spec and turn plan as JSON, so
@@ -38,14 +41,25 @@
 //!   all; a failed `apply` leaves the previous registry intact.
 
 pub mod agent;
+#[cfg(feature = "presets")]
+pub mod preset;
 pub mod profile;
 pub mod registry;
 
 pub use agent::{compose_prompt, VirtualAgent, VirtualSession};
-pub use profile::{InstructionMode, ModelWindow, Profile, ProfilePatch, RetryPolicy};
+pub use jiff;
+#[cfg(feature = "presets")]
+pub use preset::{
+    apply_preset, ids as preset_ids, instantiate as instantiate_preset, lookup as lookup_preset,
+    AgentPreset, PresetError, PresetUnit, RequiredEnv, PRESETS,
+};
+pub use profile::{
+    InstructionMode, ModelWindow, Profile, ProfilePatch, ProviderDecl, RetryPolicy, StateScope,
+};
 pub use registry::{
-    compose_instructions, AgentEntry, Availability, Binding, BindingFull, Fallback, FallbackEntry,
-    Registry, RegistryDocument, SecretRecipe, Selection, TomlSecret,
+    compose_instructions, parse_time_bound, resolve_secret, AgentEntry, Availability,
+    AvailabilityWindow, Binding, BindingFull, Fallback, FallbackEntry, FileSecret, Registry,
+    RegistryDocument, RegistrySecretResolver, SecretRecipe, Selection, TomlSecret,
 };
 
 // Re-export the a4aa surface hosts need to configure and drive sessions,

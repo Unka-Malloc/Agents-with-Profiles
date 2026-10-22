@@ -698,7 +698,7 @@ async fn acp_exhausted_model_chain_propagates_the_error() {
         .unwrap();
 
     let error = session.prompt("work".to_owned()).await.unwrap_err();
-    assert_eq!(error.code, "agent_protocol_failed");
+    assert_eq!(error.code, "agent_quota_exhausted");
     session.close().await.unwrap();
 }
 
@@ -816,7 +816,7 @@ async fn exhausted_model_chain_never_reaches_alternate_lane() {
         .unwrap();
 
     let error = session.prompt("work".to_owned()).await.unwrap_err();
-    assert_eq!(error.code, "agent_protocol_failed");
+    assert_eq!(error.code, "agent_quota_exhausted");
     session.close().await.unwrap();
 }
 

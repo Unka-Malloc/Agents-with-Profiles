@@ -88,6 +88,7 @@ name = "a4aa-dsh"
 version = "0.2.1"
 dependencies = [
  "a4aa",
+ "serde_json",
 ]
 
 [[package]]
@@ -202,6 +203,7 @@ dependencies = [
  "a4aa-codex",
  "a4aa-devin",
  "a4aa-dialects",
+ "async-trait",
  "jiff",
  "serde",
  "serde_json",

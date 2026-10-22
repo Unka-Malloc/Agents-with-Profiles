@@ -14,8 +14,9 @@
 //! - **Advisory** — carried verbatim for the host to consume (`permission`,
 //!   `mode`, `context_window`, `required_capabilities`,
 //!   `preferred_capabilities`, `skill_references`, `state_key`,
-//!   `extensions`). The crate never invents a delivery path for advisory
-//!   fields; the host decides what its agent or dispatch layer supports.
+//!   `state_scope`, `extensions`). The crate never invents a delivery
+//!   path for advisory fields; the host decides what its agent or
+//!   dispatch layer supports.
 //! - **Mechanisms** — `mechanisms` is the CAwP section: semantic
 //!   declarations (hooks, rules, skills, commands, subagents, plugins,
 //!   permissions, config-file MCP servers, native-profile selection) that
@@ -35,6 +36,22 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use a4aa::EnvValue;
+
+/// Serialization domain for host-side session state.
+///
+/// Absence (the default) means the profile takes no state lease — sessions
+/// run fully parallel. `"project"` serializes only within one project;
+/// `"global"` single-flights the whole profile, for agents that genuinely
+/// cannot serve concurrent sessions. The crate carries the marker; the
+/// session host owns the lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateScope {
+    /// Serialize only within one project.
+    Project,
+    /// Full single-flight across the machine.
+    Global,
+}
 
 /// When persona instructions are composed into turn text.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,6 +163,25 @@ pub struct RetryPolicy {
     pub reset_grace: Option<jiff::SignedDuration>,
 }
 
+/// A declared model provider: vendor identifier, base URL or endpoint,
+/// optional auth secret recipe key, and catalog of supported models.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderDecl {
+    /// Provider kind or vendor name (e.g. "anthropic", "openai", "deepseek", "kimi", "custom").
+    #[serde(default)]
+    pub vendor: String,
+    /// Base URL or custom API endpoint, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Secret recipe key or host env variable carrying credentials for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_secret: Option<String>,
+    /// Catalog of model identifiers offered by this provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+}
+
 impl RetryPolicy {
     /// The earliest instant the next attempt becomes eligible: a known
     /// `reset` wins and is shifted by `resetGrace`; otherwise `interval`
@@ -220,6 +256,13 @@ pub struct Profile {
     /// candidate chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryPolicy>,
+    /// Absolute retirement instant: once reached, the profile can no
+    /// longer serve anywhere — a free-tier promo whose end the vendor
+    /// published drops out of every chain that references it, and custody
+    /// prunes the entry on its next read. RFC 3339 or `YYYY-MM-DD`
+    /// (00:00 UTC); absence is unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retires_at: Option<String>,
     /// Default reasoning effort passed to lanes that accept one per turn.
     #[serde(default)]
     pub effort: Option<String>,
@@ -235,6 +278,9 @@ pub struct Profile {
     /// When instructions are composed into turns.
     #[serde(default)]
     pub instruction_mode: InstructionMode,
+    /// Declared model providers and their model catalogs (advisory).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderDecl>,
     /// Preferred working directory for sessions that do not override it.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
@@ -261,6 +307,11 @@ pub struct Profile {
     /// Host-side session-state namespace (advisory).
     #[serde(default)]
     pub state_key: Option<String>,
+    /// Serialization domain of [`state_key`](Self::state_key). Absent
+    /// from the document — the default — means no state lease. See
+    /// [`StateScope`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_scope: Option<StateScope>,
     /// CAwP section: semantic mechanism declarations handed to a4aa's
     /// adaptation layer for materialization into agent-native artifacts.
     #[serde(default)]
@@ -325,11 +376,13 @@ impl Profile {
             models,
             windows,
             retry,
+            retires_at,
             effort,
             mode,
             permission,
             instructions,
             instruction_mode,
+            providers,
             cwd,
             context_window,
             env,
@@ -338,6 +391,7 @@ impl Profile {
             preferred_capabilities,
             skill_references,
             state_key,
+            state_scope,
             mechanisms,
             extensions,
         } = patch;
@@ -362,6 +416,9 @@ impl Profile {
         if let Some(value) = retry {
             self.retry = Some(value);
         }
+        if let Some(value) = retires_at {
+            self.retires_at = Some(value);
+        }
         if let Some(value) = effort {
             self.effort = Some(value);
         }
@@ -376,6 +433,9 @@ impl Profile {
         }
         if let Some(value) = instruction_mode {
             self.instruction_mode = value;
+        }
+        if let Some(value) = providers {
+            self.providers.extend(value);
         }
         if let Some(value) = cwd {
             self.cwd = Some(value);
@@ -401,6 +461,9 @@ impl Profile {
         if let Some(value) = state_key {
             self.state_key = Some(value);
         }
+        if let Some(value) = state_scope {
+            self.state_scope = Some(value);
+        }
         if let Some(patch_set) = mechanisms {
             match &mut self.mechanisms {
                 Some(set) => set.merge(patch_set),
@@ -422,11 +485,13 @@ impl Profile {
             models: Some(self.models.clone()),
             windows: Some(self.windows.clone()),
             retry: self.retry.clone(),
+            retires_at: self.retires_at.clone(),
             effort: self.effort.clone(),
             mode: self.mode.clone(),
             permission: self.permission.clone(),
             instructions: self.instructions.clone(),
             instruction_mode: Some(self.instruction_mode),
+            providers: Some(self.providers.clone()),
             cwd: self.cwd.clone(),
             context_window: self.context_window,
             env: Some(self.env.clone()),
@@ -435,6 +500,7 @@ impl Profile {
             preferred_capabilities: Some(self.preferred_capabilities.clone()),
             skill_references: Some(self.skill_references.clone()),
             state_key: self.state_key.clone(),
+            state_scope: self.state_scope,
             mechanisms: self.mechanisms.clone(),
             extensions: Some(self.extensions.clone()),
         }
@@ -464,6 +530,8 @@ pub struct ProfilePatch {
     #[serde(default)]
     pub retry: Option<RetryPolicy>,
     #[serde(default)]
+    pub retires_at: Option<String>,
+    #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
@@ -473,6 +541,8 @@ pub struct ProfilePatch {
     pub instructions: Option<String>,
     #[serde(default)]
     pub instruction_mode: Option<InstructionMode>,
+    #[serde(default)]
+    pub providers: Option<BTreeMap<String, ProviderDecl>>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
     #[serde(default)]
@@ -489,6 +559,8 @@ pub struct ProfilePatch {
     pub skill_references: Option<Vec<String>>,
     #[serde(default)]
     pub state_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_scope: Option<StateScope>,
     #[serde(default)]
     pub mechanisms: Option<a4aa::MechanismSet>,
     #[serde(default)]
@@ -496,6 +568,15 @@ pub struct ProfilePatch {
 }
 
 impl Profile {
+    /// Whether this profile's declared retirement instant has passed. A
+    /// malformed `retiresAt` never retires — malformed documents are
+    /// rejected at apply, so a surviving profile always parses here.
+    pub fn is_retired(&self, now: &jiff::Timestamp) -> bool {
+        self.retires_at
+            .as_deref()
+            .is_some_and(|raw| crate::parse_time_bound(raw).is_some_and(|b| *now >= b))
+    }
+
     /// Resolve a patch into a profile under `id`. `agent` is required — a
     /// profile without a backing agent can never materialize.
     pub fn from_patch(id: impl Into<String>, mut patch: ProfilePatch) -> a4aa::Result<Self> {

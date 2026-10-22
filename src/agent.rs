@@ -435,6 +435,11 @@ const MODEL_EXHAUSTION: &[&str] = &[
     "no such model",
     "model does not exist",
     "unsupported model",
+    // A rejected credential makes this profile's provider just as unusable
+    // as an exhausted one — the turn escalates to the next profile.
+    "unauthorized",
+    "authentication_error",
+    "invalid 'authorization' header",
 ];
 
 /// A requested model the agent cannot express (`agent_configuration_unavailable`
@@ -455,6 +460,15 @@ fn model_rejected(error: &a4aa::AdapterError) -> bool {
 fn model_failure(error: &a4aa::AdapterError) -> bool {
     if model_rejected(error) {
         return true;
+    }
+    // A4AA normalizes explicit provider quota/capacity refusals across
+    // lanes into this code — a certain-effect retryable refusal, treated
+    // exactly like a matched exhaustion signature.
+    if error.code == "agent_quota_exhausted" {
+        return matches!(
+            error.stage,
+            "session/open" | "session/prompt" | "session/set_model" | "session/set_config_option"
+        );
     }
     error.code == "agent_protocol_failed"
         && matches!(

@@ -72,11 +72,17 @@ profile's candidates cannot open or complete (cross-agent fallback). Each
 fallback is either a bare profile id or `{"profile", "availability"}`; the
 primary accepts `availability` too. `availability` bounds when a candidate
 is selectable at all: `notBefore` inclusive, `notAfter` exclusive, each an
-RFC 3339 timestamp or a bare `YYYY-MM-DD` read as that day's 00:00 UTC. An
-absent bound is unbounded — a promo lane whose end the vendor never
-published stays selectable until request failure pushes it aside — and a
-malformed bound rejects the document at load. Resolution skips expired
-candidates outright, so expiry is semantic and needs no scheduled cleanup.
+RFC 3339 timestamp or a bare `YYYY-MM-DD` read as that day's 00:00 UTC.
+Recurring `windows` narrow a bound to a schedule —
+`[{days, from, to, timezone}]` where `days` is `*` or comma-separated
+`mon`–`sun` codes and `from`/`to` are `"HH:MM"` in the named IANA zone; a
+`to` earlier than `from` wraps midnight and equal bounds cover the whole
+matching day. An absent bound is unbounded — a promo lane whose end the
+vendor never published stays selectable until request failure pushes it
+aside — and any malformed bound, window field or `days` spelling rejects
+the document at load: the vocabulary fails closed rather than silently
+never covering. Resolution skips expired candidates outright, so expiry is
+semantic and needs no scheduled cleanup.
 A `null` binding value removes the slot on overlay. Unknown fields
 are rejected (`deny_unknown_fields`) — a typo is a load error, not a silent
 default.
@@ -94,6 +100,15 @@ cannot weaken it: the flag lives on the stored binding, not on the
 patched profile. Short-form bindings and `profile`-selector sessions are
 always non-strict — declare the full form where the guarantee is needed.
 
+Every selection path answers the same question: `Registry::select`,
+`resolve_binding` and `resolve_chain` all walk the one candidate iterator —
+availability bounds and retirement filter each candidate, a strict binding
+skips whatever cannot seal, and the first servable candidate answers with
+the binding's prompt composed into its instructions. `select` returns the
+profile and composed instructions without materializing an agent; the
+`resolve_*` forms return virtual agents. When no candidate is servable the
+paths refuse with `binding_chain_expired` — never an unavailable profile.
+
 ## Profile fields: materialized vs advisory
 
 | Field | Class | Effect |
@@ -103,7 +118,7 @@ always non-strict — declare the full form where the guarantee is needed.
 | `instructions`, `instructionMode` | materialized | Composed into prompt text (`instructions\n\n<text>`). `first-turn` sends once per session-bound lane (`acp`, `rpc`); `every-turn` always. Stateless `cli` lanes deliver on every turn — each turn is a fresh process. |
 | `model`, `effort` | materialized | Defaults applied at the session or turn phase supported by the A4AA adapter. Explicit session configuration wins over profile defaults. Explicit turn selectors are honored where the lane supports them; unsupported selections fail before the turn begins. ACP values use negotiated configuration. |
 | `models` | materialized | Same-agent fallback chain behind `model`: when the head model's provider answers exhaustion, the next chain entry serves the turn. |
-| `windows` | materialized | Time-windowed model routing — `[{timezone, from, to, model, models}]`. `from`/`to` are `"HH:MM"` in the named IANA zone; a `to` earlier than `from` wraps midnight. While a window covers now its own `model`/`models` chain heads selection; uncovered minutes fall back to the profile's plain `model`/`models`. |
+| `windows` | materialized | Time-windowed model routing — `[{timezone, from, to, model, models}]`. `from`/`to` are `"HH:MM"` in the named IANA zone; a `to` earlier than `from` wraps midnight. While a window covers now its own `model`/`models` chain heads selection; uncovered minutes fall back to the profile's plain `model`/`models`. An unresolvable timezone or a malformed `HH:MM` bound is a load error — never a quiet fall-back to the plain chain. |
 | `retry` | materialized | Quota-recovery schedule declared for the host orchestrator — `{interval, resetGrace}` durations (`"3h1m"` or ISO 8601). Nothing sleeps inside the crate; `wakeup()` computes the earliest eligible next attempt after chain exhaustion. |
 | `cwd` | materialized | Default session working directory; an explicit `SessionRequest.cwd` wins. |
 | `env` | materialized | Merged per key into the spec's environment policy `set` — literals and `{"secret": …}` / `{"hostEnv": …}` indirections resolve at spawn like any spec entry. |

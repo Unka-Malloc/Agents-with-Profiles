@@ -9,8 +9,11 @@
 #   repository adopts `nightly`) before the cutoff. The bump is the highest
 #   `release:patch`, `release:minor` or `release:major` label among its pull
 #   requests, patch when none is set. The train runs as a rehearsal.
-# - Run workflow: releases the head of `nightly` (or the requested commit)
-#   now, at the version typed in or bumped by the chosen level.
+# - Run workflow: verifies the head of `nightly` (or the requested commit)
+#   now, at the version typed in or bumped by the chosen level. Nothing it
+#   runs publishes: a live upload always needs a separate `publish` workflow
+#   dispatch naming this run's id with `mode: live`, which waits on the
+#   `release` environment's reviewers.
 #
 # There is deliberately no tag trigger: `publish.yml` accepts release
 # inputs only from verify runs on the default branch, and a pushed tag is
@@ -26,9 +29,9 @@
 # waits on siblings, verifies, versions and packages the candidate, then
 # hands the `.crate` set and the release decision over as artifacts.
 # `publish.yml` (the release side) is the only file that holds the OIDC
-# publishing job; it runs the default branch's own copy after this verify
-# train completes, so a candidate ref can never supply the workflow that
-# receives the publishing identity.
+# publishing job; it runs only on a manual dispatch on the default branch,
+# so a candidate ref can never supply the workflow that receives the
+# publishing identity.
 #
 # Credentials: this file needs none; a read-only token suffices.
 name: verify
@@ -170,17 +173,14 @@ jobs:
           for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
           cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
 
-      # The release train (default branch) reads this data-only file to
+      # The publish workflow (default branch) reads this data-only file to
       # learn the candidate, the version decision and the kind of run; it
       # lands for every trigger so the gate job can short-circuit cleanly
-      # on rehearsals and unqualified candidates. Kind and mode expand from
-      # immutable run metadata inline — never from a variable candidate
-      # code could have persisted through $GITHUB_ENV.
-      # Only data fields cross out of this runner. The live/dry-run mode is
-      # never written here: candidate code can overwrite this file before the
-      # upload, so mode would be candidate-produced intent. The publish
-      # workflow derives mode from its own trusted dispatch input instead,
-      # and rejects the file when it carries mode or rehearse keys at all.
+      # on unqualified candidates. Kind expands from the trusted event name
+      # inline; mode is deliberately never recorded here — candidate code
+      # could overwrite this file before the upload, so publish derives it
+      # from its own dispatch input and rejects the file when it carries
+      # mode or rehearse keys at all.
       - name: Record the release inputs
         if: always()
         run: |

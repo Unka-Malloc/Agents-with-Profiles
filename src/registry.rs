@@ -424,6 +424,23 @@ fn default_all_days() -> String {
     "*".to_string()
 }
 
+/// The weekday vocabulary — the single definition `covers` matches against
+/// and `is_well_formed` validates, so an accepted spelling can always be
+/// covered and an uncovered spelling never passes load.
+const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+fn weekday_code(date: jiff::civil::Date) -> &'static str {
+    match date.weekday() {
+        jiff::civil::Weekday::Monday => "mon",
+        jiff::civil::Weekday::Tuesday => "tue",
+        jiff::civil::Weekday::Wednesday => "wed",
+        jiff::civil::Weekday::Thursday => "thu",
+        jiff::civil::Weekday::Friday => "fri",
+        jiff::civil::Weekday::Saturday => "sat",
+        jiff::civil::Weekday::Sunday => "sun",
+    }
+}
+
 fn default_timezone() -> String {
     "UTC".to_string()
 }
@@ -438,16 +455,6 @@ impl AvailabilityWindow {
         let minute_of_day = (time.hour() as u16) * 60 + (time.minute() as u16);
         let (Some(from), Some(to)) = (minute_bound(&self.from), minute_bound(&self.to)) else {
             return false;
-        };
-
-        let weekday_code = |d: jiff::civil::Date| match d.weekday() {
-            jiff::civil::Weekday::Monday => "mon",
-            jiff::civil::Weekday::Tuesday => "tue",
-            jiff::civil::Weekday::Wednesday => "wed",
-            jiff::civil::Weekday::Thursday => "thu",
-            jiff::civil::Weekday::Friday => "fri",
-            jiff::civil::Weekday::Saturday => "sat",
-            jiff::civil::Weekday::Sunday => "sun",
         };
 
         let day_matches = |target_day: &str| {
@@ -493,13 +500,12 @@ impl AvailabilityWindow {
     }
 
     pub fn is_well_formed(&self) -> bool {
-        const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
         let days_well_formed = if self.days == "*" {
             true
         } else {
             self.days.split(',').all(|day| {
                 let day = day.trim();
-                !day.is_empty() && DAYS.iter().any(|known| day.eq_ignore_ascii_case(known))
+                !day.is_empty() && WEEKDAYS.iter().any(|known| day.eq_ignore_ascii_case(known))
             })
         };
         jiff::tz::TimeZone::get(&self.timezone).is_ok()
@@ -902,44 +908,106 @@ impl Registry {
     }
 
     /// `select` against an explicit instant — the deterministic form tests
-    /// and schedulers use.
+    /// and schedulers use. A strict binding skips candidates that cannot
+    /// seal their session surface, exactly as `resolve_chain_at` does.
     pub fn select_at(&self, binding_name: &str, now: &jiff::Timestamp) -> a4aa::Result<Selection> {
-        let binding = self.binding(binding_name).ok_or_else(|| {
-            AdapterError::permanent("binding_unknown", "registry/select")
-                .with_detail(format!("unknown binding `{binding_name}`"))
-        })?;
-        let prompt = binding.prompt().map(str::to_owned);
-        let entries = std::iter::once((binding.profile(), binding.availability())).chain(
-            binding
-                .fallbacks()
-                .iter()
-                .map(|f| (f.profile(), f.availability())),
-        );
-        for (id, availability) in entries {
-            if availability.is_some_and(|a| !a.covers(now)) {
-                continue;
-            }
-            let mut profile = self
-                .profiles
-                .get(id)
-                .expect("bindings validate against profiles at apply")
-                .clone();
-            if profile.is_retired(now) {
-                continue;
-            }
-            profile.instructions =
-                compose_instructions(profile.instructions.as_deref(), prompt.as_deref());
+        let binding = self.require_binding(binding_name, "registry/select")?;
+        let strict = binding.strict();
+        let mut strict_error = None;
+        for profile in self.available_candidates(binding, now) {
+            let profile = if strict {
+                let agent = self.candidate_agent(profile)?;
+                match agent.strict() {
+                    Ok(agent) => agent.profile().clone(),
+                    Err(error) => {
+                        if strict_error.is_none() {
+                            strict_error = Some(error);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                profile
+            };
             let instructions = profile.instructions.clone();
             return Ok(Selection {
                 profile,
                 instructions,
             });
         }
-        Err(
-            AdapterError::permanent("binding_chain_expired", "registry/select").with_detail(
-                format!("binding `{binding_name}` has no candidate available now"),
-            ),
+        if let Some(error) = strict_error {
+            return Err(error);
+        }
+        Err(Self::chain_expired(binding_name, "registry/select"))
+    }
+
+    /// The binding `name`, refusing vacant or unknown entries — the single
+    /// place the selection paths build `binding_unknown`.
+    fn require_binding(&self, binding_name: &str, op: &'static str) -> a4aa::Result<&Binding> {
+        self.binding(binding_name).ok_or_else(|| {
+            AdapterError::permanent("binding_unknown", op)
+                .with_detail(format!("unknown binding `{binding_name}`"))
+        })
+    }
+
+    /// `binding`'s candidates servable at `now`, in order: availability
+    /// bounds and retirement filter each profile, then the binding's
+    /// standing prompt composes into the survivor's instructions. Every
+    /// selection path walks this one iterator, so a future gate applies
+    /// everywhere a candidate can be picked rather than in one loop.
+    fn available_candidates<'a>(
+        &'a self,
+        binding: &'a Binding,
+        now: &'a jiff::Timestamp,
+    ) -> impl Iterator<Item = Profile> + 'a {
+        let prompt = binding.prompt().map(str::to_owned);
+        std::iter::once((binding.profile(), binding.availability()))
+            .chain(
+                binding
+                    .fallbacks()
+                    .iter()
+                    .map(|f| (f.profile(), f.availability())),
+            )
+            .filter_map(move |(id, availability)| {
+                if availability.is_some_and(|a| !a.covers(now)) {
+                    return None;
+                }
+                let mut profile = self
+                    .profiles
+                    .get(id)
+                    .expect("bindings validate against profiles at apply")
+                    .clone();
+                if profile.is_retired(now) {
+                    return None;
+                }
+                profile.instructions =
+                    compose_instructions(profile.instructions.as_deref(), prompt.as_deref());
+                Some(profile)
+            })
+    }
+
+    /// `profile` materialized with the registry's secret resolver — the
+    /// object `strict()` can seal when the binding demands it.
+    fn candidate_agent(&self, profile: Profile) -> a4aa::Result<crate::VirtualAgent> {
+        let entry = self.agents.get(&profile.agent).ok_or_else(|| {
+            AdapterError::permanent("profile_agent_unknown", "registry/resolve").with_detail(
+                format!(
+                    "profile `{}` references unknown agent `{}`",
+                    profile.id, profile.agent
+                ),
+            )
+        })?;
+        Ok(
+            crate::VirtualAgent::new(profile, entry.lane_specs()).secrets(std::sync::Arc::new(
+                RegistrySecretResolver::new(self.secrets.clone()),
+            )),
         )
+    }
+
+    fn chain_expired(binding_name: &str, op: &'static str) -> AdapterError {
+        AdapterError::permanent("binding_chain_expired", op).with_detail(format!(
+            "binding `{binding_name}` has no candidate available now"
+        ))
     }
 
     /// Resolve a binding straight to its virtual agent, with the binding's
@@ -950,11 +1018,7 @@ impl Registry {
         self.resolve_chain(binding_name)?
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                AdapterError::permanent("binding_chain_expired", "registry/resolve").with_detail(
-                    format!("binding `{binding_name}` has no candidate available now"),
-                )
-            })
+            .ok_or_else(|| Self::chain_expired(binding_name, "registry/resolve"))
     }
 
     /// Resolve a binding to its ordered candidate chain: the bound profile
@@ -975,11 +1039,7 @@ impl Registry {
         binding_name: &str,
         now: &jiff::Timestamp,
     ) -> a4aa::Result<Vec<crate::VirtualAgent>> {
-        let binding = self.binding(binding_name).ok_or_else(|| {
-            AdapterError::permanent("binding_unknown", "registry/select")
-                .with_detail(format!("unknown binding `{binding_name}`"))
-        })?;
-        let prompt = binding.prompt().map(str::to_owned);
+        let binding = self.require_binding(binding_name, "registry/select")?;
         // A strict binding may only be served by candidates that can
         // seal their session surface: an unsealable candidate is
         // skipped like an unavailable one — the role degrades to the
@@ -989,37 +1049,8 @@ impl Registry {
         let strict = binding.strict();
         let mut strict_error = None;
         let mut candidates = Vec::new();
-        let entries = std::iter::once((binding.profile(), binding.availability())).chain(
-            binding
-                .fallbacks()
-                .iter()
-                .map(|f| (f.profile(), f.availability())),
-        );
-        for (id, availability) in entries {
-            if availability.is_some_and(|a| !a.covers(now)) {
-                continue;
-            }
-            let mut profile = self
-                .profiles
-                .get(id)
-                .expect("bindings validate against profiles at apply")
-                .clone();
-            if profile.is_retired(now) {
-                continue;
-            }
-            profile.instructions =
-                compose_instructions(profile.instructions.as_deref(), prompt.as_deref());
-            let entry = self.agents.get(&profile.agent).ok_or_else(|| {
-                AdapterError::permanent("profile_agent_unknown", "registry/resolve").with_detail(
-                    format!(
-                        "profile `{}` references unknown agent `{}`",
-                        profile.id, profile.agent
-                    ),
-                )
-            })?;
-            let agent = crate::VirtualAgent::new(profile, entry.lane_specs()).secrets(
-                std::sync::Arc::new(RegistrySecretResolver::new(self.secrets.clone())),
-            );
+        for profile in self.available_candidates(binding, now) {
+            let agent = self.candidate_agent(profile)?;
             if !strict {
                 candidates.push(agent);
                 continue;

@@ -378,6 +378,11 @@ impl Profile {
     }
 
     /// Apply an overlay: `Some` replaces, `None` keeps; `env` merges per key.
+    /// Merge a patch into this profile. Construction-time validation —
+    /// including malformed model windows — lives in [`Profile::from_patch`]
+    /// and the registry's document loader; callers mutating through this
+    /// infallible merge are expected to apply a patch that already passed
+    /// one of those gates.
     pub fn apply(&mut self, patch: ProfilePatch) {
         let ProfilePatch {
             name,
@@ -589,11 +594,26 @@ impl Profile {
     }
 
     /// Resolve a patch into a profile under `id`. `agent` is required — a
-    /// profile without a backing agent can never materialize.
+    /// profile without a backing agent can never materialize. Malformed
+    /// model windows are rejected here too, so a patch that bypasses the
+    /// registry fails closed exactly like a registry document.
     pub fn from_patch(id: impl Into<String>, mut patch: ProfilePatch) -> a4aa::Result<Self> {
         let agent = patch.agent.take().ok_or_else(|| {
             a4aa::AdapterError::permanent("profile_agent_missing", "profile/resolve")
         })?;
+        if patch
+            .windows
+            .as_ref()
+            .is_some_and(|windows| windows.iter().any(|w| !w.is_well_formed()))
+        {
+            return Err(a4aa::AdapterError::permanent(
+                "profile_windows_malformed",
+                "profile/resolve",
+            )
+            .with_detail(
+                "model window declares an unresolvable timezone or a malformed HH:MM bound",
+            ));
+        }
         let mut profile = Profile {
             id: id.into(),
             agent,

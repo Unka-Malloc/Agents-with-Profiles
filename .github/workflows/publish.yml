@@ -5,11 +5,10 @@
 # This file holds the only job trusted with the crates.io OIDC identity.
 # Registries bind trusted publishing to this filename, which is why the
 # OIDC job lives here and not in the candidate-triggered `verify.yml`.
-# It never runs on a candidate ref: `workflow_run` executes the default
-# branch's copy of this file after the `verify` train completes, and a
-# manual dispatch is confined to the default branch by the job condition
-# below. The candidate supplies verified artifacts only — the workflow
-# definition itself is outside its reach.
+# It never runs on a candidate ref: a manual dispatch is confined to the
+# default branch by the job condition below. The candidate supplies
+# verified artifacts only — the workflow definition itself is outside its
+# reach.
 #
 # `gate` downloads the verify run's `release-inputs` artifact and exposes
 # its data fields as job outputs after strict shape checks. Data is all the
@@ -25,10 +24,13 @@
 # Credentials: crates.io Trusted Publishing; no stored secret.
 name: publish
 
+# There is deliberately no `workflow_run` trigger: crates.io Trusted
+# Publishing refuses the OIDC exchange for that event, so an automatic
+# publish run could only ever end with its release job skipped — a silent
+# no-op that looks like success. Publishing is manual-only: dispatch this
+# workflow with the verify run's id, and set `mode: live` to actually
+# upload; a dry-run dispatch replays every trusted step except the upload.
 on:
-  workflow_run:
-    workflows: ["verify"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       run_id:
@@ -63,7 +65,7 @@ jobs:
       actions: read
       contents: read
     outputs:
-      run_id: ${{ github.event.workflow_run.id || inputs.run_id }}
+      run_id: ${{ inputs.run_id }}
       # The mode comes only from this workflow's own dispatch input — trusted
       # runner metadata. The artifact can never carry it: the parser below
       # rejects the file outright when a candidate wrote mode or rehearse in.
@@ -76,7 +78,7 @@ jobs:
       needs_set: ${{ steps.load.outputs.needs_set }}
       excludes: ${{ steps.load.outputs.excludes }}
     env:
-      RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+      RUN_ID: ${{ inputs.run_id }}
     steps:
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
@@ -129,8 +131,7 @@ jobs:
       # qualify) and it succeeded. The source ref and the declared
       # candidate are bound separately below: a `verify` workflow
       # modified on a side branch therefore cannot forge a release
-      # decision, whether it arrives by workflow_run or by a dispatched
-      # run_id.
+      # decision, whatever run_id the dispatch names.
       - name: Bind the run to the verify train
         id: bind
         env:
@@ -183,8 +184,7 @@ jobs:
   release:
     if: >-
       github.ref_name == github.event.repository.default_branch &&
-      (github.event_name == 'workflow_dispatch' ||
-       github.event.workflow_run.conclusion == 'success') &&
+      github.event_name == 'workflow_dispatch' &&
       needs.gate.outputs.mode == 'live' &&
       needs.gate.outputs.release == 'true'
     needs: gate
@@ -280,8 +280,25 @@ jobs:
           NEEDS_SET: ${{ steps.version.outputs.needs_set }}
           EXCLUDES: ${{ steps.version.outputs.excludes }}
           RELEASE: ${{ steps.version.outputs.release }}
+          # The bound verify run's own decision, for comparison only — the
+          # recompute above is what publishes; a divergence means the
+          # artifact does not describe this commit's real decision and the
+          # release refuses rather than guess which side was tampered with.
+          ART_NEXT: ${{ needs.gate.outputs.next }}
+          ART_NEEDS_SET: ${{ needs.gate.outputs.needs_set }}
+          ART_EXCLUDES: ${{ needs.gate.outputs.excludes }}
+          ART_RELEASE: ${{ needs.gate.outputs.release }}
         run: |
           [ "$RELEASE" = "true" ] || { echo "recompute says nothing to release"; exit 1; }
+          [ "$ART_RELEASE" = "true" ] || { echo "bound verify run found nothing to release"; exit 1; }
+          for pair in "next:$NEXT:$ART_NEXT" "needs_set:$NEEDS_SET:$ART_NEEDS_SET" "excludes:$EXCLUDES:$ART_EXCLUDES"; do
+            key="${pair%%:*}"; rest="${pair#*:}"
+            mine="${rest%%:*}"; theirs="${rest#*:}"
+            [ "$mine" = "$theirs" ] || {
+              echo "version decision diverges from the bound verify run: $key '$mine' vs '$theirs'"
+              exit 1
+            }
+          done
           printf 'NEXT=%s\nNEEDS_SET=%s\nEXCLUDES=%s\n' \
             "$NEXT" "$NEEDS_SET" "$EXCLUDES" >> "$GITHUB_ENV"
       # a manifest rewrite driven by cargo metadata — data only, nothing

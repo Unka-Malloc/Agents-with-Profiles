@@ -1,8 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- `Registry::select` honors the same gates as `resolve_chain`: candidates
+  gated by availability windows or retirement no longer answer, a strict
+  binding skips candidates that cannot seal their session surface, and an
+  empty chain fails with `binding_chain_expired` instead of returning the
+  bound profile unchecked.
+- Malformed availability `windows` — a `days` value outside `*` or the
+  `mon`–`sun` vocabulary, an unresolvable `timezone`, or a malformed
+  `HH:MM` bound — reject the document at load (`binding_availability_malformed`)
+  instead of silently never covering. The same rule binds `windows` on
+  profiles: malformed model windows reject at load
+  (`profile_windows_malformed`), including profiles built through the
+  public `Profile::from_patch` path.
+- Release train: `publish.yml` no longer reads `mode`/`rehearse` from the
+  verify artifact (candidate code could rewrite it); live publishing
+  requires a `publish` dispatch with `mode: live`, the candidate must be
+  the verify run's own head, the version decision is recomputed by the
+  default branch's train helper inside the OIDC job and compared with the
+  bound run, and the release job waits on the `release` environment. The
+  `workflow_run` auto-publish path is removed — crates.io Trusted
+  Publishing refuses that event, so it could only ever no-op silently.
+
 ## 0.2.0
 
-Built on A4AA 0.4.0.
+Built on A4AA 0.4.x (developed against 0.4.0; published lockfile resolves 0.4.1).
 
 - Optional profile `stateScope`: absent means fully parallel sessions;
   `project` serializes within one project; `global` single-flights the

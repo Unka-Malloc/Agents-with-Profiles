@@ -77,8 +77,8 @@ jobs:
       sha: ${{ steps.candidate.outputs.sha }}
       branch: ${{ steps.candidate.outputs.branch }}
     env:
-      # The train's declared mode governs scheduled runs only; a manual or
-      # tag event releases live unless the dispatch opted into a rehearsal.
+      # The train's declared mode governs scheduled runs only; a manual
+      # dispatch releases live unless it opted into a rehearsal.
       RELEASE_MODE: ${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
       RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || 'manual' }}
       INPUT_VERSION: ${{ inputs.version }}

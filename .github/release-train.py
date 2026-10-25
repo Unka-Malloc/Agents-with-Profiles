@@ -196,6 +196,7 @@ def resolve_published(wanted: dict[str, set[str]]):
             ["cargo", "generate-lockfile", "--manifest-path", str(root / "Cargo.toml")],
             capture_output=True,
             text=True,
+            cwd=root,
         )
         if done.returncode != 0:
             return None, done.stderr.strip().splitlines()[-1:] or ["cargo failed"]
@@ -364,10 +365,7 @@ def choose_version(
 def cmd_version(args: argparse.Namespace) -> int:
     slug = os.environ.get("GITHUB_REPOSITORY", "")
     kind = os.environ.get("RELEASE_KIND", "train")
-    metadata = json.loads(subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-        capture_output=True, text=True, check=True,
-    ).stdout)
+    metadata = cargo_metadata(args.manifest_path, ["--no-deps"])
     members = set(metadata["workspace_members"])
     packages = [p for p in metadata["packages"] if p["id"] in members]
     publishable = [p for p in packages if p["publish"] is None or "crates-io" in p["publish"]]
@@ -446,11 +444,21 @@ def cmd_version(args: argparse.Namespace) -> int:
     )
     return 0
 
-def publishable_members() -> dict[str, dict]:
-    metadata = json.loads(subprocess.run(
-        ["cargo", "metadata", "--format-version", "1"],
-        capture_output=True, text=True, check=True,
-    ).stdout)
+def cargo_metadata(manifest_path: str, extra: list[str]) -> dict:
+    """Run `cargo metadata` from a neutral scratch directory: a checked-out
+    `.cargo/config.toml` — which can name credential-provider executables —
+    only loads when cargo's cwd walks into the candidate tree, so it never
+    loads here. `--manifest-path` still selects the intended workspace."""
+    with tempfile.TemporaryDirectory() as scratch:
+        done = subprocess.run(
+            ["cargo", "metadata", *extra, "--format-version", "1",
+             "--manifest-path", manifest_path],
+            capture_output=True, text=True, check=True, cwd=scratch)
+    return json.loads(done.stdout)
+
+
+def publishable_members(manifest_path: str) -> dict[str, dict]:
+    metadata = cargo_metadata(manifest_path, [])
     members = set(metadata["workspace_members"])
     packages = {p["name"]: p for p in metadata["packages"] if p["id"] in members}
     return {n: p for n, p in packages.items()
@@ -458,7 +466,7 @@ def publishable_members() -> dict[str, dict]:
 
 
 def cmd_order(args: argparse.Namespace) -> int:
-    packages = publishable_members()
+    packages = publishable_members(args.manifest_path)
     excludes = set((os.environ.get("EXCLUDES") or "").split())
     targets = sorted(set(packages) - excludes)
     ordered, pending = [], dict.fromkeys(targets)
@@ -484,7 +492,7 @@ def cmd_freshness(args: argparse.Namespace) -> int:
     window = dt.timedelta(days=args.window_days)
     today = dt.datetime.now(dt.timezone.utc).date()
     checked, stale = 0, []
-    for name, package in sorted(publishable_members().items()):
+    for name, package in sorted(publishable_members(args.manifest_path).items()):
         src = pathlib.Path(package["manifest_path"]).parent / "src"
         dates = [
             dt.date.fromisoformat(match.group(1))
@@ -523,14 +531,18 @@ def parser() -> argparse.ArgumentParser:
     deps = commands.add_parser("deps")
     deps.add_argument("--wait-minutes", type=int, default=0)
     deps.set_defaults(run=cmd_deps)
+    default_manifest = str(pathlib.Path.cwd() / "Cargo.toml")
     version = commands.add_parser("version")
     version.add_argument("--candidate", required=True)
     version.add_argument("--branch", default="")
+    version.add_argument("--manifest-path", default=default_manifest)
     version.set_defaults(run=cmd_version)
     order = commands.add_parser("order")
+    order.add_argument("--manifest-path", default=default_manifest)
     order.set_defaults(run=cmd_order)
     freshness = commands.add_parser("freshness")
     freshness.add_argument("--window-days", type=int, default=14)
+    freshness.add_argument("--manifest-path", default=default_manifest)
     freshness.set_defaults(run=cmd_freshness)
     return root
 

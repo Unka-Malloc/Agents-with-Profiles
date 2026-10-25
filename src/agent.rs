@@ -119,10 +119,16 @@ fn seal_lane_spec(spec: &mut AgentSpec) -> a4aa::Result<()> {
     for args in spec_arg_vectors(spec) {
         for (index, arg) in args.iter().enumerate() {
             let ambient = matches!(arg.as_str(), "--skill" | "--prompt-template")
+                || arg.starts_with("--skill=")
+                || arg.starts_with("--prompt-template=")
                 || (matches!(arg.as_str(), "-e" | "--extension")
                     && !args
                         .get(index + 1)
-                        .is_some_and(|path| path.starts_with("builtin:")));
+                        .is_some_and(|path| path.starts_with("builtin:")))
+                || arg
+                    .strip_prefix("--extension=")
+                    .or_else(|| arg.strip_prefix("-e="))
+                    .is_some_and(|path| !path.starts_with("builtin:"));
             if ambient {
                 return Err(a4aa::AdapterError::permanent(
                     "agent_unsealable",

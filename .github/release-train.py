@@ -240,6 +240,11 @@ def cmd_candidate(args: argparse.Namespace) -> int:
         if not git_ok("merge-base", "--is-ancestor", sha, f"refs/remotes/origin/{branch}"):
             raise TrainError(f"{args.override} is not on {branch}")
         source = f"requested candidate {args.override}"
+    elif kind == "tag":
+        sha = git("rev-parse", "--verify", f"{os.environ['GITHUB_SHA']}^{{commit}}")
+        if not git_ok("merge-base", "--is-ancestor", sha, f"refs/remotes/origin/{branch}"):
+            raise TrainError(f"{os.environ.get('GITHUB_REF_NAME', 'tag')} is not on {branch}")
+        source = f"pushed tag {os.environ.get('GITHUB_REF_NAME', '')}"
     elif kind == "manual":
         sha = git("rev-parse", "--verify", f"refs/remotes/origin/{branch}^{{commit}}")
         source = f"head of {branch}"

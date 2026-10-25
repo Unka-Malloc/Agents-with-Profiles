@@ -902,6 +902,50 @@ fn strict_binding_refuses_specs_reopening_ambient_channels() {
 }
 
 #[test]
+fn strict_binding_refuses_equals_form_ambient_args() {
+    for args in [
+        &["--skill=./ambient"][..],
+        &["--prompt-template=./ambient"][..],
+        &["--extension=./ambient.ts"][..],
+        &["-e=./ambient.ts"][..],
+    ] {
+        let mut document = document(&["pi"], &[("p", "pi")], &[]);
+        document.agents.insert(
+            "pi".to_owned(),
+            cli_spec("pi", "pi", args, PromptChannel::ArgOnly).into(),
+        );
+        document
+            .bindings
+            .insert("role".to_owned(), strict_binding("p", vec![]));
+        let error = Registry::from_document(document)
+            .unwrap()
+            .resolve_chain("role")
+            .err()
+            .expect("equals-form ambient args must refuse a strict session");
+        assert_eq!(error.code, "agent_unsealable", "{args:?}");
+    }
+    // A builtin path is the seal's own surface, not an ambient channel.
+    let mut document = document(&["pi"], &[("p", "pi")], &[]);
+    document.agents.insert(
+        "pi".to_owned(),
+        cli_spec(
+            "pi",
+            "pi",
+            &["--extension=builtin:mcp"],
+            PromptChannel::ArgOnly,
+        )
+        .into(),
+    );
+    document
+        .bindings
+        .insert("role".to_owned(), strict_binding("p", vec![]));
+    Registry::from_document(document)
+        .unwrap()
+        .resolve_chain("role")
+        .expect("a builtin extension is not an ambient channel");
+}
+
+#[test]
 fn non_strict_bindings_keep_the_ambient_surface() {
     let mut document = document(&["pi"], &[("p", "pi")], &[]);
     document.agents.insert(

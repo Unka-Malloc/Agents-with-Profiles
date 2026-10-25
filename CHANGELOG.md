@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
+
+Built on A4AA 0.4.0.
 
 - Optional profile `stateScope`: absent means fully parallel sessions;
   `project` serializes within one project; `global` single-flights the
@@ -17,6 +19,22 @@
   request or needing scheduled removal. Bounds live on the binding's
   primary and on full-form fallback entries; absent means unbounded and a
   malformed bound rejects the document at load.
+- Strict bindings: `strict` on a binding seals the resolved session surface
+  at resolution time; ambient-surface argv (`--skill`, `--prompt-template`,
+  `-e`/`--extension`, including equals-form) a sealed agent cannot honor
+  refuses the binding instead of silently widening the session.
+- Registry-level `secrets` recipes: named references resolve credential
+  values from the host environment at spawn; documents never carry the
+  secret itself.
+- Environment fidelity: specs resolve the user's real environment — an
+  agent never launches on an empty or minimal environment.
+- Quota refusals route through the profile's model chain: an
+  `agent_quota_exhausted` on A4AA 0.3.0+ advances the serving profile's
+  model list before the binding falls through to its next candidate.
+- Release train: the two-file verify/publish split lands — `verify.yml`
+  certifies a candidate under a read-only token and records the release
+  inputs as a data artifact; `publish.yml` holds the OIDC job and replays
+  only the bound result.
 
 ## 0.1.0
 

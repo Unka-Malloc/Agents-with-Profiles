@@ -486,8 +486,7 @@ impl AvailabilityWindow {
                     .checked_sub(jiff::SignedDuration::from_hours(24))
                     .unwrap_or(zoned.datetime().date()),
             );
-            let today = weekday_code(zoned.datetime().date());
-            day_matches(yesterday) || day_matches(today)
+            day_matches(yesterday)
         } else {
             false
         }

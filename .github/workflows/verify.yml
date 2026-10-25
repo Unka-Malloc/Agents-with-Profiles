@@ -97,7 +97,7 @@ jobs:
       # Copied before the candidate checkout replaces the working tree, so the
       # helper always matches this workflow.
       - name: Stage the train helper
-        run: cp .github/release.py "$RUNNER_TEMP/release.py"
+        run: cp .github/release-train.py "$RUNNER_TEMP/release.py"
 
       - name: Select the candidate
         id: candidate

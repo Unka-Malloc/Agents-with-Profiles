@@ -176,6 +176,11 @@ jobs:
       # on rehearsals and unqualified candidates. Kind and mode expand from
       # immutable run metadata inline — never from a variable candidate
       # code could have persisted through $GITHUB_ENV.
+      # Only data fields cross out of this runner. The live/dry-run mode is
+      # never written here: candidate code can overwrite this file before the
+      # upload, so mode would be candidate-produced intent. The publish
+      # workflow derives mode from its own trusted dispatch input instead,
+      # and rejects the file when it carries mode or rehearse keys at all.
       - name: Record the release inputs
         if: always()
         run: |
@@ -185,8 +190,6 @@ jobs:
           branch=${{ steps.candidate.outputs.branch }}
           release=${{ steps.version.outputs.release }}
           kind=${{ github.event_name == 'schedule' && 'train' || 'manual' }}
-          mode=${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
-          rehearse=${{ inputs.rehearse && 'true' || 'false' }}
           next=${{ steps.version.outputs.next }}
           needs_set=${{ steps.version.outputs.needs_set }}
           excludes=${{ steps.version.outputs.excludes }}

@@ -109,6 +109,15 @@ impl ModelWindow {
         }
     }
 
+    /// A malformed window silently covers nothing and the declared chain
+    /// answers instead — a typo then reads as "the discount never applies".
+    /// `apply` rejects it at load rather than letting it degrade quietly.
+    pub fn is_well_formed(&self) -> bool {
+        jiff::tz::TimeZone::get(&self.timezone).is_ok()
+            && minute(&self.from).is_some()
+            && minute(&self.to).is_some()
+    }
+
     /// The window's own chain: `model` first, then `models`, deduplicated.
     fn model_chain(&self) -> Vec<String> {
         let mut chain = Vec::new();

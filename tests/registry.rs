@@ -708,6 +708,120 @@ fn malformed_availability_fails_the_document() {
 }
 
 #[test]
+fn malformed_window_days_fail_the_document() {
+    let mut document = document(&["a"], &[("p", "a")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: Some(awp::Availability {
+                windows: vec![awp::AvailabilityWindow {
+                    days: "mon,noday".to_owned(),
+                    from: "00:00".to_owned(),
+                    to: "00:00".to_owned(),
+                    timezone: "UTC".to_owned(),
+                }],
+                ..Default::default()
+            }),
+            fallbacks: vec![],
+        }),
+    );
+    let error = Registry::from_document(document).unwrap_err();
+    assert_eq!(error.code, "binding_availability_malformed");
+}
+
+#[test]
+fn malformed_model_window_fails_the_document() {
+    let mut document = document(&["a"], &[], &[]);
+    document.profiles.insert(
+        "p".to_owned(),
+        ProfilePatch {
+            agent: Some("a".to_owned()),
+            windows: Some(vec![awp::ModelWindow {
+                timezone: "UTC".to_owned(),
+                from: "25:00".to_owned(),
+                to: "06:00".to_owned(),
+                model: Some("peak".to_owned()),
+                models: vec![],
+            }]),
+            ..Default::default()
+        },
+    );
+    let error = Registry::from_document(document).unwrap_err();
+    assert_eq!(error.code, "profile_windows_malformed");
+}
+
+#[test]
+fn select_honors_availability_and_retirement() {
+    let mut doc = document(&["a", "b"], &[("p", "a"), ("q", "b")], &[]);
+    // Primary "p" serves only Monday 00:00-12:00 UTC; "q" is unbounded.
+    doc.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: Some(awp::Availability {
+                windows: vec![awp::AvailabilityWindow {
+                    days: "mon".to_owned(),
+                    from: "00:00".to_owned(),
+                    to: "12:00".to_owned(),
+                    timezone: "UTC".to_owned(),
+                }],
+                ..Default::default()
+            }),
+            fallbacks: vec![awp::Fallback::Id("q".to_owned())],
+        }),
+    );
+    let registry = Registry::from_document(doc).unwrap();
+    // Sunday noon UTC is outside the primary's window -> "q" answers.
+    let sunday: jiff::Timestamp = "2026-10-25T12:00:00Z".parse().unwrap();
+    assert_eq!(registry.select_at("role", &sunday).unwrap().profile.id, "q");
+    // Monday 06:00 UTC is inside -> "p" answers.
+    let monday: jiff::Timestamp = "2026-10-19T06:00:00Z".parse().unwrap();
+    assert_eq!(registry.select_at("role", &monday).unwrap().profile.id, "p");
+
+    // A retired primary also hands the slot to the next candidate.
+    let mut retired = document(&["a", "b"], &[("p", "a"), ("q", "b")], &[]);
+    retired.profiles.get_mut("p").unwrap().retires_at = Some("2020-01-01".to_owned());
+    retired.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: None,
+            fallbacks: vec![awp::Fallback::Id("q".to_owned())],
+        }),
+    );
+    let registry = Registry::from_document(retired).unwrap();
+    assert_eq!(registry.select_at("role", &sunday).unwrap().profile.id, "q");
+
+    // When every candidate is gated out, select fails rather than
+    // answering with an unavailable profile.
+    let mut expired = document(&["a"], &[("p", "a")], &[]);
+    expired.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: Some(awp::Availability {
+                not_before: None,
+                not_after: Some("2020-01-01".to_owned()),
+                ..Default::default()
+            }),
+            fallbacks: vec![],
+        }),
+    );
+    let registry = Registry::from_document(expired).unwrap();
+    let error = registry.select_at("role", &sunday).err().unwrap();
+    assert_eq!(error.code, "binding_chain_expired");
+}
+
+#[test]
 fn windowed_fallback_deserializes_from_json() {
     let binding: awp::Binding = serde_json::from_str(
         r#"{

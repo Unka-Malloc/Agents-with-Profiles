@@ -493,9 +493,19 @@ impl AvailabilityWindow {
     }
 
     pub fn is_well_formed(&self) -> bool {
+        const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+        let days_well_formed = if self.days == "*" {
+            true
+        } else {
+            self.days.split(',').all(|day| {
+                let day = day.trim();
+                !day.is_empty() && DAYS.iter().any(|known| day.eq_ignore_ascii_case(known))
+            })
+        };
         jiff::tz::TimeZone::get(&self.timezone).is_ok()
             && minute_bound(&self.from).is_some()
             && minute_bound(&self.to).is_some()
+            && days_well_formed
     }
 }
 
@@ -753,6 +763,14 @@ impl Registry {
                         .with_detail(format!("profile `{id}`: {e}"))
                 })?;
             }
+            if profile.windows.iter().any(|w| !w.is_well_formed()) {
+                return Err(
+                    AdapterError::permanent("profile_windows_malformed", "registry/apply")
+                        .with_detail(format!(
+                            "profile `{id}` declares a model window whose timezone or HH:MM bound is malformed"
+                        )),
+                );
+            }
         }
         for (name, binding) in document.bindings {
             if binding.is_vacant() {
@@ -874,25 +892,54 @@ impl Registry {
         )
     }
 
-    /// Resolve a binding: the profile plus its composed standing
-    /// instructions (profile instructions first, binding prompt second).
+    /// Resolve a binding: the first currently servable candidate's profile
+    /// plus its composed standing instructions (profile instructions first,
+    /// binding prompt second). The same availability and retirement gates
+    /// as `resolve_chain` apply — a bound profile whose window excludes
+    /// now or that is retired must not surface here either.
     pub fn select(&self, binding_name: &str) -> a4aa::Result<Selection> {
+        self.select_at(binding_name, &jiff::Timestamp::now())
+    }
+
+    /// `select` against an explicit instant — the deterministic form tests
+    /// and schedulers use.
+    pub fn select_at(&self, binding_name: &str, now: &jiff::Timestamp) -> a4aa::Result<Selection> {
         let binding = self.binding(binding_name).ok_or_else(|| {
             AdapterError::permanent("binding_unknown", "registry/select")
                 .with_detail(format!("unknown binding `{binding_name}`"))
         })?;
-        let mut profile = self
-            .profiles
-            .get(binding.profile())
-            .expect("bindings validate against profiles at apply")
-            .clone();
-        profile.instructions =
-            compose_instructions(profile.instructions.as_deref(), binding.prompt());
-        let instructions = profile.instructions.clone();
-        Ok(Selection {
-            profile,
-            instructions,
-        })
+        let prompt = binding.prompt().map(str::to_owned);
+        let entries = std::iter::once((binding.profile(), binding.availability())).chain(
+            binding
+                .fallbacks()
+                .iter()
+                .map(|f| (f.profile(), f.availability())),
+        );
+        for (id, availability) in entries {
+            if availability.is_some_and(|a| !a.covers(now)) {
+                continue;
+            }
+            let mut profile = self
+                .profiles
+                .get(id)
+                .expect("bindings validate against profiles at apply")
+                .clone();
+            if profile.is_retired(now) {
+                continue;
+            }
+            profile.instructions =
+                compose_instructions(profile.instructions.as_deref(), prompt.as_deref());
+            let instructions = profile.instructions.clone();
+            return Ok(Selection {
+                profile,
+                instructions,
+            });
+        }
+        Err(
+            AdapterError::permanent("binding_chain_expired", "registry/select").with_detail(
+                format!("binding `{binding_name}` has no candidate available now"),
+            ),
+        )
     }
 
     /// Resolve a binding straight to its virtual agent, with the binding's

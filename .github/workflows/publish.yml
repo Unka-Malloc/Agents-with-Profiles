@@ -12,9 +12,15 @@
 # definition itself is outside its reach.
 #
 # `gate` downloads the verify run's `release-inputs` artifact and exposes
-# its fields as job outputs. `release` then replays the already-verified
-# `.crate` set: no candidate-controlled code executes under the publishing
-# identity.
+# its data fields as job outputs after strict shape checks. Data is all the
+# artifact may carry: candidate code could rewrite the file before upload,
+# so the live/dry-run mode comes only from this workflow's own dispatch
+# input, the published commit must be the verify run's head exactly, and the
+# version decision is recomputed inside the OIDC job by the default
+# branch's train helper rather than trusted from the artifact. `release`
+# then replays the release set: no candidate-controlled code executes under
+# the publishing identity. The `release` job also waits on the `release`
+# environment, so a live run holds for its configured reviewers.
 #
 # Credentials: crates.io Trusted Publishing; no stored secret.
 name: publish
@@ -28,6 +34,20 @@ on:
       run_id:
         description: Completed `verify` run id to publish from; validated before use
         required: true
+      mode:
+        description: dry-run replays the release steps without uploading; live publishes
+        type: choice
+        options: [dry-run, live]
+        default: dry-run
+      version:
+        description: Exact version to publish, such as 0.3.0; empty bumps by level
+        required: false
+        default: ""
+      level:
+        description: Bump level when no version is given
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 
 permissions: {}
 
@@ -44,7 +64,10 @@ jobs:
       contents: read
     outputs:
       run_id: ${{ github.event.workflow_run.id || inputs.run_id }}
-      mode: ${{ steps.load.outputs.mode }}
+      # The mode comes only from this workflow's own dispatch input — trusted
+      # runner metadata. The artifact can never carry it: the parser below
+      # rejects the file outright when a candidate wrote mode or rehearse in.
+      mode: ${{ inputs.mode == 'live' && 'live' || 'dry-run' }}
       sha: ${{ steps.load.outputs.sha }}
       branch: ${{ steps.load.outputs.branch }}
       release: ${{ steps.load.outputs.release }}
@@ -70,12 +93,13 @@ jobs:
         run: |
           python3 - <<'PY'
           import re, os, sys
+          # `mode` and `rehearse` are deliberately absent: they are trusted
+          # dispatch inputs on this workflow, not data a candidate runner may
+          # supply. A file carrying either key fails as an unknown field.
           SHAPES = {
               "sha": r"[0-9a-f]{40}",
               "branch": r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}",
               "kind": r"(train|manual)",
-              "mode": r"(dry-run|live)",
-              "rehearse": r"(true|false)",
               "release": r"(true|false)",
               "needs_set": r"(true|false)",
               "next": r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?",
@@ -86,6 +110,8 @@ jobs:
               key, _, value = line.strip().partition("=")
               if not key:
                   continue
+              if key in fields:
+                  raise SystemExit(f"release input repeated: {key}")
               shape = SHAPES.get(key)
               if shape is None or not re.fullmatch(shape, value):
                   raise SystemExit(f"release input fails shape check: {key}={value!r}")
@@ -109,8 +135,6 @@ jobs:
         id: bind
         env:
           GH_TOKEN: ${{ github.token }}
-          DECLARED_MODE: ${{ steps.load.outputs.mode }}
-          DECLARED_REHEARSE: ${{ steps.load.outputs.rehearse }}
         run: |
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
             --jq '{path,conclusion,head_sha,head_branch,event}' | python3 -c "
@@ -120,18 +144,6 @@ jobs:
               f\"not verify.yml: {run['path']}\"
           assert run['conclusion'] == 'success', \
               f\"run did not succeed: {run['conclusion']}\"
-          # The artifact's mode is candidate-produced data; the run's event
-          # is trusted metadata. A scheduled rehearsal can never carry the
-          # live mode, so a forged mode=live dies here.
-          if run['event'] == 'schedule':
-              assert os.environ['DECLARED_MODE'] == 'dry-run', \
-                  'scheduled verify run cannot be published live'
-          # A dispatched rehearsal declares rehearse=true in trusted run
-          # metadata; its artifact can never upgrade itself to live.
-          if run['event'] == 'workflow_dispatch':
-              assert not (os.environ['DECLARED_REHEARSE'] == 'true'
-                          and os.environ['DECLARED_MODE'] == 'live'), \
-                  'rehearsed verify run cannot be published live'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write('ref=' + (run.get('head_branch') or '') + '\n')
               out.write('head_sha=' + run['head_sha'] + '\n')
@@ -141,8 +153,8 @@ jobs:
       # any other ref — a release tag included — runs an untrusted
       # revision of the verify workflow, and a pushed tag is only as
       # trustworthy as whoever pushed it. The declared candidate must be
-      # the run's head or an ancestor of it (releasing an older
-      # default-branch commit), never a diverged or foreign sha.
+      # the run's own head exactly, never a diverged, foreign or merely
+      # ancestral sha: only the head is the tree the bound verify tested.
       - name: Bind the source ref to the default branch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -159,12 +171,14 @@ jobs:
             "repos/$GITHUB_REPOSITORY/compare/$DECLARED_SHA...$RUN_SHA" \
             --jq '.status' 2>/dev/null) || {
             echo "candidate $DECLARED_SHA is not in this repository"; exit 1; }
-          case "$status" in
-            identical|ahead) ;;
-            *) echo "candidate $DECLARED_SHA is '$status' of run head $RUN_SHA"
-               exit 1 ;;
-          esac
-          echo "source is $default; candidate is $status of the run head"
+          # Only the run's own head qualifies: an artifact naming an older
+          # default-branch commit would publish code the bound verify run
+          # never tested, so `ahead` (ancestor) is rejected, not accepted.
+          if [ "$status" != "identical" ]; then
+            echo "candidate $DECLARED_SHA is '$status' of run head $RUN_SHA"
+            exit 1
+          fi
+          echo "source is $default; candidate is the run head"
 
   release:
     if: >-
@@ -176,17 +190,18 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    environment: release
     permissions:
       contents: write
       pull-requests: read
       id-token: write
     env:
       RELEASE_MODE: live
+      RELEASE_KIND: manual
+      INPUT_VERSION: ${{ inputs.version }}
+      INPUT_LEVEL: ${{ inputs.level }}
       SIBLINGS: '[{"dir":"Adapter-For-All-Agents","slug":"Unka-Malloc/Adapters-for-All-Agents","crates":["a4aa","a4aa-antigravity","a4aa-claude","a4aa-codex","a4aa-command-code","a4aa-cursor","a4aa-devin","a4aa-dialects","a4aa-dsh","a4aa-factory","a4aa-grok","a4aa-hermes","a4aa-kilo-code","a4aa-kimi-code","a4aa-kiro","a4aa-open-claw","a4aa-opencode","a4aa-pi"]}]'
       CANDIDATE: ${{ needs.gate.outputs.sha }}
-      NEXT: ${{ needs.gate.outputs.next }}
-      NEEDS_SET: ${{ needs.gate.outputs.needs_set }}
-      EXCLUDES: ${{ needs.gate.outputs.excludes }}
     defaults:
       run:
         shell: bash
@@ -246,7 +261,29 @@ jobs:
           path: Adapter-For-All-Agents
           persist-credentials: false
 
-      # The bump the verify train decided is recreated here from `next`:
+      # The version decision is recomputed here by the default branch's own
+      # train helper on the bound commit, with this workflow's dispatch
+      # inputs — never from the artifact the candidate runner wrote. Its
+      # `next`/`needs_set`/`excludes` outputs are the ones the release uses;
+      # the artifact fields remain gate data for reporting only.
+      - name: Recompute the version decision
+        id: version
+        run: |
+          default='${{ github.event.repository.default_branch }}'
+          python3 "$RUNNER_TEMP/train.py" version \
+            --candidate "$CANDIDATE" --branch "$default" \
+            --manifest-path "$GITHUB_WORKSPACE/Agents-With-Profiles/Cargo.toml"
+
+      - name: Export the recomputed version
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+          NEEDS_SET: ${{ steps.version.outputs.needs_set }}
+          EXCLUDES: ${{ steps.version.outputs.excludes }}
+          RELEASE: ${{ steps.version.outputs.release }}
+        run: |
+          [ "$RELEASE" = "true" ] || { echo "recompute says nothing to release"; exit 1; }
+          printf 'NEXT=%s\nNEEDS_SET=%s\nEXCLUDES=%s\n' \
+            "$NEXT" "$NEEDS_SET" "$EXCLUDES" >> "$GITHUB_ENV"
       # a manifest rewrite driven by cargo metadata — data only, nothing
       # compiles and no candidate script runs under the OIDC token.
       - name: Commit the release version

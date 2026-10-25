@@ -83,7 +83,10 @@ Host-side flow against `a4aa serve` (`a4aa.v1`, see the a4aa sidecar doc):
    Instructions are due when `lane == "cli"`, or
    `turn.instructionMode == "every-turn"`, or it is the first prompt of the
    session.
-3. `session/cancel` / `session/close` as usual.
+3. `session/cancel` / `session/close` as usual — and send `session/cancel`
+   as an id-bearing request, never a notification: the sidecar defines it
+   only as a request and ignores the notification form with a stderr
+   warning, so a notification-shaped cancel never cancels the turn.
 
 `awp validate` checks the same load + layering rules ahead of time, and
 `awp run` executes one profiled turn end-to-end in-process — a fast smoke

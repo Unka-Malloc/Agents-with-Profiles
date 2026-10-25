@@ -1225,3 +1225,32 @@ fn from_patch_rejects_a_malformed_model_window() {
     assert_eq!(error.code, "profile_windows_malformed");
     assert_eq!(error.stage, "profile/resolve");
 }
+
+#[test]
+fn a_dead_strict_chain_reports_the_first_refusal_on_both_paths() {
+    // Primary `a` has no sealing recipe; fallback `b` seals structurally
+    // but reopens an ambient channel — the two fail for different reasons,
+    // so the reported detail proves which candidate's refusal surfaced.
+    let mut document = document(&["a"], &[("p", "a"), ("q", "b")], &[]);
+    document.agents.insert(
+        "b".to_owned(),
+        cli_spec("b", "pi", &["-e", "./ambient.ts"], PromptChannel::ArgOnly).into(),
+    );
+    document.bindings.insert(
+        "role".to_owned(),
+        strict_binding("p", vec![awp::Fallback::Id("q".to_owned())]),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let now: jiff::Timestamp = "2026-10-20T12:00:00Z".parse().unwrap();
+    for error in [
+        registry.select_at("role", &now).err().unwrap(),
+        registry.resolve_chain_at("role", &now).err().unwrap(),
+    ] {
+        assert_eq!(error.code, "agent_unsealable");
+        assert!(
+            error.detail.as_deref().unwrap_or_default().contains("`a`"),
+            "the first candidate's refusal must surface, got {:?}",
+            error.detail
+        );
+    }
+}

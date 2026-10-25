@@ -66,10 +66,6 @@ jobs:
       contents: read
     outputs:
       run_id: ${{ inputs.run_id }}
-      # The mode comes only from this workflow's own dispatch input — trusted
-      # runner metadata. The artifact can never carry it: the parser below
-      # rejects the file outright when a candidate wrote mode or rehearse in.
-      mode: ${{ inputs.mode == 'live' && 'live' || 'dry-run' }}
       sha: ${{ steps.load.outputs.sha }}
       branch: ${{ steps.load.outputs.branch }}
       release: ${{ steps.load.outputs.release }}

@@ -47,6 +47,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "a4aa-copilot"
+version = "0.4.1"
+dependencies = [
+ "a4aa",
+]
+
+[[package]]
 name = "a4aa-cursor"
 version = "0.4.1"
 dependencies = [
@@ -69,6 +76,7 @@ dependencies = [
  "a4aa-claude",
  "a4aa-codex",
  "a4aa-command-code",
+ "a4aa-copilot",
  "a4aa-cursor",
  "a4aa-devin",
  "a4aa-dsh",

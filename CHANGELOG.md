@@ -22,6 +22,12 @@
   bound run, and the release job waits on the `release` environment. The
   `workflow_run` auto-publish path is removed — crates.io Trusted
   Publishing refuses that event, so it could only ever no-op silently.
+  The publish dispatch must repeat the version/level the verify run was
+  dispatched with: the OIDC job recomputes the decision from its own
+  inputs and refuses a mismatch against the bound run. The release `if`
+  also compares the full branch ref (`refs/heads/<default>` plus
+  `ref_type == branch`), so a tag sharing the default branch's name
+  cannot reach the OIDC job.
 
 ## 0.2.0
 

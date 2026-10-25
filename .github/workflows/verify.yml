@@ -13,7 +13,10 @@
 #   now, at the version typed in or bumped by the chosen level. Nothing it
 #   runs publishes: a live upload always needs a separate `publish` workflow
 #   dispatch naming this run's id with `mode: live`, which waits on the
-#   `release` environment's reviewers.
+#   `release` environment's reviewers. The publish dispatch recomputes the
+#   version decision from its own version/level inputs, so those must
+#   repeat what this verify run was dispatched with or the gate refuses
+#   the mismatch.
 #
 # There is deliberately no tag trigger: `publish.yml` accepts release
 # inputs only from verify runs on the default branch, and a pushed tag is
@@ -55,7 +58,7 @@ on:
         required: false
         default: ""
       rehearse:
-        description: Rehearse only; nothing is pushed, tagged or uploaded
+        description: Verify at rehearsal strictness; a verify run never publishes regardless
         type: boolean
         default: false
 
@@ -80,8 +83,10 @@ jobs:
       sha: ${{ steps.candidate.outputs.sha }}
       branch: ${{ steps.candidate.outputs.branch }}
     env:
-      # The train's declared mode governs scheduled runs only; a manual
-      # dispatch releases live unless it opted into a rehearsal.
+      # Mode here only sets how strictly this run verifies — a rehearsal
+      # relaxes dependency readiness. It records no publishing intent:
+      # nothing in this workflow publishes, and a `publish` dispatch
+      # derives its own mode from its own input.
       RELEASE_MODE: ${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
       RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || 'manual' }}
       INPUT_VERSION: ${{ inputs.version }}

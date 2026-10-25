@@ -1141,3 +1141,87 @@ fn strict_defaults_off_and_roundtrips() {
     let registry = awp::Registry::from_json(strict_doc).unwrap();
     assert!(registry.binding("role").unwrap().strict());
 }
+
+#[test]
+fn strict_select_returns_the_sealable_fallback() {
+    let mut document = document(&["a"], &[("p", "a"), ("q", "pi")], &[]);
+    document.agents.insert(
+        "pi".to_owned(),
+        cli_spec("pi", "pi", &[], PromptChannel::ArgOnly).into(),
+    );
+    document.bindings.insert(
+        "role".to_owned(),
+        strict_binding("p", vec![awp::Fallback::Id("q".to_owned())]),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let now: jiff::Timestamp = "2026-10-20T12:00:00Z".parse().unwrap();
+    let selection = registry.select_at("role", &now).unwrap();
+    assert_eq!(selection.profile.id, "q");
+}
+
+#[test]
+fn strict_select_refuses_when_nothing_can_seal() {
+    let mut document = document(&["a", "b"], &[("p", "a"), ("q", "b")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        strict_binding("p", vec![awp::Fallback::Id("q".to_owned())]),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let now: jiff::Timestamp = "2026-10-20T12:00:00Z".parse().unwrap();
+    let error = registry.select_at("role", &now).err().unwrap();
+    assert_eq!(error.code, "agent_unsealable");
+}
+
+#[test]
+fn non_strict_select_keeps_the_unsealable_candidate() {
+    let document = document(&["a"], &[("p", "a")], &[("role", "p")]);
+    let registry = Registry::from_document(document).unwrap();
+    let now: jiff::Timestamp = "2026-10-20T12:00:00Z".parse().unwrap();
+    assert_eq!(registry.select_at("role", &now).unwrap().profile.id, "p");
+}
+
+#[test]
+fn select_reports_chain_expired_when_every_candidate_is_gated() {
+    let mut document = document(&["a"], &[("p", "a")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: Some(awp::Availability {
+                windows: vec![awp::AvailabilityWindow {
+                    days: "mon".to_owned(),
+                    from: "00:00".to_owned(),
+                    to: "12:00".to_owned(),
+                    timezone: "UTC".to_owned(),
+                }],
+                ..Default::default()
+            }),
+            fallbacks: vec![],
+        }),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    // A Sunday is never inside a Monday window.
+    let sunday: jiff::Timestamp = "2026-10-25T12:00:00Z".parse().unwrap();
+    let error = registry.select_at("role", &sunday).err().unwrap();
+    assert_eq!(error.code, "binding_chain_expired");
+}
+
+#[test]
+fn from_patch_rejects_a_malformed_model_window() {
+    let patch = ProfilePatch {
+        agent: Some("a".to_owned()),
+        windows: Some(vec![awp::ModelWindow {
+            timezone: "UTC".to_owned(),
+            from: "24:00".to_owned(),
+            to: "06:00".to_owned(),
+            model: Some("peak".to_owned()),
+            models: vec![],
+        }]),
+        ..Default::default()
+    };
+    let error = Profile::from_patch("p", patch).err().unwrap();
+    assert_eq!(error.code, "profile_windows_malformed");
+    assert_eq!(error.stage, "profile/resolve");
+}

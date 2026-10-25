@@ -100,14 +100,23 @@ cannot weaken it: the flag lives on the stored binding, not on the
 patched profile. Short-form bindings and `profile`-selector sessions are
 always non-strict — declare the full form where the guarantee is needed.
 
-Every selection path answers the same question: `Registry::select`,
-`resolve_binding` and `resolve_chain` all walk the one candidate iterator —
-availability bounds and retirement filter each candidate, a strict binding
-skips whatever cannot seal, and the first servable candidate answers with
-the binding's prompt composed into its instructions. `select` returns the
-profile and composed instructions without materializing an agent; the
-`resolve_*` forms return virtual agents. When no candidate is servable the
-paths refuse with `binding_chain_expired` — never an unavailable profile.
+Every selection path walks the same candidate iterator — availability
+bounds and retirement filter each profile, a strict binding skips whatever
+cannot seal, and the binding's prompt composes into each survivor's
+instructions — but the paths answer differently. `Registry::select` and
+`select_at` return a `Selection`: the first servable candidate's profile
+plus its composed instructions. A strict `select` still materializes each
+candidate internally to test sealability, then discards the agent — the
+returned `Selection` carries neither a sealed agent nor a strict marker,
+so a host that later materializes from that profile must seal again to
+hold the guarantee. `resolve_chain` and `resolve_chain_at` materialize the
+whole surviving chain as virtual agents — sealed ones under a strict
+binding — and may return an empty list; `resolve_binding` maps an empty
+chain to `binding_chain_expired`. When no candidate is servable `select`
+refuses with `binding_chain_expired`; under a strict binding where
+candidates exist but nothing can seal, both `select` and `resolve_chain`
+refuse with the first sealing refusal (`agent_unsealable`) instead — never
+an unavailable profile and never a silent ambient session.
 
 ## Profile fields: materialized vs advisory
 

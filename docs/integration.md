@@ -163,3 +163,8 @@ host decides whether a missing mechanism is fatal.
   pins the published profile version, `env`/`extensions` carry whatever the
   sync manifest requires, and `prompt_direct` leaves prompt delivery to the
   checker's own harness.
+
+## Skills
+
+- `skills/sdk/` — embedding guidance (registry, resolution, session calls).
+- `skills/sidecar/` — wire-mode guidance (`awp resolve` + `a4aa serve`).

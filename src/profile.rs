@@ -598,6 +598,7 @@ impl Profile {
     /// model windows are rejected here too, so a patch that bypasses the
     /// registry fails closed exactly like a registry document.
     pub fn from_patch(id: impl Into<String>, mut patch: ProfilePatch) -> a4aa::Result<Self> {
+        let id = id.into();
         let agent = patch.agent.take().ok_or_else(|| {
             a4aa::AdapterError::permanent("profile_agent_missing", "profile/resolve")
         })?;
@@ -610,12 +611,12 @@ impl Profile {
                 "profile_windows_malformed",
                 "profile/resolve",
             )
-            .with_detail(
-                "model window declares an unresolvable timezone or a malformed HH:MM bound",
-            ));
+            .with_detail(format!(
+                "profile `{id}` declares a model window whose timezone or HH:MM bound is malformed"
+            )));
         }
         let mut profile = Profile {
-            id: id.into(),
+            id,
             agent,
             ..Default::default()
         };

@@ -430,15 +430,7 @@ fn default_all_days() -> String {
 const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 fn weekday_code(date: jiff::civil::Date) -> &'static str {
-    match date.weekday() {
-        jiff::civil::Weekday::Monday => "mon",
-        jiff::civil::Weekday::Tuesday => "tue",
-        jiff::civil::Weekday::Wednesday => "wed",
-        jiff::civil::Weekday::Thursday => "thu",
-        jiff::civil::Weekday::Friday => "fri",
-        jiff::civil::Weekday::Saturday => "sat",
-        jiff::civil::Weekday::Sunday => "sun",
-    }
+    WEEKDAYS[date.weekday().to_monday_one_offset() as usize - 1]
 }
 
 fn default_timezone() -> String {
@@ -917,7 +909,7 @@ impl Registry {
         for profile in self.available_candidates(binding, now) {
             let profile = if strict {
                 let agent = self.candidate_agent(profile)?;
-                match agent.strict() {
+                match Self::seal_candidate(agent) {
                     Ok(agent) => agent.profile().clone(),
                     Err(error) => {
                         if strict_error.is_none() {
@@ -984,6 +976,14 @@ impl Registry {
                     compose_instructions(profile.instructions.as_deref(), prompt.as_deref());
                 Some(profile)
             })
+    }
+
+    /// `agent` sealed the way a strict binding requires — the single
+    /// sealing decision every selection path shares, so the unsealable
+    /// error and its stage cannot drift between `select` and
+    /// `resolve_chain`.
+    fn seal_candidate(agent: crate::VirtualAgent) -> a4aa::Result<crate::VirtualAgent> {
+        agent.strict()
     }
 
     /// `profile` materialized with the registry's secret resolver — the
@@ -1055,7 +1055,7 @@ impl Registry {
                 candidates.push(agent);
                 continue;
             }
-            match agent.strict() {
+            match Self::seal_candidate(agent) {
                 Ok(agent) => candidates.push(agent),
                 Err(error) => {
                     if candidates.is_empty() && strict_error.is_none() {

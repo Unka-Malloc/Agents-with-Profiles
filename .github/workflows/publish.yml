@@ -182,8 +182,12 @@ jobs:
           echo "source is $default; candidate is the run head"
 
   release:
+    # Branch ref, not ref_name: a pushed tag can share the default branch's
+    # name and `ref_name` alone would not tell them apart — the OIDC job
+    # must only ever run from `refs/heads/<default>`.
     if: >-
-      github.ref_name == github.event.repository.default_branch &&
+      github.ref_type == 'branch' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
       github.event_name == 'workflow_dispatch' &&
       needs.gate.outputs.mode == 'live' &&
       needs.gate.outputs.release == 'true'

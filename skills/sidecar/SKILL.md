@@ -29,7 +29,10 @@ Then drive `a4aa serve` per `docs/integration.md`:
    session options where the adapter supports them.
 2. Compose `turn.instructions + "\n\n" + text` into `session/prompt`
    when instructions are due (cli lane, `every-turn` mode, or first prompt).
-3. `session/cancel` is an id-bearing request, never a notification.
+3. `session/cancel` is an id-bearing request, never a notification — the
+   a4aa sidecar contract (`docs/sidecar-protocol.md` in the adapter repo)
+   defines it only as a request and ignores the notification form with a
+   stderr warning, so a host must send it with an id and await the result.
 
 ## Rules that keep the contract
 

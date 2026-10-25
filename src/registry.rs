@@ -909,14 +909,9 @@ impl Registry {
         for profile in self.available_candidates(binding, now) {
             let profile = if strict {
                 let agent = self.candidate_agent(profile)?;
-                match Self::seal_candidate(agent) {
-                    Ok(agent) => agent.profile().clone(),
-                    Err(error) => {
-                        if strict_error.is_none() {
-                            strict_error = Some(error);
-                        }
-                        continue;
-                    }
+                match Self::seal_or_record(agent, &mut strict_error) {
+                    Some(agent) => agent.profile().clone(),
+                    None => continue,
                 }
             } else {
                 profile
@@ -978,12 +973,22 @@ impl Registry {
             })
     }
 
-    /// `agent` sealed the way a strict binding requires — the single
-    /// sealing decision every selection path shares, so the unsealable
-    /// error and its stage cannot drift between `select` and
-    /// `resolve_chain`.
-    fn seal_candidate(agent: crate::VirtualAgent) -> a4aa::Result<crate::VirtualAgent> {
-        agent.strict()
+    /// `agent` sealed the way a strict binding requires — or `None` with
+    /// the first sealing refusal kept in `first_error`, for the caller to
+    /// surface when nothing in the chain can serve. The whole
+    /// seal-and-remember step lives here so `select` and `resolve_chain`
+    /// cannot drift on which refusal a dead chain reports.
+    fn seal_or_record(
+        agent: crate::VirtualAgent,
+        first_error: &mut Option<a4aa::AdapterError>,
+    ) -> Option<crate::VirtualAgent> {
+        match agent.strict() {
+            Ok(agent) => Some(agent),
+            Err(error) => {
+                first_error.get_or_insert(error);
+                None
+            }
+        }
     }
 
     /// `profile` materialized with the registry's secret resolver — the
@@ -1055,13 +1060,8 @@ impl Registry {
                 candidates.push(agent);
                 continue;
             }
-            match Self::seal_candidate(agent) {
-                Ok(agent) => candidates.push(agent),
-                Err(error) => {
-                    if candidates.is_empty() && strict_error.is_none() {
-                        strict_error = Some(error);
-                    }
-                }
+            if let Some(agent) = Self::seal_or_record(agent, &mut strict_error) {
+                candidates.push(agent);
             }
         }
         if strict && candidates.is_empty() {

@@ -204,7 +204,7 @@ jobs:
       RELEASE_KIND: manual
       INPUT_VERSION: ${{ inputs.version }}
       INPUT_LEVEL: ${{ inputs.level }}
-      SIBLINGS: '[{"dir":"Adapter-For-All-Agents","slug":"Unka-Malloc/Adapters-for-All-Agents","crates":["a4aa","a4aa-antigravity","a4aa-claude","a4aa-codex","a4aa-command-code","a4aa-cursor","a4aa-devin","a4aa-dialects","a4aa-dsh","a4aa-factory","a4aa-grok","a4aa-hermes","a4aa-kilo-code","a4aa-kimi-code","a4aa-kiro","a4aa-open-claw","a4aa-opencode","a4aa-pi"]}]'
+      SIBLINGS: '[{"dir":"Adapter-For-All-Agents","slug":"Unka-Malloc/Adapters-for-All-Agents","crates":["a4aa","a4aa-antigravity","a4aa-claude","a4aa-codex","a4aa-command-code","a4aa-copilot","a4aa-cursor","a4aa-devin","a4aa-dialects","a4aa-dsh","a4aa-factory","a4aa-grok","a4aa-hermes","a4aa-kilo-code","a4aa-kimi-code","a4aa-kiro","a4aa-open-claw","a4aa-opencode","a4aa-pi"]}]'
       CANDIDATE: ${{ needs.gate.outputs.sha }}
     defaults:
       run:

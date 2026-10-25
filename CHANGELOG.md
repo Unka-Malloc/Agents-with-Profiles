@@ -27,7 +27,9 @@
   inputs and refuses a mismatch against the bound run. The release `if`
   also compares the full branch ref (`refs/heads/<default>` plus
   `ref_type == branch`), so a tag sharing the default branch's name
-  cannot reach the OIDC job.
+  cannot reach the OIDC job. A manual `verify` dispatch now reports mode
+  `verify` rather than `live` — it only chooses dependency strictness
+  and records no publishing intent, since a verify run never publishes.
 
 ## 0.2.0
 

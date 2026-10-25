@@ -8,8 +8,9 @@
   unset.
 - Canonical headless-agent presets (`codex`, `cursor`, `dsh`, `hermes`,
   `opencode`, `pi`): verified program, spawn argv, and required env
-  resolution as structs. `dsh` launches `dsh acp`; leftover `--profile sdk`
-  is not a preset.
+  resolution as structs. Every preset materializes the card's full
+  capability-ordered lane chain; `dsh` is SDK-primary (`dsh --profile sdk`)
+  with the ACP profile as its ordered alternate.
 - `availability` on binding candidates: `notBefore`/`notAfter` bounds (RFC
   3339 or `YYYY-MM-DD` at 00:00 UTC) make time-limited lanes — vendor promo
   windows — expire semantically at resolution instead of failing per

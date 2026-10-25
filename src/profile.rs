@@ -291,8 +291,10 @@ pub struct Profile {
     /// `set` at materialization — [`EnvValue`] indirections included.
     #[serde(default)]
     pub env: BTreeMap<String, EnvValue>,
-    /// MCP servers appended to the `acp` lane's `mcpServers`. Ignored on
-    /// other lanes.
+    /// MCP servers appended to a lane's native registration surface
+    /// (`acp` `mcpServers`, `serve` config document, `rpc` process/session
+    /// registration). A lane that cannot register them refuses the list at
+    /// open; the profile layer never drops it.
     #[serde(default)]
     pub mcp_servers: Vec<serde_json::Value>,
     /// Capabilities the host requires when selecting this profile (advisory).

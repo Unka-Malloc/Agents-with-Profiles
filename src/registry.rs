@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use a4aa::{AdapterError, AgentSpec};
 
-use crate::profile::{Profile, ProfilePatch};
+use crate::profile::{Profile, ProfilePatch, ProviderDecl};
 
 /// One registry document: the wire, storage and overlay form.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -49,29 +49,222 @@ pub struct RegistryDocument {
     /// `hostEnv` references resolve without storing credentials here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secrets: BTreeMap<String, Vec<SecretRecipe>>,
+    /// Global or shared model provider declarations and catalogs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderDecl>,
 }
 
-/// One way to obtain a secret value: a host environment variable, or a
-/// `{home}`-expanded TOML file key. Recipes are tried in order and the
-/// first that yields a non-empty value wins.
+/// One way to obtain a secret or configuration value: a host environment
+/// variable, or a `{home}`-expanded file key (TOML, YAML, JSON).
+/// Recipes are tried in order and the first that yields a non-empty value wins.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SecretRecipe {
     /// `{"env": "NAME"}` — read the named host variable.
     Env { env: String },
-    /// `{"toml": {"path": "...", "key": "..."}}` — read a `key = "value"`
-    /// entry from a TOML file (basic `key = value` scanning, no deps).
-    Toml { toml: TomlSecret },
+    /// `{"toml": {"path": "...", "key": "..."}}` — read an entry from a TOML file.
+    Toml { toml: FileSecret },
+    /// `{"yaml": {"path": "...", "key": "..."}}` — read an entry from a YAML file.
+    Yaml { yaml: FileSecret },
+    /// `{"json": {"path": "...", "key": "..."}}` — read an entry from a JSON file.
+    Json { json: FileSecret },
 }
 
-/// File-key recipe target.
+/// Configuration file key target.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TomlSecret {
-    /// TOML file path; `{home}` expands to the user's home directory.
+pub struct FileSecret {
+    /// File path; `{home}` expands to the user's home directory.
     pub path: String,
-    /// Key inside the file.
+    /// Key or dotted key path (`section.sub.key`) inside the file.
     pub key: String,
+}
+
+pub type TomlSecret = FileSecret;
+
+impl SecretRecipe {
+    /// Attempt to resolve this recipe to a non-empty string value.
+    pub fn resolve(&self) -> Option<String> {
+        match self {
+            SecretRecipe::Env { env } => std::env::var(env).ok().filter(|v| !v.trim().is_empty()),
+            SecretRecipe::Toml { toml } => {
+                let path = expand_home(&toml.path);
+                let text = std::fs::read_to_string(path).ok()?;
+                extract_toml_key(&text, &toml.key)
+            }
+            SecretRecipe::Yaml { yaml } => {
+                let path = expand_home(&yaml.path);
+                let text = std::fs::read_to_string(path).ok()?;
+                extract_yaml_key(&text, &yaml.key)
+            }
+            SecretRecipe::Json { json } => {
+                let path = expand_home(&json.path);
+                let text = std::fs::read_to_string(path).ok()?;
+                extract_json_key(&text, &json.key)
+            }
+        }
+    }
+}
+
+/// Resolve a list of secret recipes in declaration order: the first
+/// recipe yielding a non-empty value wins.
+pub fn resolve_secret(recipes: &[SecretRecipe]) -> Option<String> {
+    recipes.iter().find_map(|r| r.resolve())
+}
+
+/// A secret resolver backed by a map of `SecretRecipe` lists.
+#[derive(Clone, Debug, Default)]
+pub struct RegistrySecretResolver {
+    secrets: BTreeMap<String, Vec<SecretRecipe>>,
+}
+
+impl RegistrySecretResolver {
+    pub fn new(secrets: BTreeMap<String, Vec<SecretRecipe>>) -> Self {
+        Self { secrets }
+    }
+}
+
+#[async_trait::async_trait]
+impl a4aa::SecretResolver for RegistrySecretResolver {
+    async fn resolve(&self, reference: &str) -> Option<String> {
+        self.secrets
+            .get(reference)
+            .and_then(|recipes| resolve_secret(recipes))
+            .or_else(|| {
+                std::env::var(reference)
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+    }
+}
+
+fn expand_home(raw: &str) -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    raw.replace("{home}", &home)
+}
+
+fn clean_val(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_comment = if let Some((before, _)) = trimmed.split_once(" #") {
+        before.trim()
+    } else {
+        trimmed
+    };
+    without_comment
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_owned()
+}
+
+fn extract_json_key(text: &str, key: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let mut current = &value;
+    for part in key.split('.') {
+        current = match current {
+            serde_json::Value::Object(map) => map.get(part)?,
+            serde_json::Value::Array(arr) => {
+                let idx: usize = part.parse().ok()?;
+                arr.get(idx)?
+            }
+            _ => return None,
+        };
+    }
+    match current {
+        serde_json::Value::String(s) => Some(s.clone()).filter(|s| !s.trim().is_empty()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_toml_key(text: &str, key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.len() == 2 {
+        let section = parts[0];
+        let subkey = parts[1];
+        let mut in_section = false;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('[') && line.ends_with(']') {
+                let name = line[1..line.len() - 1].trim();
+                in_section = name == section;
+                continue;
+            }
+            if in_section {
+                if let Some((k, v)) = line.split_once('=') {
+                    if k.trim() == subkey {
+                        let val = clean_val(v);
+                        if !val.is_empty() {
+                            return Some(val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let target = parts.last().copied().unwrap_or(key);
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == target || k.trim() == key {
+                let val = clean_val(v);
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_yaml_key(text: &str, key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.len() > 1 {
+        let mut current_idx = 0;
+        let mut current_indent = 0;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let target = parts[current_idx];
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let k = k.trim();
+                if k == target {
+                    if current_idx == parts.len() - 1 {
+                        let val = clean_val(v);
+                        if !val.is_empty() {
+                            return Some(val);
+                        }
+                    } else if v.trim().is_empty() {
+                        current_idx += 1;
+                        current_indent = indent;
+                    }
+                }
+            } else if current_idx > 0 && indent <= current_indent {
+                current_idx = 0;
+            }
+        }
+    }
+    let target = parts.last().copied().unwrap_or(key);
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim() == target || k.trim() == key {
+                let val = clean_val(v);
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// One agent entry: the primary spec plus ordered protocol alternates for
@@ -211,6 +404,119 @@ impl Fallback {
 /// is unbounded: a free lane whose end the vendor never published stays
 /// selectable until a request failure pushes it aside.
 ///
+/// A recurring schedule window for availability (e.g. peak/off-peak discount periods).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AvailabilityWindow {
+    /// Comma-separated day codes: "mon", "tue", "wed", "thu", "fri", "sat", "sun", or "*"
+    #[serde(default = "default_all_days")]
+    pub days: String,
+    /// Wall-clock start time in "HH:MM"
+    pub from: String,
+    /// Wall-clock end time in "HH:MM"
+    pub to: String,
+    /// IANA timezone name, defaults to "UTC"
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+}
+
+fn default_all_days() -> String {
+    "*".to_string()
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
+impl AvailabilityWindow {
+    pub fn covers(&self, now: &jiff::Timestamp) -> bool {
+        let Ok(zone) = jiff::tz::TimeZone::get(&self.timezone) else {
+            return false;
+        };
+        let zoned = now.to_zoned(zone);
+        let time = zoned.datetime().time();
+        let minute_of_day = (time.hour() as u16) * 60 + (time.minute() as u16);
+        let (Some(from), Some(to)) = (minute_bound(&self.from), minute_bound(&self.to)) else {
+            return false;
+        };
+
+        let weekday_code = |d: jiff::civil::Date| match d.weekday() {
+            jiff::civil::Weekday::Monday => "mon",
+            jiff::civil::Weekday::Tuesday => "tue",
+            jiff::civil::Weekday::Wednesday => "wed",
+            jiff::civil::Weekday::Thursday => "thu",
+            jiff::civil::Weekday::Friday => "fri",
+            jiff::civil::Weekday::Saturday => "sat",
+            jiff::civil::Weekday::Sunday => "sun",
+        };
+
+        let day_matches = |target_day: &str| {
+            if self.days == "*" {
+                return true;
+            }
+            self.days
+                .split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case(target_day))
+        };
+
+        if from == to {
+            // Equal bounds (e.g. 00:00 to 00:00) cover the entire day.
+            let today = weekday_code(zoned.datetime().date());
+            return day_matches(today);
+        }
+
+        if from < to {
+            // Normal range within the same calendar day.
+            if !(from..to).contains(&minute_of_day) {
+                return false;
+            }
+            let today = weekday_code(zoned.datetime().date());
+            return day_matches(today);
+        }
+
+        // Wrapped range across midnight (e.g. 18:00 to 09:00).
+        if minute_of_day >= from {
+            let today = weekday_code(zoned.datetime().date());
+            day_matches(today)
+        } else if minute_of_day < to {
+            let yesterday = weekday_code(
+                zoned
+                    .datetime()
+                    .date()
+                    .checked_sub(jiff::SignedDuration::from_hours(24))
+                    .unwrap_or(zoned.datetime().date()),
+            );
+            let today = weekday_code(zoned.datetime().date());
+            day_matches(yesterday) || day_matches(today)
+        } else {
+            false
+        }
+    }
+
+    pub fn is_well_formed(&self) -> bool {
+        jiff::tz::TimeZone::get(&self.timezone).is_ok()
+            && minute_bound(&self.from).is_some()
+            && minute_bound(&self.to).is_some()
+    }
+}
+
+fn minute_bound(raw: &str) -> Option<u16> {
+    let (h_raw, m_raw) = raw.split_once(':')?;
+    let h: u16 = h_raw.trim().parse().ok()?;
+    let m: u16 = m_raw.trim().parse().ok()?;
+    if h == 24 && m == 0 {
+        return Some(1440);
+    }
+    if h == 23 && m == 59 {
+        return Some(1440);
+    }
+    if h < 24 && m < 60 {
+        Some(h * 60 + m)
+    } else {
+        None
+    }
+}
+
 /// A malformed bound covers nothing: expiry must expire the lane, never
 /// accidentally extend it. `apply` rejects the document at load for the
 /// same reason — see [`Availability::is_well_formed`].
@@ -224,6 +530,9 @@ pub struct Availability {
     /// selectable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_after: Option<String>,
+    /// Optional recurring schedule windows. When non-empty, now must match at least one window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<AvailabilityWindow>,
 }
 
 impl Availability {
@@ -233,26 +542,37 @@ impl Availability {
         let lower = self
             .not_before
             .as_deref()
-            .is_none_or(|raw| parse_bound(raw).is_some_and(|b| *now >= b));
+            .is_none_or(|raw| parse_time_bound(raw).is_some_and(|b| *now >= b));
         let upper = self
             .not_after
             .as_deref()
-            .is_none_or(|raw| parse_bound(raw).is_some_and(|b| *now < b));
-        lower && upper
+            .is_none_or(|raw| parse_time_bound(raw).is_some_and(|b| *now < b));
+        if !(lower && upper) {
+            return false;
+        }
+        if self.windows.is_empty() {
+            return true;
+        }
+        self.windows.iter().any(|w| w.covers(now))
     }
 
     /// Every declared bound parses — documents carrying a malformed bound
     /// are rejected at `apply` rather than expiring silently at resolve.
     pub fn is_well_formed(&self) -> bool {
-        [&self.not_before, &self.not_after]
+        let bounds_ok = [&self.not_before, &self.not_after]
             .into_iter()
             .flatten()
-            .all(|raw| parse_bound(raw).is_some())
+            .all(|raw| parse_time_bound(raw).is_some());
+        if !bounds_ok {
+            return false;
+        }
+        self.windows.iter().all(|w| w.is_well_formed())
     }
 }
 
-/// One availability bound: RFC 3339, or a bare date at 00:00 UTC.
-fn parse_bound(raw: &str) -> Option<jiff::Timestamp> {
+/// One availability/retirement bound: RFC 3339, or a bare date at
+/// 00:00 UTC. Custody layers use the same parser for `retiresAt`.
+pub fn parse_time_bound(raw: &str) -> Option<jiff::Timestamp> {
     if let Ok(timestamp) = raw.parse::<jiff::Timestamp>() {
         return Some(timestamp);
     }
@@ -303,6 +623,38 @@ impl Binding {
         }
     }
 
+    /// Remove retired profiles from the candidate chain: fallbacks
+    /// pointing at them drop out; a retired primary promotes its first
+    /// surviving fallback. A chain with no surviving candidate becomes
+    /// vacant — the lane no longer exists rather than silently
+    /// resurrecting a spent entry. Custody calls this when pruning
+    /// retired profiles so the document stays self-consistent.
+    pub fn retire_profiles(&mut self, retired: &std::collections::BTreeSet<String>) {
+        let vacancy = match self {
+            Binding::Profile(id) => retired.contains(id.as_str()),
+            Binding::Full(full) => {
+                full.fallbacks.retain(|f| !retired.contains(f.profile()));
+                if retired.contains(&full.profile) {
+                    match full.fallbacks.first().cloned() {
+                        Some(next) => {
+                            full.profile = next.profile().to_string();
+                            full.availability = next.availability().cloned();
+                            full.fallbacks.remove(0);
+                            false
+                        }
+                        None => true,
+                    }
+                } else {
+                    false
+                }
+            }
+            Binding::None => false,
+        };
+        if vacancy {
+            *self = Binding::None;
+        }
+    }
+
     fn is_vacant(&self) -> bool {
         matches!(self, Binding::None) || self.profile().is_empty()
     }
@@ -323,6 +675,8 @@ pub struct Registry {
     agents: BTreeMap<String, AgentEntry>,
     profiles: BTreeMap<String, Profile>,
     bindings: BTreeMap<String, Binding>,
+    secrets: BTreeMap<String, Vec<SecretRecipe>>,
+    providers: BTreeMap<String, ProviderDecl>,
 }
 
 impl Registry {
@@ -372,6 +726,18 @@ impl Registry {
                 }
             }
             let profile = &next.profiles[&id];
+            if profile
+                .retires_at
+                .as_deref()
+                .is_some_and(|raw| parse_time_bound(raw).is_none())
+            {
+                return Err(
+                    AdapterError::permanent("profile_retirement_malformed", "registry/apply")
+                        .with_detail(format!(
+                            "profile `{id}` declares a retiresAt bound that is neither RFC 3339 nor YYYY-MM-DD"
+                        )),
+                );
+            }
             if !next.agents.contains_key(&profile.agent) {
                 return Err(
                     AdapterError::permanent("profile_agent_unknown", "registry/apply").with_detail(
@@ -433,6 +799,8 @@ impl Registry {
             }
             next.bindings.insert(name, binding);
         }
+        next.secrets.extend(document.secrets);
+        next.providers.extend(document.providers);
         *self = next;
         Ok(())
     }
@@ -468,12 +836,30 @@ impl Registry {
         self.bindings.iter()
     }
 
+    pub fn secrets(&self) -> &BTreeMap<String, Vec<SecretRecipe>> {
+        &self.secrets
+    }
+
+    pub fn providers(&self) -> &BTreeMap<String, ProviderDecl> {
+        &self.providers
+    }
+
+    pub fn provider(&self, name: &str) -> Option<&ProviderDecl> {
+        self.providers.get(name)
+    }
+
     /// Resolve a profile to the virtual agent it materializes.
     pub fn resolve(&self, profile_id: &str) -> a4aa::Result<crate::VirtualAgent> {
         let profile = self.profiles.get(profile_id).ok_or_else(|| {
             AdapterError::permanent("profile_unknown", "registry/resolve")
                 .with_detail(format!("unknown profile `{profile_id}`"))
         })?;
+        if profile.is_retired(&jiff::Timestamp::now()) {
+            return Err(
+                AdapterError::permanent("profile_retired", "registry/resolve")
+                    .with_detail(format!("profile `{profile_id}` passed its retiresAt bound")),
+            );
+        }
         let entry = self.agents.get(&profile.agent).ok_or_else(|| {
             AdapterError::permanent("profile_agent_unknown", "registry/resolve").with_detail(
                 format!(
@@ -482,10 +868,11 @@ impl Registry {
                 ),
             )
         })?;
-        Ok(crate::VirtualAgent::new(
-            profile.clone(),
-            entry.lane_specs(),
-        ))
+        Ok(
+            crate::VirtualAgent::new(profile.clone(), entry.lane_specs()).secrets(
+                std::sync::Arc::new(RegistrySecretResolver::new(self.secrets.clone())),
+            ),
+        )
     }
 
     /// Resolve a binding: the profile plus its composed standing
@@ -571,6 +958,9 @@ impl Registry {
                 .get(id)
                 .expect("bindings validate against profiles at apply")
                 .clone();
+            if profile.is_retired(now) {
+                continue;
+            }
             profile.instructions =
                 compose_instructions(profile.instructions.as_deref(), prompt.as_deref());
             let entry = self.agents.get(&profile.agent).ok_or_else(|| {
@@ -581,7 +971,9 @@ impl Registry {
                     ),
                 )
             })?;
-            let agent = crate::VirtualAgent::new(profile, entry.lane_specs());
+            let agent = crate::VirtualAgent::new(profile, entry.lane_specs()).secrets(
+                std::sync::Arc::new(RegistrySecretResolver::new(self.secrets.clone())),
+            );
             if !strict {
                 candidates.push(agent);
                 continue;

@@ -42,6 +42,7 @@ where it comes from.
       "preferredCapabilities": ["fs:write"],
       "skillReferences": ["skill/review"],
       "stateKey": "reviewer-state",
+      "stateScope": "project",          // omit for fully parallel (the default)
       "extensions": {"avatar": "owl"}
     }
   },
@@ -106,9 +107,9 @@ always non-strict — declare the full form where the guarantee is needed.
 | `retry` | materialized | Quota-recovery schedule declared for the host orchestrator — `{interval, resetGrace}` durations (`"3h1m"` or ISO 8601). Nothing sleeps inside the crate; `wakeup()` computes the earliest eligible next attempt after chain exhaustion. |
 | `cwd` | materialized | Default session working directory; an explicit `SessionRequest.cwd` wins. |
 | `env` | materialized | Merged per key into the spec's environment policy `set` — literals and `{"secret": …}` / `{"hostEnv": …}` indirections resolve at spawn like any spec entry. |
-| `mcpServers` | materialized | Appended to the `acp` lane's `mcpServers` after the spec's own. Ignored on lanes without an MCP surface. |
+| `mcpServers` | materialized | Appended to the lane's native MCP registration after the spec's own: `acp` session `mcpServers`, `serve` config document, `rpc` process/session registration, or the `cli` admission-refusal list. A lane with no registration surface keeps the list so the adapter refuses it at open rather than dropping tools. |
 | `permission`, `mode` | materialized | Session defaults, applied through A4AA's supported selectors. Explicit `SessionRequest.config` values win. An unsupported preset is an error. |
-| `contextWindow`, `requiredCapabilities`, `preferredCapabilities`, `skillReferences`, `stateKey` | advisory | Carried verbatim for the host's dispatch, selection or state policy. The crate never invents a delivery path for them. |
+| `contextWindow`, `requiredCapabilities`, `preferredCapabilities`, `skillReferences`, `stateKey`, `stateScope` | advisory | Carried verbatim for the host's dispatch, selection or state policy. `stateScope` is the serialization domain: absent means no state lease (fully parallel); `"project"` serializes within one project; `"global"` single-flights the profile. The crate never invents a delivery path for them. |
 | `mechanisms` | CAwP | Semantic mechanism declarations — hooks, rules, skills, commands, subagents, plugins, permissions, config-file MCP servers, native-profile selection. awp parses, validates and merges them; `a4aa`'s adaptation layer translates them into agent-native artifacts. See "The `mechanisms` section" below. |
 | `extensions` | advisory | Host-specific extras (avatars, sync manifests, UI hints); merged per key on overlay, never interpreted. |
 
@@ -159,8 +160,8 @@ onto each agent's native surface.
   a dialect cannot express it.
 - `mcpServers` here targets the agent's **config file** (`.cursor/mcp.json`,
   `.gemini/settings.json`, project `.mcp.json`, `opencode.json`) — distinct
-  from the profile-level `mcpServers` list, which feeds the `acp` session
-  lane.
+  from the profile-level `mcpServers` list, which feeds the lane's native
+  session registration (`acp`, `serve`, or an `rpc` lane that declares one).
 - `nativeProfile` emits no artifacts; it records that the host should select
   the agent's own profile (`codex --profile`, a DSH profile name).
 

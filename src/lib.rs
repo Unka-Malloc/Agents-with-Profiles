@@ -70,7 +70,7 @@ pub use a4aa::{
     EnvPolicy, EnvSource, EnvValue, ExtensionKind, HookDecl, HookEvent, HookIntent, HookSurface,
     LaneKind, LaneSpec, McpSurface, MechanismSet, NoSecrets, Observer, PermissionDecl,
     PermissionHandler, PermissionSurface, PluginDecl, PluginSurface, PromptChannel, Result,
-    RpcCallSpec, RpcLaneSpec, RuleDecl, SecretResolver, SessionRequest, SharedObserver, SkillDecl,
-    StreamMode, SubagentDecl, SubagentSurface, Support, SupportEntry, Target, TurnOutcome,
-    TurnRequest, WriteMode,
+    RpcCallSpec, RpcLaneSpec, RpcMcpConfig, RuleDecl, SecretResolver, SessionRequest,
+    SharedObserver, SkillDecl, StreamMode, SubagentDecl, SubagentSurface, Support, SupportEntry,
+    Target, TurnOutcome, TurnRequest, WriteMode,
 };

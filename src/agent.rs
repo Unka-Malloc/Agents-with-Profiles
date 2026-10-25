@@ -151,7 +151,10 @@ fn seal_lane_spec(spec: &mut AgentSpec) -> a4aa::Result<()> {
 /// Fold the profile into one spec: environment entries merge into the
 /// command's environment policy `set`, profile MCP servers append to any
 /// lane that carries an MCP surface (`acp` session/new, `serve` config
-/// document) — lanes without one keep none.
+/// document, `rpc` process registration, `cli` admission-refusal list). A
+/// lane without a native registration surface keeps the list, so the adapter
+/// refuses it at open instead of the profile layer silently dropping its
+/// tools.
 fn materialize(profile: &Profile, spec: &mut AgentSpec) {
     if !profile.env.is_empty() {
         let set = match &mut spec.command.env {
@@ -163,7 +166,8 @@ fn materialize(profile: &Profile, spec: &mut AgentSpec) {
     }
     let servers = match &mut spec.lane {
         LaneSpec::Acp { mcp_servers, .. } | LaneSpec::Serve { mcp_servers } => mcp_servers,
-        _ => return,
+        LaneSpec::Rpc(rpc) => &mut rpc.mcp_servers,
+        LaneSpec::Cli(cli) => &mut cli.mcp_servers,
     };
     servers.extend(profile.mcp_servers.iter().cloned());
 }

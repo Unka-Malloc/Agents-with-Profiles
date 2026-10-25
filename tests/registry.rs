@@ -1,6 +1,9 @@
 //! Registry merge, overlay and resolution semantics.
 
-use awp::{EnvValue, LaneSpec, Profile, ProfilePatch, PromptChannel, Registry, RegistryDocument};
+use awp::{
+    EnvValue, LaneSpec, Profile, ProfilePatch, PromptChannel, Registry, RegistryDocument,
+    StateScope,
+};
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -106,6 +109,7 @@ fn overlay_replaces_scalars_merges_env() {
             effort: Some("high".to_owned()),
             env: Some(env),
             instructions: Some("be terse".to_owned()),
+            state_scope: Some(StateScope::Project),
             ..Default::default()
         },
     );
@@ -116,6 +120,7 @@ fn overlay_replaces_scalars_merges_env() {
     assert_eq!(profile.model.as_deref(), Some("m2"));
     assert_eq!(profile.effort.as_deref(), Some("high"));
     assert_eq!(profile.instructions.as_deref(), Some("be terse"));
+    assert_eq!(profile.state_scope, Some(StateScope::Project));
     assert_eq!(
         profile.env.get("K"),
         Some(&EnvValue::Literal("v".to_owned()))
@@ -198,12 +203,11 @@ fn resolve_materializes_env_and_mcp_into_spec() {
     let registry = Registry::from_document(document).unwrap();
     let agent = registry.resolve("p").unwrap();
 
-    // Env lands in the command's sanitized policy `set`.
+    // Env lands in the command's policy `set`.
     match &agent.spec().command.env {
-        awp::EnvPolicy::Sanitized { set, .. } => {
+        awp::EnvPolicy::InheritAll { set } | awp::EnvPolicy::Sanitized { set, .. } => {
             assert_eq!(set.get("EXTRA"), Some(&EnvValue::Literal("1".to_owned())));
         }
-        other => panic!("unexpected policy: {other:?}"),
     }
     // Profile MCP servers append after the spec's own.
     match &agent.spec().lane {
@@ -211,6 +215,87 @@ fn resolve_materializes_env_and_mcp_into_spec() {
             assert_eq!(mcp_servers.len(), 2);
             assert_eq!(mcp_servers[0]["name"], "base-mcp");
             assert_eq!(mcp_servers[1]["name"], "profile-mcp");
+        }
+        other => panic!("unexpected lane: {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_materializes_profile_mcp_into_the_rpc_lane() {
+    let mut document = RegistryDocument::default();
+    let mut spec = cli_spec("base", "prog", &["{prompt}"], PromptChannel::ArgOnly);
+    spec.lane = LaneSpec::Rpc(Box::new(awp::RpcLaneSpec {
+        session_open: Some(awp::RpcCallSpec {
+            method: "session/new".to_owned(),
+            params: json!({}),
+        }),
+        prompt: awp::RpcCallSpec {
+            method: "session/prompt".to_owned(),
+            params: json!({}),
+        },
+        mcp_servers: vec![json!({"name": "base-mcp"})],
+        mcp_config: Some(awp::RpcMcpConfig {
+            flag: "-c".to_owned(),
+            root: "mcp_servers".to_owned(),
+            env_vars_key: "env_vars".to_owned(),
+            tools_approval: None,
+            tools_approval_servers: vec![],
+        }),
+        ..Default::default()
+    }));
+    document.agents.insert("base".to_owned(), spec.into());
+    document.profiles.insert(
+        "p".to_owned(),
+        ProfilePatch {
+            agent: Some("base".to_owned()),
+            mcp_servers: Some(vec![json!({"name": "profile-mcp"})]),
+            ..Default::default()
+        },
+    );
+
+    let registry = Registry::from_document(document).unwrap();
+    let agent = registry.resolve("p").unwrap();
+    match &agent.spec().lane {
+        LaneSpec::Rpc(rpc) => {
+            assert_eq!(rpc.mcp_servers.len(), 2);
+            assert_eq!(rpc.mcp_servers[0]["name"], "base-mcp");
+            assert_eq!(rpc.mcp_servers[1]["name"], "profile-mcp");
+            assert_eq!(
+                rpc.mcp_config.as_ref().map(|config| config.root.as_str()),
+                Some("mcp_servers")
+            );
+        }
+        other => panic!("unexpected lane: {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_materializes_profile_mcp_into_the_cli_lane() {
+    let mut document = RegistryDocument::default();
+    let mut spec = cli_spec("base", "prog", &["{prompt}"], PromptChannel::ArgOnly);
+    if let LaneSpec::Cli(lane) = &mut spec.lane {
+        lane.mcp_servers = vec![json!({"name": "base-mcp"})];
+    }
+    document.agents.insert("base".to_owned(), spec.into());
+    document.profiles.insert(
+        "p".to_owned(),
+        ProfilePatch {
+            agent: Some("base".to_owned()),
+            mcp_servers: Some(vec![json!({"name": "profile-mcp"})]),
+            ..Default::default()
+        },
+    );
+
+    let registry = Registry::from_document(document).unwrap();
+    let agent = registry.resolve("p").unwrap();
+    match &agent.spec().lane {
+        LaneSpec::Cli(lane) => {
+            // The cli lane cannot register MCP servers, but dropping them
+            // here would hide the mismatch from the adapter's fail-closed
+            // admission. The list must survive materialization.
+            assert_eq!(lane.mcp_servers.len(), 2);
+            assert_eq!(lane.mcp_servers[0]["name"], "base-mcp");
+            assert_eq!(lane.mcp_servers[1]["name"], "profile-mcp");
         }
         other => panic!("unexpected lane: {other:?}"),
     }
@@ -449,6 +534,7 @@ fn availability_bounds_filter_expired_candidates() {
                     availability: Some(awp::Availability {
                         not_before: None,
                         not_after: Some("2026-11-01".to_owned()),
+                        ..Default::default()
                     }),
                 }),
                 awp::Fallback::Id("r".to_owned()),
@@ -491,6 +577,7 @@ fn availability_bounds_filter_expired_candidates() {
             availability: Some(awp::Availability {
                 not_before: Some("2026-05-01".to_owned()),
                 not_after: Some("2026-06-01".to_owned()),
+                ..Default::default()
             }),
             fallbacks: vec![],
         }),
@@ -504,6 +591,96 @@ fn availability_bounds_filter_expired_candidates() {
         .resolve_chain_at("solo", &early)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn retired_profiles_drop_out_of_chains() {
+    let mut document = document(&["a", "b"], &[("p", "a"), ("q", "b")], &[]);
+    document.profiles.get_mut("p").unwrap().retires_at = Some("2026-10-23".to_owned());
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: None,
+            fallbacks: vec![awp::Fallback::Id("q".to_owned())],
+        }),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let id_of = |chain: &[awp::VirtualAgent]| {
+        chain
+            .iter()
+            .map(|agent| agent.profile().id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Before the instant the promo lane serves; past it the profile is
+    // gone everywhere — the chain only yields the surviving candidate.
+    let during: jiff::Timestamp = "2026-10-20T12:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(&registry.resolve_chain_at("role", &during).unwrap()),
+        vec!["p", "q"]
+    );
+    let after: jiff::Timestamp = "2026-10-23T00:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(&registry.resolve_chain_at("role", &after).unwrap()),
+        vec!["q"]
+    );
+    // `retiresAt` is exclusive like `notAfter`: the instant itself is out.
+    let edge = after;
+    assert_eq!(
+        id_of(&registry.resolve_chain_at("role", &edge).unwrap()),
+        vec!["q"]
+    );
+}
+
+#[test]
+fn malformed_retires_at_fails_the_document() {
+    let mut document = document(&["a"], &[("p", "a")], &[]);
+    document.profiles.get_mut("p").unwrap().retires_at = Some("not-a-date".to_owned());
+    let error = Registry::from_document(document).unwrap_err();
+    assert_eq!(error.code, "profile_retirement_malformed");
+}
+
+#[test]
+fn retire_profiles_prunes_and_promotes() {
+    let retired: std::collections::BTreeSet<String> =
+        ["p".to_owned(), "gone".to_owned()].into_iter().collect();
+    // A retired primary promotes its first surviving fallback; retired
+    // fallbacks drop out of the middle of the chain too.
+    let mut binding = awp::Binding::Full(awp::BindingFull {
+        profile: "p".to_owned(),
+        strict: false,
+        prompt: None,
+        availability: None,
+        fallbacks: vec![
+            awp::Fallback::Id("gone".to_owned()),
+            awp::Fallback::Windowed(awp::FallbackEntry {
+                profile: "q".to_owned(),
+                availability: Some(awp::Availability {
+                    not_after: Some("2030-01-01".to_owned()),
+                    ..Default::default()
+                }),
+            }),
+        ],
+    });
+    binding.retire_profiles(&retired);
+    let awp::Binding::Full(full) = &binding else {
+        panic!("chain survives through promotion")
+    };
+    assert_eq!(full.profile, "q");
+    assert_eq!(full.fallbacks.len(), 0);
+    assert_eq!(
+        full.availability
+            .as_ref()
+            .and_then(|a| a.not_after.as_deref()),
+        Some("2030-01-01")
+    );
+    // A fully spent chain becomes vacant — resolution then fails closed.
+    let mut spent = awp::Binding::Profile("p".to_owned());
+    spent.retire_profiles(&retired);
+    assert!(matches!(spent, awp::Binding::None));
 }
 
 #[test]
@@ -521,6 +698,7 @@ fn malformed_availability_fails_the_document() {
                 availability: Some(awp::Availability {
                     not_before: None,
                     not_after: Some("not-a-date".to_owned()),
+                    ..Default::default()
                 }),
             })],
         }),
@@ -547,6 +725,60 @@ fn windowed_fallback_deserializes_from_json() {
     assert_eq!(
         windowed.availability().and_then(|a| a.not_after.as_deref()),
         Some("2026-11-01")
+    );
+}
+
+#[test]
+fn recurring_schedule_windows_filter_chain_based_on_time_and_fallback() {
+    let mut document = document(&["a", "b", "c"], &[("p", "a"), ("q", "b"), ("r", "c")], &[]);
+    // Primary "p" is only available Mon-Fri 18:00 to 09:00 (Asia/Shanghai)
+    document.bindings.insert(
+        "general-worker".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: Some(awp::Availability {
+                windows: vec![awp::AvailabilityWindow {
+                    days: "mon,tue,wed,thu,fri".to_owned(),
+                    from: "18:00".to_owned(),
+                    to: "09:00".to_owned(),
+                    timezone: "Asia/Shanghai".to_owned(),
+                }],
+                ..Default::default()
+            }),
+            fallbacks: vec![
+                awp::Fallback::Id("q".to_owned()),
+                awp::Fallback::Id("r".to_owned()),
+            ],
+        }),
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let id_of = |chain: &[awp::VirtualAgent]| {
+        chain
+            .iter()
+            .map(|agent| agent.profile().id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // 1. Off-peak: Tuesday 20:00 Asia/Shanghai (12:00 UTC) -> "p" is available!
+    // Result chain: ["p", "q", "r"]
+    let offpeak: jiff::Timestamp = "2026-10-20T12:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(
+            &registry
+                .resolve_chain_at("general-worker", &offpeak)
+                .unwrap()
+        ),
+        vec!["p", "q", "r"]
+    );
+
+    // 2. Peak: Tuesday 10:00 Asia/Shanghai (02:00 UTC) -> "p" is skipped!
+    // Result chain: ["q", "r"]
+    let peak: jiff::Timestamp = "2026-10-20T02:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(&registry.resolve_chain_at("general-worker", &peak).unwrap()),
+        vec!["q", "r"]
     );
 }
 

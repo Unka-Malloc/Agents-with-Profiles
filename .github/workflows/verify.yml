@@ -186,6 +186,7 @@ jobs:
           release=${{ steps.version.outputs.release }}
           kind=${{ github.event_name == 'schedule' && 'train' || 'manual' }}
           mode=${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
+          rehearse=${{ inputs.rehearse && 'true' || 'false' }}
           next=${{ steps.version.outputs.next }}
           needs_set=${{ steps.version.outputs.needs_set }}
           excludes=${{ steps.version.outputs.excludes }}

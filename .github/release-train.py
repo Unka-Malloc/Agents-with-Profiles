@@ -4,7 +4,7 @@
 Every subcommand runs inside the repository checkout, writes step outputs to
 $GITHUB_OUTPUT and a readable report to $GITHUB_STEP_SUMMARY. RELEASE_KIND
 says what started the run: `train` (the weekly schedule), `manual` (Run
-workflow) or `tag` (a pushed version tag).
+workflow). Tag pushes are not release triggers; use Run workflow.
 """
 from __future__ import annotations
 
@@ -241,10 +241,7 @@ def cmd_candidate(args: argparse.Namespace) -> int:
             raise TrainError(f"{args.override} is not on {branch}")
         source = f"requested candidate {args.override}"
     elif kind == "tag":
-        sha = git("rev-parse", "--verify", f"{os.environ['GITHUB_SHA']}^{{commit}}")
-        if not git_ok("merge-base", "--is-ancestor", sha, f"refs/remotes/origin/{branch}"):
-            raise TrainError(f"{os.environ.get('GITHUB_REF_NAME', 'tag')} is not on {branch}")
-        source = f"pushed tag {os.environ.get('GITHUB_REF_NAME', '')}"
+        raise TrainError("tag pushes are not release triggers; use Run workflow")
     elif kind == "manual":
         sha = git("rev-parse", "--verify", f"refs/remotes/origin/{branch}^{{commit}}")
         source = f"head of {branch}"
@@ -388,12 +385,7 @@ def cmd_version(args: argparse.Namespace) -> int:
     last_tag = tags[max(released)] if released else None
     notes, pulls = [], []
     if kind == "tag":
-        tag = os.environ.get("GITHUB_REF_NAME", "")
-        upcoming, level, changed = parse_version(tag[1:]), "tag", True
-        stale = sorted(p["name"] for p in publishable if parse_version(p["version"]) != upcoming)
-        if stale:
-            raise TrainError(f"{tag} does not match the manifests of {', '.join(stale)}; set them "
-                             f"to {show(upcoming)} before tagging, or use Run workflow")
+        raise TrainError("tag pushes are not release triggers; use Run workflow")
     else:
         if last_tag:
             changed = not git_ok("diff", "--quiet", last_tag, args.candidate)

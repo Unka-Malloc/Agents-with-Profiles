@@ -780,6 +780,32 @@ fn recurring_schedule_windows_filter_chain_based_on_time_and_fallback() {
         id_of(&registry.resolve_chain_at("general-worker", &peak).unwrap()),
         vec!["q", "r"]
     );
+
+    // 3. Morning tail: Tuesday 08:00 Asia/Shanghai (00:00 UTC) belongs to
+    // Monday's wrapped window — Monday is in mon-fri -> "p" is available.
+    // Result chain: ["p", "q", "r"]
+    let tail_in: jiff::Timestamp = "2026-10-20T00:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(
+            &registry
+                .resolve_chain_at("general-worker", &tail_in)
+                .unwrap()
+        ),
+        vec!["p", "q", "r"]
+    );
+
+    // 4. Morning tail: Monday 08:00 Asia/Shanghai (00:00 UTC) belongs to
+    // Sunday's wrapped window — Sunday is not in mon-fri -> "p" is skipped.
+    // Result chain: ["q", "r"]
+    let tail_out: jiff::Timestamp = "2026-10-19T00:00:00Z".parse().unwrap();
+    assert_eq!(
+        id_of(
+            &registry
+                .resolve_chain_at("general-worker", &tail_out)
+                .unwrap()
+        ),
+        vec!["q", "r"]
+    );
 }
 
 // ------------------------------- strict bindings -------------------------

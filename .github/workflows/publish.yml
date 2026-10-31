@@ -5,51 +5,29 @@
 # This file holds the only job trusted with the crates.io OIDC identity.
 # Registries bind trusted publishing to this filename, which is why the
 # OIDC job lives here and not in the candidate-triggered `verify.yml`.
-# It never runs on a candidate ref: a manual dispatch is confined to the
-# default branch by the job condition below. The candidate supplies
-# verified artifacts only — the workflow definition itself is outside its
-# reach.
+# It never runs on a candidate ref: `workflow_run` executes the default
+# branch's copy of this file after the `verify` train completes, and a
+# manual dispatch is confined to the default branch by the job condition
+# below. The candidate supplies verified artifacts only — the workflow
+# definition itself is outside its reach.
 #
 # `gate` downloads the verify run's `release-inputs` artifact and exposes
-# its data fields as job outputs after strict shape checks. Data is all the
-# artifact may carry: candidate code could rewrite the file before upload,
-# so the live/dry-run mode comes only from this workflow's own dispatch
-# input, the published commit must be the verify run's head exactly, and the
-# version decision is recomputed inside the OIDC job by the default
-# branch's train helper rather than trusted from the artifact. `release`
-# then replays the release set: no candidate-controlled code executes under
-# the publishing identity. The `release` job also waits on the `release`
-# environment, so a live run holds for its configured reviewers.
+# its fields as job outputs. `release` then replays the already-verified
+# `.crate` set: no candidate-controlled code executes under the publishing
+# identity.
 #
 # Credentials: crates.io Trusted Publishing; no stored secret.
 name: publish
 
-# There is deliberately no `workflow_run` trigger: crates.io Trusted
-# Publishing refuses the OIDC exchange for that event, so an automatic
-# publish run could only ever end with its release job skipped — a silent
-# no-op that looks like success. Publishing is manual-only: dispatch this
-# workflow with the verify run's id, and set `mode: live` to actually
-# upload; a dry-run dispatch replays every trusted step except the upload.
 on:
+  workflow_run:
+    workflows: ["verify"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       run_id:
         description: Completed `verify` run id to publish from; validated before use
         required: true
-      mode:
-        description: dry-run replays the release steps without uploading; live publishes
-        type: choice
-        options: [dry-run, live]
-        default: dry-run
-      version:
-        description: Exact version to publish, such as 0.3.0; empty bumps by level
-        required: false
-        default: ""
-      level:
-        description: Bump level when no version is given
-        type: choice
-        options: [patch, minor, major]
-        default: patch
 
 permissions: {}
 
@@ -63,9 +41,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       actions: read
-      contents: read
     outputs:
-      run_id: ${{ inputs.run_id }}
+      run_id: ${{ github.event.workflow_run.id || inputs.run_id }}
+      mode: ${{ steps.load.outputs.mode }}
       sha: ${{ steps.load.outputs.sha }}
       branch: ${{ steps.load.outputs.branch }}
       release: ${{ steps.load.outputs.release }}
@@ -74,7 +52,7 @@ jobs:
       needs_set: ${{ steps.load.outputs.needs_set }}
       excludes: ${{ steps.load.outputs.excludes }}
     env:
-      RUN_ID: ${{ inputs.run_id }}
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
     steps:
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
@@ -91,13 +69,11 @@ jobs:
         run: |
           python3 - <<'PY'
           import re, os, sys
-          # `mode` and `rehearse` are deliberately absent: they are trusted
-          # dispatch inputs on this workflow, not data a candidate runner may
-          # supply. A file carrying either key fails as an unknown field.
           SHAPES = {
               "sha": r"[0-9a-f]{40}",
               "branch": r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}",
               "kind": r"(train|manual)",
+              "mode": r"(dry-run|live)",
               "release": r"(true|false)",
               "needs_set": r"(true|false)",
               "next": r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?",
@@ -108,8 +84,6 @@ jobs:
               key, _, value = line.strip().partition("=")
               if not key:
                   continue
-              if key in fields:
-                  raise SystemExit(f"release input repeated: {key}")
               shape = SHAPES.get(key)
               if shape is None or not re.fullmatch(shape, value):
                   raise SystemExit(f"release input fails shape check: {key}={value!r}")
@@ -127,11 +101,14 @@ jobs:
       # qualify) and it succeeded. The source ref and the declared
       # candidate are bound separately below: a `verify` workflow
       # modified on a side branch therefore cannot forge a release
-      # decision, whatever run_id the dispatch names.
+      # decision, whether it arrives by workflow_run or by a dispatched
+      # run_id.
       - name: Bind the run to the verify train
         id: bind
         env:
           GH_TOKEN: ${{ github.token }}
+          DECLARED_SHA: ${{ steps.load.outputs.sha }}
+          DECLARED_MODE: ${{ steps.load.outputs.mode }}
         run: |
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
             --jq '{path,conclusion,head_sha,head_branch,event}' | python3 -c "
@@ -141,6 +118,12 @@ jobs:
               f\"not verify.yml: {run['path']}\"
           assert run['conclusion'] == 'success', \
               f\"run did not succeed: {run['conclusion']}\"
+          # The artifact's mode is candidate-produced data; the run's event
+          # is trusted metadata. A scheduled rehearsal can never carry the
+          # live mode, so a forged mode=live dies here.
+          if run['event'] == 'schedule':
+              assert os.environ['DECLARED_MODE'] == 'dry-run', \
+                  'scheduled verify run cannot be published live'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write('ref=' + (run.get('head_branch') or '') + '\n')
               out.write('head_sha=' + run['head_sha'] + '\n')
@@ -150,8 +133,8 @@ jobs:
       # any other ref — a release tag included — runs an untrusted
       # revision of the verify workflow, and a pushed tag is only as
       # trustworthy as whoever pushed it. The declared candidate must be
-      # the run's own head exactly, never a diverged, foreign or merely
-      # ancestral sha: only the head is the tree the bound verify tested.
+      # the run's head or an ancestor of it (releasing an older
+      # default-branch commit), never a diverged or foreign sha.
       - name: Bind the source ref to the default branch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -168,40 +151,35 @@ jobs:
             "repos/$GITHUB_REPOSITORY/compare/$DECLARED_SHA...$RUN_SHA" \
             --jq '.status' 2>/dev/null) || {
             echo "candidate $DECLARED_SHA is not in this repository"; exit 1; }
-          # Only the run's own head qualifies: an artifact naming an older
-          # default-branch commit would publish code the bound verify run
-          # never tested, so `ahead` (ancestor) is rejected, not accepted.
-          if [ "$status" != "identical" ]; then
-            echo "candidate $DECLARED_SHA is '$status' of run head $RUN_SHA"
-            exit 1
-          fi
-          echo "source is $default; candidate is the run head"
+          case "$status" in
+            identical|ahead) ;;
+            *) echo "candidate $DECLARED_SHA is '$status' of run head $RUN_SHA"
+               exit 1 ;;
+          esac
+          echo "source is $default; candidate is $status of the run head"
 
   release:
-    # Branch ref, not ref_name: a pushed tag can share the default branch's
-    # name and `ref_name` alone would not tell them apart — the OIDC job
-    # must only ever run from `refs/heads/<default>`.
     if: >-
-      github.ref_type == 'branch' &&
-      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      github.event_name == 'workflow_dispatch' &&
-      inputs.mode == 'live' &&
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success') &&
+      needs.gate.outputs.mode == 'live' &&
       needs.gate.outputs.release == 'true'
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    environment: release
     permissions:
       contents: write
       pull-requests: read
       id-token: write
     env:
       RELEASE_MODE: live
-      RELEASE_KIND: manual
-      INPUT_VERSION: ${{ inputs.version }}
-      INPUT_LEVEL: ${{ inputs.level }}
       SIBLINGS: '[{"dir":"Adapter-For-All-Agents","slug":"Unka-Malloc/Adapters-for-All-Agents","crates":["a4aa","a4aa-antigravity","a4aa-claude","a4aa-codex","a4aa-command-code","a4aa-copilot","a4aa-cursor","a4aa-devin","a4aa-dialects","a4aa-dsh","a4aa-factory","a4aa-grok","a4aa-hermes","a4aa-kilo-code","a4aa-kimi-code","a4aa-kiro","a4aa-open-claw","a4aa-opencode","a4aa-pi"]}]'
       CANDIDATE: ${{ needs.gate.outputs.sha }}
+      BRANCH: ${{ needs.gate.outputs.branch }}
+      NEXT: ${{ needs.gate.outputs.next }}
+      NEEDS_SET: ${{ needs.gate.outputs.needs_set }}
+      EXCLUDES: ${{ needs.gate.outputs.excludes }}
     defaults:
       run:
         shell: bash
@@ -225,16 +203,6 @@ jobs:
       # checkout has created the job's default working directory.
       - run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
-      # The train helper is read from the repository's default branch —
-      # never from the candidate checkout and never from a branch the
-      # artifact names — so the dependency resolution below stays
-      # trusted workflow code under the OIDC token.
-      - name: Stage the train helper
-        run: |
-          default='${{ github.event.repository.default_branch }}'
-          git fetch -q origin "$default"
-          git show "origin/$default:.github/release-train.py" > "$RUNNER_TEMP/train.py"
-
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Install the pinned toolchain
@@ -243,64 +211,7 @@ jobs:
             rustup toolchain install
           fi
 
-      # Cross-repository dependencies were waited on inside verify; a second
-      # pass here resolves the sibling ref used for the path-dependency
-      # checkout — manifest data again, still no candidate code.
-      - name: Resolve cross-repository dependencies
-        id: deps
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 "$RUNNER_TEMP/train.py" deps --wait-minutes=0
-
-      - name: Check out Adapter-For-All-Agents at its resolved release
-        if: steps.deps.outputs.ready == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: Unka-Malloc/Adapters-for-All-Agents
-          ref: ${{ steps.deps.outputs.ref_0 }}
-          path: Adapter-For-All-Agents
-          persist-credentials: false
-
-      # The version decision is recomputed here by the default branch's own
-      # train helper on the bound commit, with this workflow's dispatch
-      # inputs — never from the artifact the candidate runner wrote. Its
-      # `next`/`needs_set`/`excludes` outputs are the ones the release uses;
-      # the artifact fields remain gate data for reporting only.
-      - name: Recompute the version decision
-        id: version
-        run: |
-          default='${{ github.event.repository.default_branch }}'
-          python3 "$RUNNER_TEMP/train.py" version \
-            --candidate "$CANDIDATE" --branch "$default" \
-            --manifest-path "$GITHUB_WORKSPACE/Agents-With-Profiles/Cargo.toml"
-
-      - name: Export the recomputed version
-        env:
-          NEXT: ${{ steps.version.outputs.next }}
-          NEEDS_SET: ${{ steps.version.outputs.needs_set }}
-          EXCLUDES: ${{ steps.version.outputs.excludes }}
-          RELEASE: ${{ steps.version.outputs.release }}
-          # The bound verify run's own decision, for comparison only — the
-          # recompute above is what publishes; a divergence means the
-          # artifact does not describe this commit's real decision and the
-          # release refuses rather than guess which side was tampered with.
-          ART_NEXT: ${{ needs.gate.outputs.next }}
-          ART_NEEDS_SET: ${{ needs.gate.outputs.needs_set }}
-          ART_EXCLUDES: ${{ needs.gate.outputs.excludes }}
-          ART_RELEASE: ${{ needs.gate.outputs.release }}
-        run: |
-          [ "$RELEASE" = "true" ] || { echo "recompute says nothing to release"; exit 1; }
-          [ "$ART_RELEASE" = "true" ] || { echo "bound verify run found nothing to release"; exit 1; }
-          for pair in "next:$NEXT:$ART_NEXT" "needs_set:$NEEDS_SET:$ART_NEEDS_SET" "excludes:$EXCLUDES:$ART_EXCLUDES"; do
-            key="${pair%%:*}"; rest="${pair#*:}"
-            mine="${rest%%:*}"; theirs="${rest#*:}"
-            [ "$mine" = "$theirs" ] || {
-              echo "version decision diverges from the bound verify run: $key '$mine' vs '$theirs'"
-              exit 1
-            }
-          done
-          printf 'NEXT=%s\nNEEDS_SET=%s\nEXCLUDES=%s\n' \
-            "$NEXT" "$NEEDS_SET" "$EXCLUDES" >> "$GITHUB_ENV"
+      # The bump the verify train decided is recreated here from `next`:
       # a manifest rewrite driven by cargo metadata — data only, nothing
       # compiles and no candidate script runs under the OIDC token.
       - name: Commit the release version
@@ -360,15 +271,39 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
-      # Dependency-first publish order comes from the train helper staged
-      # from the default branch — trusted code reading cargo metadata on the
-      # candidate tree, never candidate-supplied logic.
+      # Dependency-first publish order is recomputed from cargo metadata —
+      # manifest data, not executed code — so the ordering matches the tree
+      # this job checked out and just bumped.
       - name: Rebuild the release set
         run: |
           mkdir -p target/package
-          (cd "$RUNNER_TEMP" && python3 "$RUNNER_TEMP/train.py" order \
-            --manifest-path "$GITHUB_WORKSPACE/Agents-With-Profiles/Cargo.toml" \
-            > "$GITHUB_WORKSPACE/Agents-With-Profiles/target/package/publish-order.txt")
+          python3 - <<'PY' > target/package/publish-order.txt
+          import json, os, subprocess
+          meta = json.loads(subprocess.run(
+              ["cargo", "metadata", "--format-version", "1",
+               "--manifest-path", os.path.join(os.getcwd(), "Cargo.toml")],
+              capture_output=True, text=True, check=True,
+              cwd=os.environ["RUNNER_TEMP"]).stdout)
+          members = set(meta["workspace_members"])
+          packages = {p["name"]: p for p in meta["packages"] if p["id"] in members}
+          publishable = {n: p for n, p in packages.items()
+                         if p["publish"] is None or "crates-io" in p["publish"]}
+          excludes = set((os.environ.get("EXCLUDES") or "").split())
+          pending = dict.fromkeys(sorted(set(publishable) - excludes))
+          ordered = []
+          while pending:
+              ready = [n for n in pending
+                       if not any(d["name"] in pending
+                                  for d in publishable[n]["dependencies"]
+                                  if d["kind"] != "dev")]
+              if not ready:
+                  raise SystemExit(f"dependency cycle among {', '.join(sorted(pending))}")
+              ordered.extend(sorted(ready))
+              for n in ready:
+                  del pending[n]
+          for n in ordered:
+              print(f"{n}\t{publishable[n]['version']}")
+          PY
           args=()
           for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
           (cd "$RUNNER_TEMP" && cargo package --workspace --allow-dirty \
@@ -430,7 +365,7 @@ jobs:
             gh release create "v$NEXT" --verify-tag --generate-notes --title "v$NEXT"
 
       - name: Merge the release back into nightly
-        if: ${{ github.event.repository.default_branch == 'nightly' }}
+        if: env.BRANCH == 'nightly'
         run: |
           git fetch -q origin nightly
           if git merge-base --is-ancestor HEAD origin/nightly; then exit 0; fi

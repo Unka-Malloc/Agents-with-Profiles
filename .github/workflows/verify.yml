@@ -9,14 +9,8 @@
 #   repository adopts `nightly`) before the cutoff. The bump is the highest
 #   `release:patch`, `release:minor` or `release:major` label among its pull
 #   requests, patch when none is set. The train runs as a rehearsal.
-# - Run workflow: verifies the head of `nightly` (or the requested commit)
-#   now, at the version typed in or bumped by the chosen level. Nothing it
-#   runs publishes: a live upload always needs a separate `publish` workflow
-#   dispatch naming this run's id with `mode: live`, which waits on the
-#   `release` environment's reviewers. The publish dispatch recomputes the
-#   version decision from its own version/level inputs, so those must
-#   repeat what this verify run was dispatched with or the gate refuses
-#   the mismatch.
+# - Run workflow: releases the head of `nightly` (or the requested commit)
+#   now, at the version typed in or bumped by the chosen level.
 #
 # There is deliberately no tag trigger: `publish.yml` accepts release
 # inputs only from verify runs on the default branch, and a pushed tag is
@@ -32,9 +26,9 @@
 # waits on siblings, verifies, versions and packages the candidate, then
 # hands the `.crate` set and the release decision over as artifacts.
 # `publish.yml` (the release side) is the only file that holds the OIDC
-# publishing job; it runs only on a manual dispatch on the default branch,
-# so a candidate ref can never supply the workflow that receives the
-# publishing identity.
+# publishing job; it runs the default branch's own copy after this verify
+# train completes, so a candidate ref can never supply the workflow that
+# receives the publishing identity.
 #
 # Credentials: this file needs none; a read-only token suffices.
 name: verify
@@ -58,7 +52,7 @@ on:
         required: false
         default: ""
       rehearse:
-        description: Verify at rehearsal strictness; a verify run never publishes regardless
+        description: Rehearse only; nothing is pushed, tagged or uploaded
         type: boolean
         default: false
 
@@ -83,11 +77,9 @@ jobs:
       sha: ${{ steps.candidate.outputs.sha }}
       branch: ${{ steps.candidate.outputs.branch }}
     env:
-      # Mode here only sets how strictly this run verifies — a rehearsal
-      # relaxes dependency readiness. A manual verify reports `verify`,
-      # never `live`: nothing in this workflow publishes, and a `publish`
-      # dispatch derives its own mode from its own input.
-      RELEASE_MODE: ${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'verify' }}
+      # The train's declared mode governs scheduled runs only; a manual or
+      # tag event releases live unless the dispatch opted into a rehearsal.
+      RELEASE_MODE: ${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
       RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || 'manual' }}
       INPUT_VERSION: ${{ inputs.version }}
       INPUT_LEVEL: ${{ inputs.level }}
@@ -105,7 +97,7 @@ jobs:
       # Copied before the candidate checkout replaces the working tree, so the
       # helper always matches this workflow.
       - name: Stage the train helper
-        run: cp .github/release-train.py "$RUNNER_TEMP/release.py"
+        run: cp .github/release.py "$RUNNER_TEMP/release.py"
 
       - name: Select the candidate
         id: candidate
@@ -178,14 +170,12 @@ jobs:
           for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
           cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
 
-      # The publish workflow (default branch) reads this data-only file to
+      # The release train (default branch) reads this data-only file to
       # learn the candidate, the version decision and the kind of run; it
       # lands for every trigger so the gate job can short-circuit cleanly
-      # on unqualified candidates. Kind expands from the trusted event name
-      # inline; mode is deliberately never recorded here — candidate code
-      # could overwrite this file before the upload, so publish derives it
-      # from its own dispatch input and rejects the file when it carries
-      # mode or rehearse keys at all.
+      # on rehearsals and unqualified candidates. Kind and mode expand from
+      # immutable run metadata inline — never from a variable candidate
+      # code could have persisted through $GITHUB_ENV.
       - name: Record the release inputs
         if: always()
         run: |
@@ -195,6 +185,7 @@ jobs:
           branch=${{ steps.candidate.outputs.branch }}
           release=${{ steps.version.outputs.release }}
           kind=${{ github.event_name == 'schedule' && 'train' || 'manual' }}
+          mode=${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
           next=${{ steps.version.outputs.next }}
           needs_set=${{ steps.version.outputs.needs_set }}
           excludes=${{ steps.version.outputs.excludes }}

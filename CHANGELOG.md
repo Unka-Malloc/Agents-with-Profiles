@@ -21,22 +21,21 @@
   profiles: malformed model windows reject at load
   (`profile_windows_malformed`), including profiles built through the
   public `Profile::from_patch` path.
-- Release train: `publish.yml` no longer reads `mode`/`rehearse` from the
-  verify artifact (candidate code could rewrite it); live publishing
-  requires a `publish` dispatch with `mode: live`, the candidate must be
-  the verify run's own head, the version decision is recomputed by the
-  default branch's train helper inside the OIDC job and compared with the
-  bound run, and the release job waits on the `release` environment. The
-  `workflow_run` auto-publish path is removed — crates.io Trusted
-  Publishing refuses that event, so it could only ever no-op silently.
-  The publish dispatch must repeat the version/level the verify run was
-  dispatched with: the OIDC job recomputes the decision from its own
-  inputs and refuses a mismatch against the bound run. The release `if`
-  also compares the full branch ref (`refs/heads/<default>` plus
-  `ref_type == branch`), so a tag sharing the default branch's name
-  cannot reach the OIDC job. A manual `verify` dispatch now reports mode
-  `verify` rather than `live` — it only chooses dependency strictness
-  and records no publishing intent, since a verify run never publishes.
+- Release train regenerated under its final names: `.github/release.py`
+  replaces `release-train.py`, and `.github/release.lock` records the
+  engine revision plus digests of its templates, this repository's
+  declaration and each generated output, so a regeneration always travels
+  with a verifiable source record. `publish.yml` now fires on the
+  `verify` train's `workflow_run` completion — always the default
+  branch's own copy — beside the manual dispatch, which keeps only the
+  `run_id` input. The gate binds the run to `verify.yml` with its head on
+  the default branch, validates the artifact's `mode`, refuses
+  `mode=live` from a scheduled rehearsal and accepts a declared candidate
+  that is the run head or an ancestor of it; the publish order is
+  recomputed from cargo metadata inside the OIDC job. A manual `verify`
+  dispatch declares `live` (`dry-run` with `rehearse`) in the
+  release-inputs artifact, and a non-rehearsal run on the default branch
+  publishes without a second human gate.
 
 ## 0.2.0
 

@@ -41,12 +41,16 @@
 //!   all; a failed `apply` leaves the previous registry intact.
 
 pub mod agent;
+#[cfg(feature = "dialects")]
+pub mod detect;
 #[cfg(feature = "presets")]
 pub mod preset;
 pub mod profile;
 pub mod registry;
 
 pub use agent::{compose_prompt, VirtualAgent, VirtualSession};
+#[cfg(feature = "dialects")]
+pub use detect::{scan as detect_agents, Detection};
 pub use jiff;
 #[cfg(feature = "presets")]
 pub use preset::{

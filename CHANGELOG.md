@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `awp::detect_agents()` (behind `dialects`) probes the machine against
+  every a4aa card's `detect` surface — `PATH` binaries, OS-gated
+  `binary_dirs`, configuration files, prior-use markers and OS-gated
+  application bundles — and returns one `Detection` per card carrying the
+  resolved executable, the marker paths that exist and the binary-name
+  set a host joins onto `command.program` basenames. What exists on a
+  machine is a runtime fact, never an install-time assumption.
 - `Registry::select` honors the same gates as `resolve_chain`: candidates
   gated by availability windows or retirement no longer answer, a strict
   binding skips candidates that cannot seal their session surface, and an

@@ -186,6 +186,7 @@ fn resolve_materializes_env_and_mcp_into_spec() {
         mcp_servers: vec![json!({"name": "base-mcp"})],
         prefer_load: false,
         auth_key: None,
+        enforced_permission: None,
     };
     document.agents.insert("base".to_owned(), spec.into());
 

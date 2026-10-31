@@ -132,6 +132,7 @@ fn fixture_spec() -> AgentSpec {
             mcp_servers: vec![],
             prefer_load: false,
             auth_key: None,
+            enforced_permission: None,
         },
         command: CommandSpec {
             program: env!("CARGO_BIN_EXE_awp").to_owned(),

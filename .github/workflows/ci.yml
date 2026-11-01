@@ -46,27 +46,6 @@ jobs:
           path: ${{ env.DIR }}
           persist-credentials: false
 
-      - name: Check out Hook-Engine at its default branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: Unka-Malloc/Agent-Hook-Engine
-          path: Hook-Engine
-          persist-credentials: false
-
-      - name: Check out Metera at its default branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: Unka-Malloc/Metera
-          path: Metera
-          persist-credentials: false
-
-      - name: Check out Adapter-For-All-Agents at its default branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: Unka-Malloc/Adapters-for-All-Agents
-          path: Adapter-For-All-Agents
-          persist-credentials: false
-
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -102,3 +81,9 @@ jobs:
                                "regenerate instead of editing: " + ", ".join(stale))
           print(f"release.lock provenance verified for {len(recorded)} file(s)")
           PY
+
+      # The generated helper ships its own tests beside it: table-driven
+      # coverage of the manifest rewriter and its post-check over
+      # synthetic manifests — plain python3, no cargo, no network.
+      - name: Test the generated release helper
+        run: python3 .github/test_release.py

@@ -21,21 +21,32 @@
   profiles: malformed model windows reject at load
   (`profile_windows_malformed`), including profiles built through the
   public `Profile::from_patch` path.
+- `awp::detect_agents()` resolves Windows launchables through `PATHEXT`:
+  a bare `PATH` or install-directory name also tries each `PATHEXT`
+  extension in order, so a `tool.cmd` or `tool.exe` shim counts as a
+  `PATH` hit instead of reporting the agent absent. `PATHEXT` is read
+  from the environment with the cmd.exe default set as fallback; Unix
+  resolution is unchanged.
 - Release train regenerated under its final names: `.github/release.py`
   replaces `release-train.py`, and `.github/release.lock` records the
   engine revision plus digests of its templates, this repository's
   declaration and each generated output, so a regeneration always travels
-  with a verifiable source record. `publish.yml` now fires on the
+  with a verifiable source record. `publish.yml` fires only on the
   `verify` train's `workflow_run` completion — always the default
-  branch's own copy — beside the manual dispatch, which keeps only the
-  `run_id` input. The gate binds the run to `verify.yml` with its head on
-  the default branch, validates the artifact's `mode`, refuses
-  `mode=live` from a scheduled rehearsal and accepts a declared candidate
-  that is the run head or an ancestor of it; the publish order is
-  recomputed from cargo metadata inside the OIDC job. A manual `verify`
-  dispatch declares `live` (`dry-run` with `rehearse`) in the
-  release-inputs artifact, and a non-rehearsal run on the default branch
-  publishes without a second human gate.
+  branch's own copy; there is deliberately no dispatch trigger and no tag
+  path on the OIDC file. Its gate binds the run to a succeeded
+  `verify.yml` on the default branch and derives live/dry-run and the
+  release kind from metadata GitHub minted — the run's event and the
+  signed verify job name (`sig=1`/`sched=`/`rehearse`/`version`/`level`/
+  `cand=`), never from the `release-inputs` artifact, whose only fields
+  are `sha` and `release`. The release job runs in the protected
+  `release` environment — a live publish always meets that approval —
+  and recomputes the version decision and the publish order from the
+  bound commit inside the OIDC job; a scheduled train stays a rehearsal.
+  Releasing manually means dispatching `verify.yml` on the default
+  branch with `rehearse: false`, optionally naming `version`, `level` or
+  `candidate`; the run still flows into `publish.yml` and through the
+  environment gate.
 
 ## 0.2.0
 

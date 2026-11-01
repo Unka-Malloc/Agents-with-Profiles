@@ -9,7 +9,7 @@ spec, the same instruction composition and the same turn defaults.
 
 ```toml
 [dependencies]
-agents-with-profiles = "0.1"
+agents-with-profiles = "0.2"
 ```
 
 ```rust
@@ -102,8 +102,8 @@ package, so a host picks exactly one:
 
 ```toml
 [dependencies]
-agents-with-profiles = "0.1"
-a4aa-pi = "0.2"   # the only adapter compiled in
+agents-with-profiles = "0.2"
+a4aa-pi = "0.4"   # the only adapter compiled in
 ```
 
 ```rust

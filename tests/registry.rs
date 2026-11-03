@@ -127,6 +127,92 @@ fn overlay_replaces_scalars_merges_env() {
     );
 }
 
+/// A layered overlay (base → organization → project) that re-materializes
+/// an agent entry keeps the host declarations the regenerated layer
+/// cannot name — the `Registry::apply` half of the custody incident where
+/// a card rewrite stripped `toolsApprovalServers`.
+#[test]
+fn overlay_replacement_carries_host_declarations() {
+    let rpc_agent = |servers: serde_json::Value, approval_servers: serde_json::Value| {
+        json!({
+            "id": "a",
+            "lane": "rpc",
+            "prompt": {"method": "session/prompt", "params": {"text": "{prompt}"}},
+            "mcpServers": servers,
+            "mcpConfig": {
+                "flag": "-c",
+                "root": "mcp_servers",
+                "envVarsKey": "env_vars",
+                "toolsApproval": {"key": "default_tools_approval_mode", "value": "approve"},
+                "toolsApprovalServers": approval_servers
+            },
+            "command": {
+                "program": "agent",
+                "cwd": "/tmp/work",
+                "env": {"inheritAll": {"set": {"HOST_FLAG": "1"}}}
+            }
+        })
+    };
+    let base: RegistryDocument = serde_json::from_value(json!({
+        "agents": {
+            "a": rpc_agent(
+                json!([{"name": "project-automation", "command": "pa", "args": [], "env": []}]),
+                json!(["project-automation"])
+            )
+        },
+        "profiles": {"p": {"agent": "a"}}
+    }))
+    .unwrap();
+    let mut registry = Registry::from_document(base).unwrap();
+
+    // The project layer regenerates the same agent from card data alone:
+    // no host server list, no approval servers, no env, no cwd.
+    let overlay: RegistryDocument = serde_json::from_value(json!({
+        "agents": {"a": rpc_agent(json!([]), json!([]))}
+    }))
+    .unwrap();
+    registry.apply(overlay).unwrap();
+
+    let agent = registry.agent("a").unwrap();
+    let LaneSpec::Rpc(rpc) = &agent.lane else {
+        panic!("rpc lane");
+    };
+    assert_eq!(rpc.mcp_servers.len(), 1);
+    assert_eq!(rpc.mcp_servers[0]["name"], "project-automation");
+    assert_eq!(
+        rpc.mcp_config.as_ref().unwrap().tools_approval_servers,
+        ["project-automation"]
+    );
+    let awp::EnvPolicy::InheritAll { set } = &agent.command.env else {
+        panic!("fidelity policy survives");
+    };
+    assert_eq!(set["HOST_FLAG"], EnvValue::Literal("1".to_owned()));
+    assert_eq!(
+        agent.command.cwd.as_deref(),
+        Some(std::path::Path::new("/tmp/work"))
+    );
+
+    // Declared fields on the overlay entry still win outright.
+    let overlay: RegistryDocument = serde_json::from_value(json!({
+        "agents": {"a": rpc_agent(
+            json!([{"name": "other-tools", "command": "ot"}]),
+            json!(["other-tools"])
+        )}
+    }))
+    .unwrap();
+    registry.apply(overlay).unwrap();
+    let agent = registry.agent("a").unwrap();
+    let LaneSpec::Rpc(rpc) = &agent.lane else {
+        panic!("rpc lane");
+    };
+    assert_eq!(rpc.mcp_servers.len(), 1);
+    assert_eq!(rpc.mcp_servers[0]["name"], "other-tools");
+    assert_eq!(
+        rpc.mcp_config.as_ref().unwrap().tools_approval_servers,
+        ["other-tools"]
+    );
+}
+
 #[test]
 fn failed_overlay_leaves_registry_untouched() {
     let mut registry = Registry::from_document(document(&["a"], &[("p", "a")], &[])).unwrap();

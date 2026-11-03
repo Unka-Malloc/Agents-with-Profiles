@@ -21,12 +21,16 @@
 //! replaced per key, profiles merge field-wise through
 //! [`Profile::apply`]. This reproduces the scoped-override pattern
 //! (base → organization → project) without any scope vocabulary in the
-//! crate — the host decides how many layers it stacks.
+//! crate — the host decides how many layers it stacks. An agent entry a
+//! later layer replaces still keeps the host declarations the card layer
+//! cannot name ([`AgentEntry::carry_host_declarations_from`]), so stacking
+//! a regenerated document never silently revokes approved MCP servers,
+//! lane registrations or declared environment.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use a4aa::{AdapterError, AgentSpec};
+use a4aa::{AdapterError, AgentSpec, EnvPolicy, LaneSpec};
 
 use crate::profile::{Profile, ProfilePatch, ProviderDecl};
 
@@ -299,6 +303,130 @@ impl AgentEntry {
         std::iter::once(self.spec.clone())
             .chain(self.alternates.iter().cloned())
             .collect()
+    }
+
+    /// Carry host declarations forward when this entry replaces `prior`.
+    ///
+    /// Card materialization and presets emit the mechanism surface only —
+    /// the fields only the host can name stay blank: approved MCP server
+    /// names (`mcpConfig.toolsApprovalServers`), host-registered MCP
+    /// servers on the lane, declared env overrides, a working directory,
+    /// an output bound, an enforced permission preset. A rewrite that
+    /// regenerates the entry from card data alone must not silently
+    /// revoke them. Lane variants pair by lane kind, not position, so a
+    /// card that gains or reorders alternates still lands its declaration
+    /// on the matching spec; fields the new spec declares itself always
+    /// win.
+    pub fn carry_host_declarations_from(&mut self, prior: &AgentEntry) {
+        let mut priors: Vec<&AgentSpec> = std::iter::once(&prior.spec)
+            .chain(prior.alternates.iter())
+            .collect();
+        for spec in std::iter::once(&mut self.spec).chain(self.alternates.iter_mut()) {
+            let Some(index) = priors
+                .iter()
+                .position(|old| same_lane(&old.lane, &spec.lane))
+            else {
+                continue;
+            };
+            carry_spec(spec, priors.remove(index));
+        }
+    }
+}
+
+fn same_lane(a: &LaneSpec, b: &LaneSpec) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+fn carry_spec(new: &mut AgentSpec, old: &AgentSpec) {
+    if new.command.cwd.is_none() {
+        new.command.cwd.clone_from(&old.command.cwd);
+    }
+    carry_env(&mut new.command.env, &old.command.env);
+    if new.max_output_bytes.is_none() {
+        new.max_output_bytes = old.max_output_bytes;
+    }
+    carry_lane(&mut new.lane, &old.lane);
+}
+
+/// Host env declarations ride inside whichever policy the spec declares —
+/// `set` entries union under either policy; the sanitized `inherit` list
+/// carries only when both sides keep one.
+fn carry_env(new: &mut EnvPolicy, old: &EnvPolicy) {
+    let old_set = match old {
+        EnvPolicy::Sanitized { set, .. } | EnvPolicy::InheritAll { set } => set,
+    };
+    let new_set = match new {
+        EnvPolicy::Sanitized { set, .. } | EnvPolicy::InheritAll { set } => set,
+    };
+    for (name, value) in old_set {
+        new_set.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    if let (EnvPolicy::Sanitized { inherit: ni, .. }, EnvPolicy::Sanitized { inherit: oi, .. }) =
+        (new, old)
+    {
+        for name in oi {
+            if !ni.contains(name) {
+                ni.push(name.clone());
+            }
+        }
+    }
+}
+
+fn carry_lane(new: &mut LaneSpec, old: &LaneSpec) {
+    match (new, old) {
+        (LaneSpec::Rpc(new_rpc), LaneSpec::Rpc(old_rpc)) => {
+            // A server list the host registered on the lane itself carries
+            // even when the new spec lost the registration surface — the
+            // custody verifier's explicit refusal beats a silent drop.
+            if new_rpc.mcp_servers.is_empty() {
+                new_rpc.mcp_servers.clone_from(&old_rpc.mcp_servers);
+            }
+            if let (Some(config), Some(old_config)) = (&mut new_rpc.mcp_config, &old_rpc.mcp_config)
+            {
+                // The approval mechanism is card data; the server names it
+                // applies to are host config — the card never emits them.
+                // Without the mechanism there is nothing to attach them
+                // to, so they move only while it exists.
+                if config.tools_approval.is_some() && config.tools_approval_servers.is_empty() {
+                    config
+                        .tools_approval_servers
+                        .clone_from(&old_config.tools_approval_servers);
+                }
+            }
+        }
+        (
+            LaneSpec::Acp {
+                mcp_servers: new_servers,
+                enforced_permission: new_permission,
+                ..
+            },
+            LaneSpec::Acp {
+                mcp_servers: old_servers,
+                enforced_permission: old_permission,
+                ..
+            },
+        ) => {
+            if new_servers.is_empty() {
+                new_servers.clone_from(old_servers);
+            }
+            if new_permission.is_none() {
+                new_permission.clone_from(old_permission);
+            }
+        }
+        (
+            LaneSpec::Serve {
+                mcp_servers: new_servers,
+            },
+            LaneSpec::Serve {
+                mcp_servers: old_servers,
+            },
+        ) if new_servers.is_empty() => {
+            new_servers.clone_from(old_servers);
+        }
+        (LaneSpec::Cli(new_cli), LaneSpec::Cli(old_cli)) if new_cli.mcp_servers.is_empty() => {
+            new_cli.mcp_servers.clone_from(&old_cli.mcp_servers);
+        }
+        _ => {}
     }
 }
 
@@ -707,11 +835,16 @@ impl Registry {
     }
 
     /// Overlay one document onto this registry: agents and bindings replace
-    /// per key, profiles merge field-wise. Atomic — a document that fails
+    /// per key, profiles merge field-wise. A replaced agent entry carries
+    /// the host declarations its replacement left blank — an overlay layer
+    /// that re-materializes an agent from card data keeps the base entry's
+    /// `mcpConfig.toolsApprovalServers`, lane `mcpServers`, env `set`
+    /// entries and the other fields only the host can name; every field the
+    /// overlay declares itself still wins. Atomic — a document that fails
     /// validation leaves the registry untouched.
     pub fn apply(&mut self, document: RegistryDocument) -> a4aa::Result<()> {
         let mut next = self.clone();
-        for (id, entry) in document.agents {
+        for (id, mut entry) in document.agents {
             if entry.spec.id != id {
                 return Err(AdapterError::permanent(
                     "registry_agent_id_mismatch",
@@ -721,6 +854,9 @@ impl Registry {
                     "agent key `{id}` does not match spec id `{}`",
                     entry.spec.id
                 )));
+            }
+            if let Some(prior) = next.agents.get(&id) {
+                entry.carry_host_declarations_from(prior);
             }
             next.agents.insert(id, entry);
         }

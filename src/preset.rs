@@ -150,7 +150,9 @@ pub fn instantiate(preset_id: &str, profile_id: &str) -> Result<PresetUnit, Pres
 }
 
 /// Insert the preset's verified agent and a new profile. An existing agent
-/// with the same id is replaced so leftover argv cannot linger; an existing
+/// with the same id is replaced so leftover argv cannot linger — host
+/// declarations the card cannot name (`mcpConfig.toolsApprovalServers`
+/// and friends) carry over from the entry being replaced; an existing
 /// profile is refused. Advanced custody stays on `va set --file`.
 pub fn apply_preset(
     doc: &mut RegistryDocument,
@@ -163,7 +165,11 @@ pub fn apply_preset(
         });
     }
     let unit = instantiate(preset_id, profile_id)?;
-    doc.agents.insert(unit.agent.spec.id.clone(), unit.agent);
+    let mut agent = unit.agent;
+    if let Some(prior) = doc.agents.get(&agent.spec.id) {
+        agent.carry_host_declarations_from(prior);
+    }
+    doc.agents.insert(agent.spec.id.clone(), agent);
     doc.profiles.insert(profile_id.to_owned(), unit.profile);
     Ok(unit.preset)
 }
@@ -428,6 +434,80 @@ mod tests {
         apply_preset(&mut doc, "implementer", "hermes").unwrap();
         assert_eq!(doc.profiles.len(), 2);
         Registry::from_document(doc).unwrap();
+    }
+
+    /// Re-materializing over an existing `-auto` entry regenerates the
+    /// card surface but keeps the host declarations a card cannot name —
+    /// the incident where an a4aa re-materialization stripped codex-auto's
+    /// `toolsApprovalServers` and the rpc lane then refused MCP sessions.
+    #[test]
+    fn reapplying_a_preset_keeps_host_declarations() {
+        let mut doc = RegistryDocument::default();
+        apply_preset(&mut doc, "p", "codex").unwrap();
+        {
+            let entry = doc.agents.get_mut("codex-auto").unwrap();
+            let LaneSpec::Rpc(rpc) = &mut entry.spec.lane else {
+                panic!("codex drives the rpc lane");
+            };
+            rpc.mcp_config.as_mut().unwrap().tools_approval_servers =
+                vec!["project-automation".into()];
+            rpc.mcp_servers = vec![serde_json::json!({
+                "name": "project-automation", "command": "pa", "args": [], "env": []
+            })];
+            let EnvPolicy::InheritAll { set } = &mut entry.spec.command.env else {
+                panic!("presets inherit the host environment");
+            };
+            set.insert("HOST_FLAG".into(), EnvValue::Literal("1".into()));
+            entry.spec.command.cwd = Some(std::path::PathBuf::from("/tmp/work"));
+        }
+        apply_preset(&mut doc, "q", "codex").unwrap();
+        let entry = &doc.agents["codex-auto"];
+        let LaneSpec::Rpc(rpc) = &entry.spec.lane else {
+            panic!("codex drives the rpc lane");
+        };
+        assert_eq!(
+            rpc.mcp_config.as_ref().unwrap().tools_approval_servers,
+            ["project-automation"]
+        );
+        assert_eq!(rpc.mcp_servers.len(), 1);
+        let EnvPolicy::InheritAll { set } = &entry.spec.command.env else {
+            panic!("presets inherit the host environment");
+        };
+        assert_eq!(set["HOST_FLAG"], EnvValue::Literal("1".into()));
+        assert_eq!(
+            entry.spec.command.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/work"))
+        );
+        Registry::from_document(doc).unwrap();
+    }
+
+    /// Declared fields on the materialized entry always win: a new list
+    /// the incoming spec names itself is never overwritten by the prior's.
+    #[test]
+    fn declared_fields_on_the_new_entry_win() {
+        let mut doc = RegistryDocument::default();
+        apply_preset(&mut doc, "p", "codex").unwrap();
+        {
+            let entry = doc.agents.get_mut("codex-auto").unwrap();
+            let LaneSpec::Rpc(rpc) = &mut entry.spec.lane else {
+                panic!("codex drives the rpc lane");
+            };
+            rpc.mcp_config.as_mut().unwrap().tools_approval_servers = vec!["old-tools".into()];
+        }
+        let mut unit = instantiate("codex", "q").unwrap();
+        let LaneSpec::Rpc(rpc) = &mut unit.agent.spec.lane else {
+            panic!("codex drives the rpc lane");
+        };
+        rpc.mcp_config.as_mut().unwrap().tools_approval_servers = vec!["new-tools".into()];
+        let mut agent = unit.agent;
+        agent.carry_host_declarations_from(&doc.agents["codex-auto"]);
+        let LaneSpec::Rpc(rpc) = &agent.spec.lane else {
+            panic!("codex drives the rpc lane");
+        };
+        assert_eq!(
+            rpc.mcp_config.as_ref().unwrap().tools_approval_servers,
+            ["new-tools"]
+        );
     }
 
     #[test]

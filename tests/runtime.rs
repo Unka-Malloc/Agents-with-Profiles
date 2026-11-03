@@ -87,6 +87,7 @@ fn rpc_spec(
             env: Default::default(),
         },
         max_output_bytes: None,
+        seatbelted_permission: None,
     }
 }
 
@@ -141,6 +142,7 @@ fn fixture_spec() -> AgentSpec {
             env: Default::default(),
         },
         max_output_bytes: None,
+        seatbelted_permission: None,
     }
 }
 

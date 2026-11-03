@@ -19,5 +19,6 @@ pub fn cli_spec(id: &str, program: &str, args: &[&str], channel: PromptChannel) 
             env: Default::default(),
         },
         max_output_bytes: None,
+        seatbelted_permission: None,
     }
 }

@@ -2,6 +2,9 @@
 
 use awp::{AgentSpec, CliLaneSpec, CommandSpec, LaneSpec, PromptChannel, StreamMode};
 
+// Shared constructor: each test binary includes this module but only some
+// use the helper — usage is platform-gated in places, so stay silent.
+#[allow(dead_code)]
 pub fn cli_spec(id: &str, program: &str, args: &[&str], channel: PromptChannel) -> AgentSpec {
     AgentSpec {
         id: id.to_owned(),

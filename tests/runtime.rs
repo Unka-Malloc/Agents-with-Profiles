@@ -4,12 +4,14 @@
 //! The `acp` cases drive `awp fixture-agent`; the `cli` cases use ubiquitous
 //! Unix tools, and the `rpc` cases use a small local JSON-RPC child fixture.
 
+#[cfg(unix)]
 use a4aa::SessionConfig;
 use awp::{
-    AgentEvent, AgentSpec, CommandSpec, EnvValue, InstructionMode, LaneSpec, ProfilePatch,
-    PromptChannel, Registry, RegistryDocument, RpcCallSpec, RpcLaneSpec, SessionRequest,
-    TurnRequest,
+    AgentEvent, AgentSpec, CommandSpec, InstructionMode, LaneSpec, ProfilePatch, Registry,
+    RegistryDocument, SessionRequest, TurnRequest,
 };
+#[cfg(unix)]
+use awp::{EnvValue, PromptChannel, RpcCallSpec, RpcLaneSpec};
 #[cfg(unix)]
 use serde_json::json;
 #[cfg(unix)]
@@ -56,6 +58,7 @@ for line in sys.stdin:
 "#;
 
 mod common;
+#[cfg(unix)]
 use common::cli_spec;
 
 #[cfg(unix)]

@@ -3,6 +3,8 @@
 //! forever. `try_wait` polling bounds the assertion so a regression fails
 //! instead of hanging the suite.
 
+#![cfg(unix)]
+
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

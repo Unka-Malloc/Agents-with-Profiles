@@ -15,6 +15,20 @@ fn test_secret(label: &str) -> String {
     format!("{label}-{}-{nonce}", std::process::id())
 }
 
+/// Same rule for environment-variable names a secret resolves from: minted
+/// uppercase names cannot collide with a real credential variable.
+fn test_env_name(label: &str) -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "AWP_TEST_{}_{}_{nonce}",
+        label.to_uppercase().replace('-', "_"),
+        std::process::id()
+    )
+}
+
 const DOC: &str = r#"{
   "agents": {
     "fixture": {
@@ -37,7 +51,7 @@ const DOC: &str = r#"{
       "instructions": "Review carefully.",
       "instructionMode": "first-turn",
       "contextWindow": 200000,
-      "env": {"FLAG": "1", "TOKEN": {"secret": {"secret": "__VAULT_REF__"}},
+      "env": {"FLAG": "1", "__TOKEN_ENV__": {"secret": {"secret": "__VAULT_REF__"}},
             "INHERITED": {"hostEnv": {"host_env": "HOST_VAR"}}},
       "mcpServers": [{"name": "tools"}],
       "requiredCapabilities": ["fs:read"],
@@ -60,7 +74,10 @@ const DOC: &str = r#"{
 #[test]
 fn document_roundtrips_and_validates() {
     let vault_ref = format!("vault/{}", test_secret("token"));
-    let doc = DOC.replace("__VAULT_REF__", &vault_ref);
+    let token_env = test_env_name("token");
+    let doc = DOC
+        .replace("__VAULT_REF__", &vault_ref)
+        .replace("__TOKEN_ENV__", &token_env);
     let registry = awp::Registry::from_json(&doc).expect("valid document");
 
     let reviewer = registry.profile("reviewer").expect("profile resolves");
@@ -71,7 +88,7 @@ fn document_roundtrips_and_validates() {
     assert_eq!(reviewer.required_capabilities, ["fs:read"]);
     assert_eq!(reviewer.state_key.as_deref(), Some("reviewer-state"));
     assert_eq!(reviewer.extensions["avatar"], json!("owl"));
-    match reviewer.env.get("TOKEN") {
+    match reviewer.env.get(token_env.as_str()) {
         Some(awp::EnvValue::Source(awp::EnvSource::Secret { secret })) => {
             assert_eq!(secret, &vault_ref)
         }
@@ -99,7 +116,9 @@ fn document_roundtrips_and_validates() {
 
 #[test]
 fn document_surfaces_resolved_profiles() {
-    let doc = DOC.replace("__VAULT_REF__", &test_secret("token"));
+    let doc = DOC
+        .replace("__VAULT_REF__", &test_secret("token"))
+        .replace("__TOKEN_ENV__", &test_env_name("token"));
     let registry = awp::Registry::from_json(&doc).unwrap();
     let mut ids: Vec<&str> = registry.profiles().map(|p| p.id.as_str()).collect();
     ids.sort_unstable();
@@ -217,8 +236,8 @@ fn secrets_and_providers_serialize_and_deserialize() {
       },
       "bindings": {},
       "secrets": {
-        "API_KEY": [
-          {"env": "CUSTOM_KEY"},
+        "__SECRETS_KEY__": [
+          {"env": "__ENV_KEY__"},
           {"json": {"path": "{home}/.config/app/config.json", "key": "auth.apiKey"}},
           {"yaml": {"path": "{home}/.config/app/config.yaml", "key": "auth.api_key"}},
           {"toml": {"path": "{home}/.config/app/config.toml", "key": "credentials.token"}}
@@ -228,14 +247,19 @@ fn secrets_and_providers_serialize_and_deserialize() {
         "deepseek": {
           "vendor": "deepseek",
           "baseUrl": "https://api.deepseek.com/v1",
-          "authSecret": "DEEPSEEK_API_KEY",
+          "authSecret": "__AUTH_SECRET__",
           "models": ["deepseek-chat", "deepseek-reasoner"]
         }
       }
     }"#;
 
-    let doc: RegistryDocument = serde_json::from_str(json_text).expect("parses document");
-    assert_eq!(doc.secrets["API_KEY"].len(), 4);
+    let secrets_key = test_env_name("api-key");
+    let json_text = json_text
+        .replace("__SECRETS_KEY__", &secrets_key)
+        .replace("__ENV_KEY__", &test_env_name("custom-key"))
+        .replace("__AUTH_SECRET__", &test_env_name("auth-secret"));
+    let doc: RegistryDocument = serde_json::from_str(&json_text).expect("parses document");
+    assert_eq!(doc.secrets[secrets_key.as_str()].len(), 4);
     assert_eq!(doc.providers["deepseek"].vendor, "deepseek");
     assert_eq!(doc.providers["deepseek"].models.len(), 2);
     let reg = awp::Registry::from_document(doc).expect("valid registry");

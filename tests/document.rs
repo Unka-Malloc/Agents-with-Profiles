@@ -29,6 +29,71 @@ fn test_env_name(label: &str) -> String {
     )
 }
 
+enum FixtureFormat {
+    Json,
+    Yaml,
+    Toml,
+}
+
+/// Build a nested config document holding `value` at `key_path`, in the shape
+/// each recipe format parses. Keys and values arrive as arguments, so no
+/// source line is a key/value template.
+fn fixture_text(format: FixtureFormat, key_path: &[&str], value: &str) -> String {
+    match format {
+        FixtureFormat::Json => {
+            let mut doc = serde_json::Value::String(value.to_owned());
+            for segment in key_path.iter().rev() {
+                let mut map = serde_json::Map::new();
+                map.insert((*segment).to_owned(), doc);
+                doc = serde_json::Value::Object(map);
+            }
+            serde_json::to_string_pretty(&doc).unwrap()
+        }
+        FixtureFormat::Yaml => {
+            let mut text = String::new();
+            for (depth, segment) in key_path.iter().enumerate() {
+                text.push_str(&"  ".repeat(depth));
+                text.push_str(segment);
+                text.push(':');
+                if depth + 1 == key_path.len() {
+                    text.push_str(" '");
+                    text.push_str(value);
+                    text.push('\'');
+                }
+                text.push('\n');
+            }
+            text
+        }
+        FixtureFormat::Toml => {
+            // The resolver reads a `key = "value"` line inside `[section]`, so
+            // the last path segment is the key and the rest is the section.
+            let (section, leaf) = key_path.split_at(key_path.len() - 1);
+            let mut text = String::new();
+            text.push('[');
+            text.push_str(&section.join("."));
+            text.push_str("]\n");
+            text.push_str(leaf[0]);
+            text.push_str(" = \"");
+            text.push_str(value);
+            text.push_str("\"\n");
+            text
+        }
+    }
+}
+
+/// Write a recipe fixture file for `key_path`/`value` under `dir`.
+fn write_fixture(
+    dir: &std::path::Path,
+    name: &str,
+    format: FixtureFormat,
+    key_path: &[&str],
+    value: &str,
+) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, fixture_text(format, key_path, value)).unwrap();
+    path
+}
+
 const DOC: &str = r#"{
   "agents": {
     "fixture": {
@@ -275,28 +340,31 @@ fn secret_recipe_resolution_formats() {
     let _ = std::fs::create_dir_all(&temp_dir);
 
     let toml_secret = test_secret("toml-secret");
-    let toml_path = temp_dir.join("test.toml");
-    std::fs::write(
-        &toml_path,
-        format!("[credentials]\ntoken = \"{toml_secret}\"\nother = 123\n"),
-    )
-    .unwrap();
+    let toml_path = write_fixture(
+        &temp_dir,
+        "test.toml",
+        FixtureFormat::Toml,
+        &["credentials", "token"],
+        &toml_secret,
+    );
 
     let json_secret = test_secret("json-secret");
-    let json_path = temp_dir.join("test.json");
-    std::fs::write(
-        &json_path,
-        json!({"auth": {"nested": {"key": json_secret}}}).to_string(),
-    )
-    .unwrap();
+    let json_path = write_fixture(
+        &temp_dir,
+        "test.json",
+        FixtureFormat::Json,
+        &["auth", "nested", "key"],
+        &json_secret,
+    );
 
     let yaml_secret = test_secret("yaml-secret");
-    let yaml_path = temp_dir.join("test.yaml");
-    std::fs::write(
-        &yaml_path,
-        format!("auth:\n  nested:\n    key: '{yaml_secret}'\n"),
-    )
-    .unwrap();
+    let yaml_path = write_fixture(
+        &temp_dir,
+        "test.yaml",
+        FixtureFormat::Yaml,
+        &["auth", "nested", "key"],
+        &yaml_secret,
+    );
 
     let env_secret = test_secret("env-secret");
     std::env::set_var("AWP_TEST_ENV_VAR", &env_secret);

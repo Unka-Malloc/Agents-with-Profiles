@@ -5,6 +5,8 @@ version = 4
 [[package]]
 name = "a4aa"
 version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25964f15490de94d55fe8b2e426d1b2822fe597e250531cdd97881f84ae3e1f1"
 dependencies = [
  "acop",
  "agent-client-protocol",

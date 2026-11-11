@@ -4,6 +4,17 @@
 use awp::{Binding, InstructionMode, RegistryDocument};
 use serde_json::json;
 
+/// Test keys are minted per run, never defaulted: the value still reads like a
+/// secret so recipe resolution exercises real bytes, but nothing static ships
+/// in the test source.
+fn test_secret(label: &str) -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{label}-{}-{nonce}", std::process::id())
+}
+
 const DOC: &str = r#"{
   "agents": {
     "fixture": {
@@ -26,7 +37,7 @@ const DOC: &str = r#"{
       "instructions": "Review carefully.",
       "instructionMode": "first-turn",
       "contextWindow": 200000,
-      "env": {"FLAG": "1", "TOKEN": {"secret": {"secret": "vault/token"}},
+      "env": {"FLAG": "1", "TOKEN": {"secret": {"secret": "__VAULT_REF__"}},
             "INHERITED": {"hostEnv": {"host_env": "HOST_VAR"}}},
       "mcpServers": [{"name": "tools"}],
       "requiredCapabilities": ["fs:read"],
@@ -48,7 +59,9 @@ const DOC: &str = r#"{
 
 #[test]
 fn document_roundtrips_and_validates() {
-    let registry = awp::Registry::from_json(DOC).expect("valid document");
+    let vault_ref = format!("vault/{}", test_secret("token"));
+    let doc = DOC.replace("__VAULT_REF__", &vault_ref);
+    let registry = awp::Registry::from_json(&doc).expect("valid document");
 
     let reviewer = registry.profile("reviewer").expect("profile resolves");
     assert_eq!(reviewer.agent, "fixture");
@@ -60,7 +73,7 @@ fn document_roundtrips_and_validates() {
     assert_eq!(reviewer.extensions["avatar"], json!("owl"));
     match reviewer.env.get("TOKEN") {
         Some(awp::EnvValue::Source(awp::EnvSource::Secret { secret })) => {
-            assert_eq!(secret, "vault/token")
+            assert_eq!(secret, &vault_ref)
         }
         other => panic!("unexpected env value: {other:?}"),
     }
@@ -86,7 +99,8 @@ fn document_roundtrips_and_validates() {
 
 #[test]
 fn document_surfaces_resolved_profiles() {
-    let registry = awp::Registry::from_json(DOC).unwrap();
+    let doc = DOC.replace("__VAULT_REF__", &test_secret("token"));
+    let registry = awp::Registry::from_json(&doc).unwrap();
     let mut ids: Vec<&str> = registry.profiles().map(|p| p.id.as_str()).collect();
     ids.sort_unstable();
     assert_eq!(ids, ["implementer", "reviewer"]);
@@ -236,28 +250,32 @@ fn secret_recipe_resolution_formats() {
     let temp_dir = std::env::temp_dir().join(format!("awp-sec-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&temp_dir);
 
+    let toml_secret = test_secret("toml-secret");
     let toml_path = temp_dir.join("test.toml");
     std::fs::write(
         &toml_path,
-        "[credentials]\ntoken = \"toml-secret-value\"\nother = 123\n",
+        format!("[credentials]\ntoken = \"{toml_secret}\"\nother = 123\n"),
     )
     .unwrap();
 
+    let json_secret = test_secret("json-secret");
     let json_path = temp_dir.join("test.json");
     std::fs::write(
         &json_path,
-        r#"{"auth": {"nested": {"key": "json-secret-value"}}}"#,
+        json!({"auth": {"nested": {"key": json_secret}}}).to_string(),
     )
     .unwrap();
 
+    let yaml_secret = test_secret("yaml-secret");
     let yaml_path = temp_dir.join("test.yaml");
     std::fs::write(
         &yaml_path,
-        "auth:\n  nested:\n    key: 'yaml-secret-value'\n",
+        format!("auth:\n  nested:\n    key: '{yaml_secret}'\n"),
     )
     .unwrap();
 
-    std::env::set_var("AWP_TEST_ENV_VAR", "env-secret-value");
+    let env_secret = test_secret("env-secret");
+    std::env::set_var("AWP_TEST_ENV_VAR", &env_secret);
 
     let recipes = vec![
         awp::SecretRecipe::Env {
@@ -272,7 +290,7 @@ fn secret_recipe_resolution_formats() {
     ];
     assert_eq!(
         awp::resolve_secret(&recipes).as_deref(),
-        Some("toml-secret-value")
+        Some(toml_secret.as_str())
     );
 
     let json_recipe = awp::SecretRecipe::Json {
@@ -281,7 +299,7 @@ fn secret_recipe_resolution_formats() {
             key: "auth.nested.key".into(),
         },
     };
-    assert_eq!(json_recipe.resolve().as_deref(), Some("json-secret-value"));
+    assert_eq!(json_recipe.resolve().as_deref(), Some(json_secret.as_str()));
 
     let yaml_recipe = awp::SecretRecipe::Yaml {
         yaml: awp::FileSecret {
@@ -289,12 +307,12 @@ fn secret_recipe_resolution_formats() {
             key: "auth.nested.key".into(),
         },
     };
-    assert_eq!(yaml_recipe.resolve().as_deref(), Some("yaml-secret-value"));
+    assert_eq!(yaml_recipe.resolve().as_deref(), Some(yaml_secret.as_str()));
 
     let env_recipe = awp::SecretRecipe::Env {
         env: "AWP_TEST_ENV_VAR".into(),
     };
-    assert_eq!(env_recipe.resolve().as_deref(), Some("env-secret-value"));
+    assert_eq!(env_recipe.resolve().as_deref(), Some(env_secret.as_str()));
 
     let _ = std::fs::remove_dir_all(temp_dir);
 }

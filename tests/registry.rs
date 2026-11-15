@@ -820,6 +820,31 @@ fn malformed_window_days_fail_the_document() {
 }
 
 #[test]
+fn non_hh_mm_window_bounds_fail_the_document() {
+    for (from, to) in [("9:00", "17:00"), ("09:0", "17:00"), ("09:00", "24:01")] {
+        let mut document = document(&["a"], &[("p", "a")], &[]);
+        document.bindings.insert(
+            "role".to_owned(),
+            awp::Binding::Full(awp::BindingFull {
+                profile: "p".to_owned(),
+                strict: false,
+                prompt: None,
+                availability: Some(awp::Availability {
+                    windows: vec![availability_window("*", from, to, "UTC")],
+                    ..Default::default()
+                }),
+                fallbacks: vec![],
+            }),
+        );
+        let error = Registry::from_document(document).unwrap_err();
+        assert_eq!(
+            error.code, "binding_availability_malformed",
+            "{from}-{to} must be rejected at load"
+        );
+    }
+}
+
+#[test]
 fn malformed_model_window_fails_the_document() {
     let mut document = document(&["a"], &[], &[]);
     document.profiles.insert(
@@ -1007,6 +1032,349 @@ fn recurring_schedule_windows_filter_chain_based_on_time_and_fallback() {
         ),
         vec!["q", "r"]
     );
+}
+
+// -------------------- availability windows: cooldowns & edges ------------
+
+fn instant(raw: &str) -> jiff::Timestamp {
+    raw.parse().expect("valid test timestamp")
+}
+
+fn availability_window(
+    days: &str,
+    from: &str,
+    to: &str,
+    timezone: &str,
+) -> awp::AvailabilityWindow {
+    awp::AvailabilityWindow {
+        days: days.to_owned(),
+        from: from.to_owned(),
+        to: to.to_owned(),
+        timezone: timezone.to_owned(),
+    }
+}
+
+/// An availability bound that opens exactly when a candidate's cooldown
+/// elapses — the shape a host writes after removing a refused candidate.
+fn cooling_until(until: jiff::Timestamp) -> awp::Availability {
+    awp::Availability {
+        not_before: Some(until.to_string()),
+        ..Default::default()
+    }
+}
+
+fn ids_at(registry: &Registry, binding: &str, now: jiff::Timestamp) -> Vec<String> {
+    registry
+        .resolve_chain_at(binding, &now)
+        .unwrap()
+        .iter()
+        .map(|agent| agent.profile().id.clone())
+        .collect()
+}
+
+#[test]
+fn cooldown_expiry_recovers_rate_limit_before_quota_exhaustion() {
+    // A QuotaExhausted refusal pins a candidate for its long reset window
+    // (one hour here); a RateLimited refusal only for the provider's
+    // `retryAfterMs` (30s here). The availability gate must honour each
+    // deadline exactly when it elapses — no cooldown outlives its own
+    // deadline and no candidate returns before it.
+    const RATE_LIMIT_RETRY_AFTER_MS: i64 = 30_000;
+    const QUOTA_COOLDOWN_SECS: i64 = 60 * 60;
+
+    let base = instant("2026-10-20T12:00:00Z");
+    let rate_expiry = base
+        .checked_add(jiff::SignedDuration::from_millis(RATE_LIMIT_RETRY_AFTER_MS))
+        .unwrap();
+    let quota_expiry = base
+        .checked_add(jiff::SignedDuration::from_secs(QUOTA_COOLDOWN_SECS))
+        .unwrap();
+
+    let mut document = document(&["a", "b", "c"], &[("p", "a"), ("q", "b"), ("r", "c")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: Some(cooling_until(quota_expiry)),
+            fallbacks: vec![
+                awp::Fallback::Windowed(awp::FallbackEntry {
+                    profile: "q".to_owned(),
+                    availability: Some(cooling_until(rate_expiry)),
+                }),
+                awp::Fallback::Id("r".to_owned()),
+            ],
+        }),
+    );
+    let registry = Registry::from_document(document).unwrap();
+
+    // Both candidates are cooling down: only the unconditional candidate
+    // serves, and neither deadline has been reached early.
+    assert_eq!(ids_at(&registry, "role", base), vec!["r"]);
+    let just_before_rate = rate_expiry
+        .checked_sub(jiff::SignedDuration::from_millis(1))
+        .unwrap();
+    assert_eq!(ids_at(&registry, "role", just_before_rate), vec!["r"]);
+
+    // `notBefore` is inclusive: the short-cooldown candidate recovers on the
+    // exact millisecond of its deadline while the long one stays out.
+    assert_eq!(ids_at(&registry, "role", rate_expiry), vec!["q", "r"]);
+    let just_before_quota = quota_expiry
+        .checked_sub(jiff::SignedDuration::from_secs(1))
+        .unwrap();
+    assert_eq!(ids_at(&registry, "role", just_before_quota), vec!["q", "r"]);
+
+    // The quota cooldown expires last and restores the primary; both
+    // selection paths agree at that boundary.
+    assert_eq!(ids_at(&registry, "role", quota_expiry), vec!["p", "q", "r"]);
+    assert_eq!(
+        registry
+            .select_at("role", &quota_expiry)
+            .unwrap()
+            .profile
+            .id,
+        "p"
+    );
+}
+
+#[test]
+fn consecutive_rejections_degrade_the_chain_and_recover_in_order() {
+    // Three refusals land in sequence: quota (one hour), rate limit (30s)
+    // and overload (five minutes). Every rejection removes one more
+    // candidate from the front; recovery happens only when that candidate's
+    // own deadline elapses, so the chain rebuilds in deadline order rather
+    // than resetting wholesale after the first success.
+    let base = instant("2026-10-20T12:00:00Z");
+    let rate_expiry = base
+        .checked_add(jiff::SignedDuration::from_secs(30))
+        .unwrap();
+    let overload_expiry = base
+        .checked_add(jiff::SignedDuration::from_mins(5))
+        .unwrap();
+    let quota_expiry = base
+        .checked_add(jiff::SignedDuration::from_secs(60 * 60))
+        .unwrap();
+
+    let mut document = document(
+        &["a", "b", "c", "d"],
+        &[("p", "a"), ("q", "b"), ("r", "c"), ("s", "d")],
+        &[],
+    );
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: Some(cooling_until(quota_expiry)),
+            fallbacks: vec![
+                awp::Fallback::Windowed(awp::FallbackEntry {
+                    profile: "q".to_owned(),
+                    availability: Some(cooling_until(rate_expiry)),
+                }),
+                awp::Fallback::Windowed(awp::FallbackEntry {
+                    profile: "r".to_owned(),
+                    availability: Some(cooling_until(overload_expiry)),
+                }),
+                awp::Fallback::Id("s".to_owned()),
+            ],
+        }),
+    );
+    let registry = Registry::from_document(document).unwrap();
+
+    // Every cooled-down candidate is out; the degradation lands on "s".
+    assert_eq!(ids_at(&registry, "role", base), vec!["s"]);
+    let before_rate = rate_expiry
+        .checked_sub(jiff::SignedDuration::from_millis(1))
+        .unwrap();
+    assert_eq!(ids_at(&registry, "role", before_rate), vec!["s"]);
+
+    // The rate-limited candidate returns first, ahead of the still-cooling
+    // overload and quota candidates.
+    assert_eq!(ids_at(&registry, "role", rate_expiry), vec!["q", "s"]);
+    let before_overload = overload_expiry
+        .checked_sub(jiff::SignedDuration::from_secs(1))
+        .unwrap();
+    assert_eq!(ids_at(&registry, "role", before_overload), vec!["q", "s"]);
+    assert_eq!(
+        ids_at(&registry, "role", overload_expiry),
+        vec!["q", "r", "s"]
+    );
+
+    // The quota cooldown is the last to lift and restores the primary.
+    let before_quota = quota_expiry
+        .checked_sub(jiff::SignedDuration::from_secs(1))
+        .unwrap();
+    assert_eq!(ids_at(&registry, "role", before_quota), vec!["q", "r", "s"]);
+    assert_eq!(
+        ids_at(&registry, "role", quota_expiry),
+        vec!["p", "q", "r", "s"]
+    );
+}
+
+#[test]
+fn recurring_window_reopens_after_its_cooldown_and_expires_on_the_clock() {
+    // A candidate whose availability is a nightly window is the recurring
+    // form of a cooldown: while the window is closed the fallback serves,
+    // and the next opening restores the primary at the exact boundary.
+    let mut document = document(&["a", "b"], &[("p", "a"), ("q", "b")], &[]);
+    document.bindings.insert(
+        "role".to_owned(),
+        awp::Binding::Full(awp::BindingFull {
+            profile: "p".to_owned(),
+            strict: false,
+            prompt: None,
+            availability: Some(awp::Availability {
+                windows: vec![availability_window("*", "22:00", "06:00", "UTC")],
+                ..Default::default()
+            }),
+            fallbacks: vec![awp::Fallback::Id("q".to_owned())],
+        }),
+    );
+    let registry = Registry::from_document(document).unwrap();
+
+    let cases = [
+        // Monday before the window opens.
+        ("2026-10-19T21:59:59Z", "q"),
+        // The opening instant is inclusive.
+        ("2026-10-19T22:00:00Z", "p"),
+        // Tuesday's tail still belongs to Monday's window.
+        ("2026-10-20T05:59:59Z", "p"),
+        // The closing instant is exclusive.
+        ("2026-10-20T06:00:00Z", "q"),
+        // Between windows the fallback serves.
+        ("2026-10-20T21:59:59Z", "q"),
+        // The next window opens on time.
+        ("2026-10-20T22:00:00Z", "p"),
+    ];
+    for (raw, expected) in cases {
+        let now = instant(raw);
+        assert_eq!(
+            registry.select_at("role", &now).unwrap().profile.id,
+            expected,
+            "{raw}"
+        );
+        if expected == "p" {
+            assert_eq!(ids_at(&registry, "role", now), vec!["p", "q"], "{raw}");
+        } else {
+            assert_eq!(ids_at(&registry, "role", now), vec!["q"], "{raw}");
+        }
+    }
+}
+
+#[test]
+fn availability_window_clock_boundaries_are_half_open_across_zones() {
+    // Normal range: `from` inclusive, `to` exclusive, in the declared zone.
+    let utc = availability_window("mon", "09:00", "17:00", "UTC");
+    assert!(!utc.covers(&instant("2026-10-19T08:59:59Z")));
+    assert!(utc.covers(&instant("2026-10-19T09:00:00Z")));
+    assert!(utc.covers(&instant("2026-10-19T16:59:59Z")));
+    assert!(!utc.covers(&instant("2026-10-19T17:00:00Z")));
+    // 2026-10-19 is Monday; Tuesday at the same wall clock is outside the
+    // day filter even though the time-of-day matches.
+    assert!(!utc.covers(&instant("2026-10-20T09:00:00Z")));
+
+    // The same wall clock in UTC+8 opens at 01:00Z, not 09:00Z.
+    let shanghai = availability_window("mon", "09:00", "17:00", "Asia/Shanghai");
+    assert!(!shanghai.covers(&instant("2026-10-19T00:59:59Z")));
+    assert!(shanghai.covers(&instant("2026-10-19T01:00:00Z")));
+    assert!(shanghai.covers(&instant("2026-10-19T08:59:59Z")));
+    assert!(!shanghai.covers(&instant("2026-10-19T09:00:00Z")));
+
+    // A wrapped window belongs to the day it opens on: Tuesday 00:30 is
+    // Monday's tail, while Monday 00:30 belongs to Sunday and is out.
+    let night = availability_window("mon", "22:00", "06:00", "UTC");
+    assert!(!night.covers(&instant("2026-10-19T00:30:00Z")));
+    assert!(night.covers(&instant("2026-10-20T00:30:00Z")));
+    // Equal day/time bounds are the documented whole-day spelling.
+    let whole_day = availability_window("*", "00:00", "00:00", "UTC");
+    assert!(whole_day.covers(&instant("2026-10-20T00:00:00Z")));
+    assert!(whole_day.covers(&instant("2026-10-20T12:00:00Z")));
+    assert!(whole_day.covers(&instant("2026-10-20T23:59:59Z")));
+
+    // `to` is strictly exclusive at the last minute: 23:59 is minute 1439,
+    // not an alias for 24:00, so only the explicit 24:00 end bound covers
+    // the final minute of the day.
+    let last_minute = availability_window("*", "23:58", "23:59", "UTC");
+    assert!(last_minute.covers(&instant("2026-10-20T23:58:00Z")));
+    assert!(last_minute.covers(&instant("2026-10-20T23:58:59Z")));
+    assert!(!last_minute.covers(&instant("2026-10-20T23:59:00Z")));
+    let through_end = availability_window("*", "00:00", "24:00", "UTC");
+    assert!(through_end.is_well_formed());
+    assert!(through_end.covers(&instant("2026-10-20T23:59:59Z")));
+
+    // Only exactly two ASCII digits per field parse: these are typos, not
+    // alternate spellings, and a malformed window covers nothing.
+    for (from, to) in [("9:00", "17:00"), ("09:0", "17:00"), ("09:00", " 17:00")] {
+        let malformed = availability_window("*", from, to, "UTC");
+        assert!(!malformed.is_well_formed(), "{from}-{to} must be malformed");
+        assert!(!malformed.covers(&instant("2026-10-20T10:00:00Z")));
+    }
+}
+
+#[test]
+fn zero_span_bounds_cover_nothing_and_recover_on_their_deadline() {
+    let now = instant("2026-10-20T12:00:00Z");
+
+    // A zero-span availability interval is empty at every instant:
+    // `notBefore` is inclusive and `notAfter` exclusive, so equal bounds
+    // never intersect.
+    let empty = awp::Availability {
+        not_before: Some(now.to_string()),
+        not_after: Some(now.to_string()),
+        ..Default::default()
+    };
+    for probe in [
+        now.checked_sub(jiff::SignedDuration::from_millis(1))
+            .unwrap(),
+        now,
+        now.checked_add(jiff::SignedDuration::from_millis(1))
+            .unwrap(),
+    ] {
+        assert!(!empty.covers(&probe), "{probe} must not be covered");
+    }
+
+    // A zero-length cooldown (`notBefore == now`) is already over: the
+    // candidate is out one millisecond earlier and back exactly at now.
+    let reopened = cooling_until(now);
+    assert!(!reopened.covers(
+        &now.checked_sub(jiff::SignedDuration::from_millis(1))
+            .unwrap()
+    ));
+    assert!(reopened.covers(&now));
+
+    // Conversely a deadline exactly at now is already closed.
+    let closed = awp::Availability {
+        not_after: Some(now.to_string()),
+        ..Default::default()
+    };
+    assert!(closed.covers(
+        &now.checked_sub(jiff::SignedDuration::from_millis(1))
+            .unwrap()
+    ));
+    assert!(!closed.covers(&now));
+}
+
+#[test]
+fn availability_windows_follow_dst_transitions() {
+    // US spring-forward 2026-03-08: 02:00 EST jumps to 03:00 EDT. A window
+    // spanning the gap stays open across it and still closes on local wall
+    // clock, not on a fixed UTC offset.
+    let spring = availability_window("sun", "01:30", "03:30", "America/New_York");
+    assert!(!spring.covers(&instant("2026-03-08T06:29:59Z")));
+    assert!(spring.covers(&instant("2026-03-08T06:30:00Z"))); // 01:30 EST
+    assert!(spring.covers(&instant("2026-03-08T07:00:00Z"))); // 03:00 EDT
+    assert!(!spring.covers(&instant("2026-03-08T07:30:00Z"))); // 03:30 EDT
+
+    // US fall-back 2026-11-01: 02:00 EDT returns to 01:00 EST. Both passes
+    // of the repeated hour are inside a 01:00-02:00 local window.
+    let fall = availability_window("sun", "01:00", "02:00", "America/New_York");
+    assert!(!fall.covers(&instant("2026-11-01T04:59:59Z"))); // 00:59:59 EDT
+    assert!(fall.covers(&instant("2026-11-01T05:00:00Z"))); // 01:00 EDT
+    assert!(fall.covers(&instant("2026-11-01T06:00:00Z"))); // 01:00 EST
+    assert!(fall.covers(&instant("2026-11-01T06:59:59Z"))); // 01:59:59 EST
+    assert!(!fall.covers(&instant("2026-11-01T07:00:00Z"))); // 02:00 EST
 }
 
 // ------------------------------- strict bindings -------------------------

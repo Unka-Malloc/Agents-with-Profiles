@@ -75,14 +75,20 @@ is selectable at all: `notBefore` inclusive, `notAfter` exclusive, each an
 RFC 3339 timestamp or a bare `YYYY-MM-DD` read as that day's 00:00 UTC.
 Recurring `windows` narrow a bound to a schedule —
 `[{days, from, to, timezone}]` where `days` is `*` or comma-separated
-`mon`–`sun` codes and `from`/`to` are `"HH:MM"` in the named IANA zone; a
+`mon`–`sun` codes and `from`/`to` are `"HH:MM"` (exactly two digits per
+field; `24:00` spells end of day) in the named IANA zone; a
 `to` earlier than `from` wraps midnight and equal bounds cover the whole
 matching day. An absent bound is unbounded — a promo lane whose end the
 vendor never published stays selectable until request failure pushes it
 aside — and any malformed bound, window field or `days` spelling rejects
 the document at load: the vocabulary fails closed rather than silently
 never covering. Resolution skips expired candidates outright, so expiry is
-semantic and needs no scheduled cleanup.
+semantic and needs no scheduled cleanup. Bounds are evaluated in the
+declared zone, so a daylight-saving gap or repeated hour follows the local
+wall clock; a zero-span `notBefore`/`notAfter` interval is empty, while
+equal recurring-window bounds are the whole-day spelling. These boundaries
+are deterministic against an explicit instant (`select_at` /
+`resolve_chain_at`), not the host clock.
 A `null` binding value removes the slot on overlay. Unknown fields
 are rejected (`deny_unknown_fields`) — a typo is a load error, not a silent
 default.

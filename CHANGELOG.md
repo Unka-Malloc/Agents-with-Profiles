@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Availability window `HH:MM` bounds now require exactly two ASCII digits
+  per field, and `23:59` is minute 1439 — the exclusive `to` bound — rather
+  than an alias for `24:00`; `24:00` remains the explicit end-of-day
+  spelling. A shape like `9:00` or `09:0` now rejects the document at load
+  instead of silently widening the window. Deterministic coverage also pins
+  cooldown-expiry recovery (long quota vs short `retryAfterMs`), consecutive
+  refusal degradation, wrapped-midnight day attribution, zero-span bounds
+  and DST transitions against explicit instants.
 - Per-adapter Cargo features: `default-features = false, features = ["codex"]`
   builds `a4aa` plus `a4aa-codex` only; `dialects` enables all seventeen
   adapters and `presets` enables the six whose cards it launches. `awp

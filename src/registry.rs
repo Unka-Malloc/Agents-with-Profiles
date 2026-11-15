@@ -637,12 +637,16 @@ impl AvailabilityWindow {
 
 fn minute_bound(raw: &str) -> Option<u16> {
     let (h_raw, m_raw) = raw.split_once(':')?;
-    let h: u16 = h_raw.trim().parse().ok()?;
-    let m: u16 = m_raw.trim().parse().ok()?;
-    if h == 24 && m == 0 {
-        return Some(1440);
+    // Exactly two ASCII digits per field: `9:00` and `09:0` are typos, not
+    // alternate spellings, and the vocabulary fails closed at load.
+    let two_digits =
+        |field: &str| field.len() == 2 && field.bytes().all(|byte| byte.is_ascii_digit());
+    if !two_digits(h_raw) || !two_digits(m_raw) {
+        return None;
     }
-    if h == 23 && m == 59 {
+    let h: u16 = h_raw.parse().ok()?;
+    let m: u16 = m_raw.parse().ok()?;
+    if h == 24 && m == 0 {
         return Some(1440);
     }
     if h < 24 && m < 60 {

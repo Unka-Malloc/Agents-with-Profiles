@@ -2,8 +2,12 @@
 
 ## Unreleased
 
-- `awp::detect_agents()` (behind `dialects`) probes the machine against
-  every a4aa card's `detect` surface — `PATH` binaries, OS-gated
+- Per-adapter Cargo features: `default-features = false, features = ["codex"]`
+  builds `a4aa` plus `a4aa-codex` only; `dialects` enables all seventeen
+  adapters and `presets` enables the six whose cards it launches. `awp
+  materialize` and `awp::dialects` resolve only compiled-in adapters.
+- `awp::detect_agents()` probes the machine against every compiled-in
+  adapter's `detect` surface — `PATH` binaries, OS-gated
   `binary_dirs`, configuration files, prior-use markers and OS-gated
   application bundles — and returns one `Detection` per card carrying the
   resolved executable, the marker paths that exist and the binary-name

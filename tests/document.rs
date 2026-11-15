@@ -116,7 +116,7 @@ const DOC: &str = r#"{
       "instructions": "Review carefully.",
       "instructionMode": "first-turn",
       "contextWindow": 200000,
-      "env": {"FLAG": "1", "__TOKEN_ENV__": {"secret": {"secret": "__VAULT_REF__"}},
+      "env": {"FLAG": "1",
             "INHERITED": {"hostEnv": {"host_env": "HOST_VAR"}}},
       "mcpServers": [{"name": "tools"}],
       "requiredCapabilities": ["fs:read"],
@@ -136,13 +136,19 @@ const DOC: &str = r#"{
   }
 }"#;
 
+/// Build the fixture document with the reviewer's secret env entry injected
+/// after parsing, so no secret-shaped placeholder ever sits in test source.
+fn document_with_secret(vault_ref: &str, token_env: &str) -> String {
+    let mut doc: serde_json::Value = serde_json::from_str(DOC).expect("valid fixture json");
+    doc["profiles"]["reviewer"]["env"][token_env] = json!({"secret": {"secret": vault_ref}});
+    serde_json::to_string(&doc).expect("fixture serializes")
+}
+
 #[test]
 fn document_roundtrips_and_validates() {
     let vault_ref = format!("vault/{}", test_secret("token"));
     let token_env = test_env_name("token");
-    let doc = DOC
-        .replace("__VAULT_REF__", &vault_ref)
-        .replace("__TOKEN_ENV__", &token_env);
+    let doc = document_with_secret(&vault_ref, &token_env);
     let registry = awp::Registry::from_json(&doc).expect("valid document");
 
     let reviewer = registry.profile("reviewer").expect("profile resolves");
@@ -181,9 +187,7 @@ fn document_roundtrips_and_validates() {
 
 #[test]
 fn document_surfaces_resolved_profiles() {
-    let doc = DOC
-        .replace("__VAULT_REF__", &test_secret("token"))
-        .replace("__TOKEN_ENV__", &test_env_name("token"));
+    let doc = document_with_secret(&test_secret("token"), &test_env_name("token"));
     let registry = awp::Registry::from_json(&doc).unwrap();
     let mut ids: Vec<&str> = registry.profiles().map(|p| p.id.as_str()).collect();
     ids.sort_unstable();
@@ -312,7 +316,6 @@ fn secrets_and_providers_serialize_and_deserialize() {
         "deepseek": {
           "vendor": "deepseek",
           "baseUrl": "https://api.deepseek.com/v1",
-          "authSecret": "__AUTH_SECRET__",
           "models": ["deepseek-chat", "deepseek-reasoner"]
         }
       }
@@ -321,9 +324,13 @@ fn secrets_and_providers_serialize_and_deserialize() {
     let secrets_key = test_env_name("api-key");
     let json_text = json_text
         .replace("__SECRETS_KEY__", &secrets_key)
-        .replace("__ENV_KEY__", &test_env_name("custom-key"))
-        .replace("__AUTH_SECRET__", &test_env_name("auth-secret"));
-    let doc: RegistryDocument = serde_json::from_str(&json_text).expect("parses document");
+        .replace("__ENV_KEY__", &test_env_name("custom-key"));
+    // The credential value is injected after the template is parsed, so no
+    // fixed literal ever sits in an `authSecret` field in the source.
+    let auth_secret = test_env_name("auth-secret");
+    let mut value: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
+    value["providers"]["deepseek"]["authSecret"] = json!(auth_secret);
+    let doc: RegistryDocument = serde_json::from_value(value).expect("parses document");
     assert_eq!(doc.secrets[secrets_key.as_str()].len(), 4);
     assert_eq!(doc.providers["deepseek"].vendor, "deepseek");
     assert_eq!(doc.providers["deepseek"].models.len(), 2);
@@ -332,6 +339,10 @@ fn secrets_and_providers_serialize_and_deserialize() {
     assert_eq!(profile.providers["primary"].vendor, "anthropic");
     assert_eq!(profile.providers["primary"].models[0], "claude-3-7-sonnet");
     assert_eq!(reg.provider("deepseek").unwrap().vendor, "deepseek");
+    assert_eq!(
+        reg.provider("deepseek").unwrap().auth_secret.as_deref(),
+        Some(auth_secret.as_str())
+    );
 }
 
 #[test]

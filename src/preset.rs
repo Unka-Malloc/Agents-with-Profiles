@@ -194,8 +194,8 @@ fn agent_id(preset: &AgentPreset) -> String {
 }
 
 fn entry_from_card(id: &str, agent_id: &str) -> AgentEntry {
-    let card =
-        a4aa_dialects::card(id).unwrap_or_else(|| panic!("preset id {id} must match an A4AA card"));
+    let card = crate::dialects::card(id)
+        .unwrap_or_else(|| panic!("preset id {id} must match an A4AA card"));
     // Presets run headless inside the workspace this layer dispatches —
     // the custody host's own workspace and environment grants, so
     // trusted-workspace argv (cursor's --trust) and InheritAll
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn dsh_is_sdk_primary_with_the_acp_alternate() {
         let unit = instantiate("dsh", "deepseek").unwrap();
-        let specs = a4aa_dialects::card("dsh").unwrap().specs();
+        let specs = crate::dialects::card("dsh").unwrap().specs();
         assert_eq!(unit.agent.spec.command.program, "dsh");
         assert_eq!(args_of(&unit.agent), ["--profile", "sdk"]);
         assert!(matches!(unit.agent.spec.lane, LaneSpec::Rpc(_)));
@@ -321,7 +321,7 @@ mod tests {
     fn every_preset_copies_every_declared_card_lane() {
         for preset in PRESETS {
             let unit = instantiate(preset.id, "p").unwrap();
-            let card = a4aa_dialects::card(preset.id).unwrap();
+            let card = crate::dialects::card(preset.id).unwrap();
             let declared = card.specs();
             let materialized = unit.agent.lane_specs();
             assert_eq!(
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn hermes_copies_acp_spawn() {
         let unit = instantiate("hermes", "h").unwrap();
-        let card = a4aa_dialects::card("hermes").unwrap().spec();
+        let card = crate::dialects::card("hermes").unwrap().spec();
         assert_eq!(unit.agent.spec.command.program, "hermes");
         assert_eq!(unit.agent.spec.command.args, card.command.args);
         assert_eq!(unit.agent.spec.command.args, ["acp"]);
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn pi_uses_mode_rpc() {
         let unit = instantiate("pi", "p").unwrap();
-        let card = a4aa_dialects::card("pi").unwrap().spec();
+        let card = crate::dialects::card("pi").unwrap().spec();
         assert_eq!(unit.agent.spec.command.program, "pi");
         assert_eq!(unit.agent.spec.command.args, card.command.args);
         assert_eq!(unit.agent.spec.command.args, ["--mode", "rpc"]);
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn opencode_copies_serve_then_acp() {
         let unit = instantiate("opencode", "oc").unwrap();
-        let specs = a4aa_dialects::card("opencode").unwrap().specs();
+        let specs = crate::dialects::card("opencode").unwrap().specs();
         assert_eq!(unit.agent.spec.command.program, "opencode");
         assert_eq!(unit.agent.spec.command.args, specs[0].command.args);
         assert_eq!(unit.agent.spec.command.args, ["serve", "--port", "0"]);
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn codex_copies_app_server() {
         let unit = instantiate("codex", "c").unwrap();
-        let specs = a4aa_dialects::card("codex").unwrap().specs();
+        let specs = crate::dialects::card("codex").unwrap().specs();
         assert_eq!(unit.agent.spec.command.program, "codex");
         assert_eq!(unit.agent.spec.command.args, specs[0].command.args);
         assert_eq!(unit.agent.spec.command.args, ["app-server", "--stdio"]);

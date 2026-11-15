@@ -16,5 +16,6 @@ hits both on `PATH` and in install directories. What exists on a machine
 is a runtime fact, never an
 install-time assumption; a host pairs each detection with
 `awp::lookup_preset` to offer one-step registration for agents already
-installed. Discovery lives behind the `dialects` feature (on by default)
-beside the card registry.
+installed. Discovery probes every adapter compiled into the build — the
+`dialects` feature enables all of them, a single adapter feature enables
+one, and a build with no adapter feature reports nothing.

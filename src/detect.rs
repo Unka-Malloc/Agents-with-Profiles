@@ -96,10 +96,11 @@ impl Machine {
     }
 }
 
-/// Probe every known agent card against this machine, in catalog order.
+/// Probe every agent card compiled into this build against this machine, in
+/// adapter order.
 pub fn scan() -> Vec<Detection> {
     probe_cards(
-        a4aa_dialects::cards().map(|(id, card)| (id, &card.detect)),
+        crate::dialects::cards().map(|(id, card)| (id, &card.detect)),
         &Machine::local(),
     )
 }
@@ -428,9 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn scan_covers_every_card_in_catalog_order() {
+    fn scan_covers_every_compiled_in_card() {
         let detections = scan();
-        let cards: Vec<_> = a4aa_dialects::cards().collect();
+        let cards: Vec<_> = crate::dialects::cards().collect();
         assert_eq!(detections.len(), cards.len());
         for (detection, (id, card)) in detections.iter().zip(cards) {
             assert_eq!(detection.id, id);

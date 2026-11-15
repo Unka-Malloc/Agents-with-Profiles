@@ -89,32 +89,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "a4aa-dialects"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a53afcdcb999ece60e075f374face19ef8c05298ef8446e8358c7a4519d2e93"
-dependencies = [
- "a4aa",
- "a4aa-antigravity",
- "a4aa-claude",
- "a4aa-codex",
- "a4aa-command-code",
- "a4aa-copilot",
- "a4aa-cursor",
- "a4aa-devin",
- "a4aa-dsh",
- "a4aa-factory",
- "a4aa-grok",
- "a4aa-hermes",
- "a4aa-kilo-code",
- "a4aa-kimi-code",
- "a4aa-kiro",
- "a4aa-open-claw",
- "a4aa-opencode",
- "a4aa-pi",
-]
-
-[[package]]
 name = "a4aa-dsh"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -284,9 +258,23 @@ name = "agents-with-profiles"
 version = "0.2.1"
 dependencies = [
  "a4aa",
+ "a4aa-antigravity",
+ "a4aa-claude",
  "a4aa-codex",
+ "a4aa-command-code",
+ "a4aa-copilot",
+ "a4aa-cursor",
  "a4aa-devin",
- "a4aa-dialects",
+ "a4aa-dsh",
+ "a4aa-factory",
+ "a4aa-grok",
+ "a4aa-hermes",
+ "a4aa-kilo-code",
+ "a4aa-kimi-code",
+ "a4aa-kiro",
+ "a4aa-open-claw",
+ "a4aa-opencode",
+ "a4aa-pi",
  "async-trait",
  "jiff",
  "serde",

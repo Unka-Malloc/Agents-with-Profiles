@@ -2,7 +2,10 @@
 //! and registry-level validation. Adaptation itself is covered in a4aa's
 //! mechanisms tests — here only the profile-side wiring is exercised.
 
-use awp::{HookEvent, Registry, RegistryDocument, Support};
+#[cfg(any(feature = "codex", feature = "devin"))]
+use awp::Support;
+use awp::{HookEvent, Registry, RegistryDocument};
+#[cfg(feature = "devin")]
 use std::path::Path;
 
 const DOC: &str = r#"{
@@ -95,6 +98,7 @@ fn malformed_mechanisms_fail_atomically() {
     assert_eq!(mechanisms.hooks.len(), 1);
 }
 
+#[cfg(feature = "codex")]
 #[test]
 fn resolved_agent_carries_mechanisms_for_adaptation() {
     let registry = Registry::from_json(DOC).unwrap();
@@ -113,6 +117,7 @@ fn resolved_agent_carries_mechanisms_for_adaptation() {
         .all(|entry| entry.support != Support::Unsupported || entry.item == "permissions"));
 }
 
+#[cfg(feature = "devin")]
 #[test]
 fn semantic_mechanisms_materialize_through_devin() {
     // The same agent-neutral declarations drive a4aa-devin's surfaces:

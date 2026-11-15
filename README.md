@@ -86,6 +86,23 @@ per `session/prompt`, compose `turn.instructions` into the text per
 `instructionMode`. See
 [docs/integration.md](docs/integration.md).
 
+## Feature selection
+
+`dialects` (default) compiles every `a4aa-<agent>` adapter; `presets`
+(default) adds the six headless-agent presets. A host that drives one agent
+can keep exactly one descriptor:
+
+```toml
+[dependencies]
+agents-with-profiles = { version = "0.2", default-features = false, features = ["pi"] }
+```
+
+That dependency tree contains `a4aa` and `a4aa-pi` only.
+`awp::dialects::dialect("pi")` and `awp materialize --dialect pi` work;
+names of adapters that were not compiled in stay unknown. `presets` alone
+enables `codex`, `cursor`, `dsh`, `hermes`, `opencode` and `pi` because it
+materializes their cards.
+
 ## Documentation
 
 Entry point: [docs/README.md](docs/README.md) — the
@@ -97,7 +114,8 @@ adaptation dialects.
 ## Verify
 
 ```sh
-scripts/verify.sh   # fmt + clippy + cargo test --all-targets
+scripts/verify.sh          # fmt + clippy + tests + trimmed build gates
+scripts/feature-matrix.sh  # check/test every trimmed feature combination
 ```
 
 ## Status

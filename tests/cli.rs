@@ -73,3 +73,56 @@ fn run_exits_with_turn_output() {
     assert!(status.success(), "exit status: {status}");
     assert_eq!(stdout.trim_end(), "hello-run");
 }
+
+/// `materialize` resolves `--dialect codex` through the compiled-in catalog,
+/// including the single-adapter build (`--features codex`).
+#[cfg(feature = "codex")]
+#[test]
+fn materialize_uses_the_compiled_in_dialect() {
+    let dir = std::env::temp_dir().join(format!("awp-materialize-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("registry.json");
+    std::fs::write(
+        &config,
+        r#"{
+  "agents": {
+    "codex": {"id": "codex", "lane": "cli", "command": {"program": "codex"}}
+  },
+  "profiles": {
+    "reviewer": {
+      "agent": "codex",
+      "mechanisms": {"rules": [{"name": "core", "content": "Never guess."}]}
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_awp"))
+        .args([
+            "materialize",
+            "--config",
+            config.to_str().unwrap(),
+            "--profile",
+            "reviewer",
+            "--dialect",
+            "codex",
+        ])
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        output.status.success(),
+        "materialize failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["dialect"], "codex");
+    assert!(
+        plan["artifacts"]
+            .as_array()
+            .is_some_and(|artifacts| !artifacts.is_empty()),
+        "materialize emitted no artifacts: {plan}"
+    );
+}

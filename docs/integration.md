@@ -98,30 +98,42 @@ A profile's `mechanisms` section declares hooks, rules, skills, commands,
 subagents, plugins, permissions, config-file MCP servers and native-profile
 selection in semantic, dialect-free form. Adaptation lives in the
 `a4aa-<agent>` crates — each agent's descriptor is its own installable
-package, so a host picks exactly one:
+package, and AwP exposes one Cargo feature per adapter:
 
 ```toml
 [dependencies]
-agents-with-profiles = "0.2"
-a4aa-pi = "0.4"   # the only adapter compiled in
+# The built-in catalog for exactly one adapter: a4aa + a4aa-pi, nothing else.
+agents-with-profiles = { version = "0.2", default-features = false, features = ["pi"] }
 ```
 
 ```rust
-// AwP parses and resolves; the adapter crate owns the agent's dialect.
+// AwP parses and resolves; the enabled adapter owns the agent's dialect.
 let mechanisms = agent.profile().mechanisms.clone().unwrap_or_default();
-let plan = a4aa_pi::adapt(&mechanisms); // or a4aa::adapt(a4aa_pi::dialect(), &set)
+let dialect = awp::dialects::dialect("pi").expect("pi feature enabled");
+let plan = dialect.adapt(&mechanisms); // equivalently a4aa_pi::adapt(&mechanisms)
 ```
 
-Multi-agent tooling can instead depend on `a4aa-dialects` (a name→`Dialect`
-registry over all adapter crates) — that is what `awp materialize` does:
+A host can also depend on the adapter crate directly and leave AwP's catalog
+out of the build:
+
+```toml
+[dependencies]
+agents-with-profiles = { version = "0.2", default-features = false }
+a4aa-pi = "0.5"   # the only adapter compiled in
+```
+
+Multi-agent tooling enables `dialects` (every adapter) and uses the name
+index — that is what `awp materialize` does:
 
 ```sh
 awp materialize --config awp.json --profile reviewer --dialect codex
 ```
 
-The `materialize` subcommand is behind the `dialects` cargo feature, on by
-default. Building `agents-with-profiles` with `default-features = false`
-drops `a4aa-dialects` entirely — the library itself needs no adapter crate.
+`materialize` resolves names against the adapters compiled into the build.
+`default-features = false` compiles no adapter at all; adding one adapter
+feature compiles exactly that descriptor plus `a4aa`. `presets` enables the
+six adapters whose cards it launches (`codex`, `cursor`, `dsh`, `hermes`,
+`opencode`, `pi`), and `dialects` enables all seventeen.
 
 ```jsonc
 {

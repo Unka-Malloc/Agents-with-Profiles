@@ -19,19 +19,69 @@ name = "awp"
 path = "src/bin/awp.rs"
 
 [features]
-# `dialects` powers `awp materialize --dialect <name>` through the
-# a4aa-dialects registry. It is on by default so the CLI works out of the
-# box; hosts embedding awp as a library can disable default features and
-# depend on exactly one `a4aa-<agent>` crate instead.
-# `presets` is the canonical headless-agent launch library consumed by `va
-# profile add --preset`. It needs the card registry to copy spawn argv.
+# Every adapter is its own feature so a single-agent host compiles exactly
+# the descriptor it drives. `dialects` enables all of them for multi-agent
+# hosts and keeps `awp materialize --dialect <name>` working out of the box;
+# it is on by default. `presets` needs the cards of the six headless agents
+# it launches, so it enables those adapters rather than every dialect.
 default = ["dialects", "presets"]
-dialects = ["dep:a4aa-dialects"]
-presets = ["dialects"]
+dialects = [
+    "antigravity",
+    "claude",
+    "codex",
+    "commandcode",
+    "copilot",
+    "cursor",
+    "devin",
+    "dsh",
+    "factory",
+    "grok",
+    "hermes",
+    "kilocode",
+    "kimicode",
+    "kiro",
+    "openclaw",
+    "opencode",
+    "pi",
+]
+antigravity = ["dep:a4aa-antigravity"]
+claude = ["dep:a4aa-claude"]
+codex = ["dep:a4aa-codex"]
+commandcode = ["dep:a4aa-command-code"]
+copilot = ["dep:a4aa-copilot"]
+cursor = ["dep:a4aa-cursor"]
+devin = ["dep:a4aa-devin"]
+dsh = ["dep:a4aa-dsh"]
+factory = ["dep:a4aa-factory"]
+grok = ["dep:a4aa-grok"]
+hermes = ["dep:a4aa-hermes"]
+kilocode = ["dep:a4aa-kilo-code"]
+kimicode = ["dep:a4aa-kimi-code"]
+kiro = ["dep:a4aa-kiro"]
+openclaw = ["dep:a4aa-open-claw"]
+opencode = ["dep:a4aa-opencode"]
+pi = ["dep:a4aa-pi"]
+presets = ["codex", "cursor", "dsh", "hermes", "opencode", "pi"]
 
 [dependencies]
 a4aa = "0.5.1"
-a4aa-dialects = { version = "0.5", optional = true }
+a4aa-antigravity = { version = "0.5", optional = true }
+a4aa-claude = { version = "0.5", optional = true }
+a4aa-codex = { version = "0.5", optional = true }
+a4aa-command-code = { version = "0.5", optional = true }
+a4aa-copilot = { version = "0.5", optional = true }
+a4aa-cursor = { version = "0.5", optional = true }
+a4aa-devin = { version = "0.5", optional = true }
+a4aa-dsh = { version = "0.5", optional = true }
+a4aa-factory = { version = "0.5", optional = true }
+a4aa-grok = { version = "0.5", optional = true }
+a4aa-hermes = { version = "0.5", optional = true }
+a4aa-kilo-code = { version = "0.5", optional = true }
+a4aa-kimi-code = { version = "0.5", optional = true }
+a4aa-kiro = { version = "0.5", optional = true }
+a4aa-open-claw = { version = "0.5", optional = true }
+a4aa-opencode = { version = "0.5", optional = true }
+a4aa-pi = { version = "0.5", optional = true }
 async-trait = "0.1"
 jiff = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -48,7 +98,5 @@ tokio = { version = "1", features = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-# Direct single-agent adapter dependency: the tests drive a resolved
-# profile's mechanisms through one adapter crate, no registry involved.
-a4aa-codex = "0.5"
-a4aa-devin = "0.5"
+# Adapter-specific tests live behind the matching feature, so a trimmed test
+# build never compiles an adapter the selected feature set did not ask for.

@@ -236,45 +236,45 @@ async fn resolve() -> i32 {
 // ----------------------------- materialize -------------------------------
 
 async fn materialize() -> i32 {
-    // `args` is only consumed under the `dialects` feature.
-    #[allow(unused_variables)]
     let args = match parse_args() {
         Ok(args) => args,
         Err(e) => return usage_error(&e),
     };
-    #[cfg(not(feature = "dialects"))]
-    {
-        return failure(
-            "materialize needs the `dialects` feature (a4aa-dialects); \
-             single-agent hosts can call a4aa_<agent>::adapt() directly",
-        );
-    }
-    #[cfg(feature = "dialects")]
-    {
-        let name = match args.dialect.as_deref() {
-            Some(name) => name,
-            None => return usage_error("--dialect is required"),
-        };
-        let dialect = match a4aa_dialects::dialect(name) {
-            Some(dialect) => dialect,
-            None => return usage_error(&format!("unknown dialect: {name}")),
-        };
-        let registry = match load_registry(&args) {
-            Ok(registry) => registry,
-            Err(e) => return failure(&e),
-        };
-        let agent = match select_agent(&args, &registry) {
-            Ok(agent) => agent,
-            Err(e) => return failure(&e),
-        };
-        let mechanisms = agent.profile().mechanisms.clone().unwrap_or_default();
-        let plan = dialect.adapt(&mechanisms);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&plan).unwrap_or_default()
-        );
-        0
-    }
+    let name = match args.dialect.as_deref() {
+        Some(name) => name,
+        None => return usage_error("--dialect is required"),
+    };
+    let dialect = match awp::dialects::dialect(name) {
+        Some(dialect) => dialect,
+        None => {
+            let enabled: Vec<_> = awp::dialects::names().collect();
+            if enabled.is_empty() {
+                return failure(
+                    "no dialect adapter is compiled in; rebuild with --features codex \
+                     (or another a4aa-<agent> feature)",
+                );
+            }
+            return usage_error(&format!(
+                "unknown dialect: {name}; compiled in: {}",
+                enabled.join(", ")
+            ));
+        }
+    };
+    let registry = match load_registry(&args) {
+        Ok(registry) => registry,
+        Err(e) => return failure(&e),
+    };
+    let agent = match select_agent(&args, &registry) {
+        Ok(agent) => agent,
+        Err(e) => return failure(&e),
+    };
+    let mechanisms = agent.profile().mechanisms.clone().unwrap_or_default();
+    let plan = dialect.adapt(&mechanisms);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&plan).unwrap_or_default()
+    );
+    0
 }
 
 // --------------------------------- run ----------------------------------

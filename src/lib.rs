@@ -28,6 +28,12 @@
 //!   hosts in any language can feed it to `a4aa serve` and get identical
 //!   profile semantics without reimplementing the merge rules.
 //!
+//! Adapter selection is per Cargo feature: `default-features = false` plus
+//! one adapter feature (for example `codex`) compiles exactly that
+//! `a4aa-<agent>` descriptor; the `dialects` feature enables all seventeen
+//! for multi-agent hosts, and `presets` enables the six presets it launches.
+//! [`dialects`] resolves names only against the adapters compiled in.
+//!
 //! Design invariants (inherited from a4aa where they apply):
 //!
 //! - **Zero-assumption output.** The crate never imposes a schema on agent
@@ -41,15 +47,14 @@
 //!   all; a failed `apply` leaves the previous registry intact.
 
 pub mod agent;
-#[cfg(feature = "dialects")]
 pub mod detect;
+pub mod dialects;
 #[cfg(feature = "presets")]
 pub mod preset;
 pub mod profile;
 pub mod registry;
 
 pub use agent::{compose_prompt, VirtualAgent, VirtualSession};
-#[cfg(feature = "dialects")]
 pub use detect::{scan as detect_agents, Detection};
 pub use jiff;
 #[cfg(feature = "presets")]

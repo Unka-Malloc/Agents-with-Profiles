@@ -419,3 +419,230 @@ fn secret_recipe_resolution_formats() {
 
     let _ = std::fs::remove_dir_all(temp_dir);
 }
+
+fn secret_case(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("awp-{label}-{}", test_secret("case")));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn file_recipe(format: FixtureFormat, path: &std::path::Path, key: &str) -> awp::SecretRecipe {
+    let file = awp::FileSecret {
+        path: path.to_str().unwrap().into(),
+        key: key.into(),
+    };
+    match format {
+        FixtureFormat::Toml => awp::SecretRecipe::Toml { toml: file },
+        FixtureFormat::Yaml => awp::SecretRecipe::Yaml { yaml: file },
+        FixtureFormat::Json => awp::SecretRecipe::Json { json: file },
+    }
+}
+
+/// A path missing from its declared table must not borrow a same-named
+/// leaf from a different table: that would inject the wrong credential
+/// instead of failing closed.
+#[test]
+fn file_secret_does_not_fall_back_to_a_leaf_in_another_table() {
+    let dir = secret_case("secret-missing-path");
+
+    let toml_path = dir.join("missing.toml");
+    std::fs::write(
+        &toml_path,
+        "[credentials]\nscope = \"missing\"\n[other]\ntoken = \"leaf-elsewhere\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "credentials.token").resolve(),
+        None
+    );
+
+    let yaml_path = dir.join("missing.yaml");
+    std::fs::write(
+        &yaml_path,
+        "credentials:\n  scope: missing\nother:\n  token: leaf-elsewhere\n",
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &yaml_path, "credentials.token").resolve(),
+        None
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Three-segment keys resolve only under their declared table, and an
+/// unrelated table holding the same leaf stays invisible.
+#[test]
+fn three_segment_file_secret_resolves_only_under_its_table() {
+    let dir = secret_case("secret-three-segment");
+
+    let toml_path = dir.join("three.toml");
+    std::fs::write(
+        &toml_path,
+        concat!(
+            "credentials.token = \"toml-dotted\"\n",
+            "[auth.nested]\nkey = \"toml-expected\"\n",
+            "[other.nested]\nkey = \"toml-wrong\"\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "auth.nested.key")
+            .resolve()
+            .as_deref(),
+        Some("toml-expected")
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "other.nested.key")
+            .resolve()
+            .as_deref(),
+        Some("toml-wrong")
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "missing.nested.key").resolve(),
+        None
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "credentials.token")
+            .resolve()
+            .as_deref(),
+        Some("toml-dotted")
+    );
+
+    let yaml_path = dir.join("three.yaml");
+    std::fs::write(
+        &yaml_path,
+        concat!(
+            "auth:\n  nested:\n    key: yaml-expected\n",
+            "other:\n  nested:\n    key: yaml-wrong\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &yaml_path, "auth.nested.key")
+            .resolve()
+            .as_deref(),
+        Some("yaml-expected")
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &yaml_path, "missing.nested.key").resolve(),
+        None
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A YAML sequence has no dotted-path selector, so mapping keys inside an
+/// item must never be assembled into the dotted path of the key that owns
+/// the sequence.
+#[test]
+fn file_secret_ignores_sequence_item_mappings() {
+    let dir = secret_case("secret-yaml-sequence");
+
+    let yaml_path = dir.join("sequence.yaml");
+    std::fs::write(
+        &yaml_path,
+        concat!(
+            "auth:\n",
+            "  nested:\n",
+            "    - name: first\n",
+            "      key: masquerade\n",
+            "    -\n",
+            "      key: masquerade-again\n",
+            "  direct:\n",
+            "    key: real\n",
+        ),
+    )
+    .unwrap();
+    for key in ["auth.nested.key", "auth.nested.name"] {
+        assert_eq!(
+            file_recipe(FixtureFormat::Yaml, &yaml_path, key).resolve(),
+            None,
+            "{key} must not resolve from a sequence item"
+        );
+    }
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &yaml_path, "auth.direct.key")
+            .resolve()
+            .as_deref(),
+        Some("real")
+    );
+
+    // The sequence may sit at the same indentation as the key that owns it;
+    // a following sibling mapping must still resolve.
+    let indentless_path = dir.join("indentless.yaml");
+    std::fs::write(
+        &indentless_path,
+        concat!(
+            "auth:\n",
+            "  nested:\n",
+            "  - name: first\n",
+            "    key: masquerade\n",
+            "  direct:\n",
+            "    key: real\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &indentless_path, "auth.nested.key").resolve(),
+        None
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &indentless_path, "auth.direct.key")
+            .resolve()
+            .as_deref(),
+        Some("real")
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A `#` inside a quoted value is data, not the start of an inline comment.
+#[test]
+fn file_secret_preserves_a_hash_inside_a_quoted_value() {
+    let dir = secret_case("secret-quoted-hash");
+
+    let toml_path = dir.join("quoted.toml");
+    std::fs::write(
+        &toml_path,
+        concat!(
+            "[credentials]\n",
+            "token = \"double # value\" # trailing comment\n",
+            "literal = 'single # value' # trailing comment\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "credentials.token")
+            .resolve()
+            .as_deref(),
+        Some("double # value")
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "credentials.literal")
+            .resolve()
+            .as_deref(),
+        Some("single # value")
+    );
+
+    let yaml_path = dir.join("quoted.yaml");
+    std::fs::write(
+        &yaml_path,
+        "credentials:\n  token: \"double # value\" # trailing comment\n  literal: 'single # value' # trailing comment\n",
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &yaml_path, "credentials.token")
+            .resolve()
+            .as_deref(),
+        Some("double # value")
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &yaml_path, "credentials.literal")
+            .resolve()
+            .as_deref(),
+        Some("single # value")
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}

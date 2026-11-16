@@ -80,7 +80,9 @@ pub enum SecretRecipe {
 pub struct FileSecret {
     /// File path; `{home}` expands to the user's home directory.
     pub path: String,
-    /// Key or dotted key path (`section.sub.key`) inside the file.
+    /// Exact key or dotted key path (`section.sub.key`) inside the file.
+    /// A leaf name is never matched outside the table the path declares,
+    /// and a YAML sequence item has no dotted-path selector.
     pub key: String,
 }
 
@@ -149,17 +151,235 @@ fn expand_home(raw: &str) -> String {
     raw.replace("{home}", &home)
 }
 
-fn clean_val(raw: &str) -> String {
+/// Remove an inline comment without treating a `#` inside a quoted scalar
+/// as the start of one. TOML starts a comment at any unquoted `#`; YAML
+/// requires the `#` to be separated from the preceding character.
+fn strip_inline_comment(line: &str, yaml: bool) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('"') => {
+                if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            Some('\'') => {
+                if character == '\'' {
+                    // YAML doubles a single quote to escape it; TOML literal
+                    // strings have no escape and close at the first quote.
+                    if yaml && line[index + 1..].starts_with('\'') {
+                        escaped = true;
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            Some(_) => {}
+            None => match character {
+                '"' => quote = Some('"'),
+                '\'' => quote = Some('\''),
+                '#' => {
+                    let separated = index == 0
+                        || line[..index]
+                            .chars()
+                            .next_back()
+                            .is_some_and(char::is_whitespace);
+                    if !yaml || separated {
+                        return line[..index].trim_end();
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    line.trim_end()
+}
+
+/// Find `separator` outside quoted keys and values. For YAML a `:` only
+/// separates a mapping key when whitespace or the end of the line follows.
+fn find_separator(line: &str, separator: char, yaml: bool) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('"') => {
+                if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            Some('\'') => {
+                if character == '\'' {
+                    if yaml && line[index + 1..].starts_with('\'') {
+                        escaped = true;
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            Some(_) => {}
+            None => {
+                if character == '"' || character == '\'' {
+                    quote = Some(character);
+                } else if character == separator {
+                    let rests_empty_or_spaced = line[index + 1..]
+                        .chars()
+                        .next()
+                        .is_none_or(char::is_whitespace);
+                    if !yaml || rests_empty_or_spaced {
+                        return Some(index);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Split a dotted path into segments, honoring quoted segments that may
+/// contain a dot themselves.
+fn dotted_path(raw: &str) -> Vec<String> {
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, character) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('"') => {
+                if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => {}
+            None => match character {
+                '"' | '\'' => quote = Some(character),
+                '.' => {
+                    segments.push(unquote_path_segment(&raw[start..index]));
+                    start = index + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    segments.push(unquote_path_segment(&raw[start..]));
+    segments
+}
+
+fn unquote_path_segment(raw: &str) -> String {
     let trimmed = raw.trim();
-    let without_comment = if let Some((before, _)) = trimmed.split_once(" #") {
-        before.trim()
+    if trimmed.starts_with('"') {
+        parse_double_quoted(trimmed).unwrap_or_default()
+    } else if let Some(literal) = trimmed.strip_prefix('\'') {
+        literal
+            .find('\'')
+            .map(|end| literal[..end].to_owned())
+            .unwrap_or_default()
     } else {
-        trimmed
+        trimmed.to_owned()
+    }
+}
+
+/// Decode a double-quoted string with its common escapes. The closing
+/// quote ends the scalar; anything after it is syntax the caller ignores.
+fn parse_double_quoted(raw: &str) -> Option<String> {
+    let mut value = String::new();
+    let mut characters = raw.strip_prefix('"')?.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => return Some(value),
+            '\\' => match characters.next()? {
+                'b' => value.push('\u{0008}'),
+                't' => value.push('\t'),
+                'n' => value.push('\n'),
+                'f' => value.push('\u{000c}'),
+                'r' => value.push('\r'),
+                '"' => value.push('"'),
+                '\\' => value.push('\\'),
+                escape @ ('u' | 'U') => {
+                    let width = if escape == 'u' { 4 } else { 8 };
+                    let digits: String = characters.by_ref().take(width).collect();
+                    let decoded = u32::from_str_radix(&digits, 16)
+                        .ok()
+                        .and_then(char::from_u32)?;
+                    value.push(decoded);
+                }
+                other => {
+                    value.push('\\');
+                    value.push(other);
+                }
+            },
+            _ => value.push(character),
+        }
+    }
+    None
+}
+
+fn parse_toml_value(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let value = if raw.starts_with('"') {
+        parse_double_quoted(raw)?
+    } else if let Some(literal) = raw.strip_prefix('\'') {
+        let end = literal.find('\'')?;
+        literal[..end].to_owned()
+    } else {
+        raw.to_owned()
     };
-    without_comment
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_owned()
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn parse_yaml_value(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let value = if raw.starts_with('"') {
+        parse_double_quoted(raw)?
+    } else if raw.starts_with('\'') {
+        let mut value = String::new();
+        let mut characters = raw.strip_prefix('\'')?.chars();
+        loop {
+            match characters.next()? {
+                '\'' if characters.as_str().starts_with('\'') => {
+                    characters.next();
+                    value.push('\'');
+                }
+                '\'' => break value,
+                character => value.push(character),
+            }
+        }
+    } else {
+        raw.to_owned()
+    };
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn extract_json_key(text: &str, key: &str) -> Option<String> {
@@ -184,88 +404,91 @@ fn extract_json_key(text: &str, key: &str) -> Option<String> {
 }
 
 fn extract_toml_key(text: &str, key: &str) -> Option<String> {
-    let parts: Vec<&str> = key.split('.').collect();
-    if parts.len() == 2 {
-        let section = parts[0];
-        let subkey = parts[1];
-        let mut in_section = false;
-        for line in text.lines().map(str::trim) {
-            if line.starts_with('[') && line.ends_with(']') {
-                let name = line[1..line.len() - 1].trim();
-                in_section = name == section;
-                continue;
-            }
-            if in_section {
-                if let Some((k, v)) = line.split_once('=') {
-                    if k.trim() == subkey {
-                        let val = clean_val(v);
-                        if !val.is_empty() {
-                            return Some(val);
-                        }
-                    }
-                }
-            }
-        }
+    let target = dotted_path(key);
+    if target.is_empty() {
+        return None;
     }
-    let target = parts.last().copied().unwrap_or(key);
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('#') || line.starts_with('[') {
+    let mut table: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let line = strip_inline_comment(raw, false).trim();
+        if line.is_empty() {
             continue;
         }
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == target || k.trim() == key {
-                let val = clean_val(v);
-                if !val.is_empty() {
-                    return Some(val);
-                }
-            }
+        if line.starts_with('[') && line.ends_with(']') {
+            let name = line.trim_start_matches('[').trim_end_matches(']').trim();
+            table = dotted_path(name);
+            continue;
+        }
+        let Some(equals) = find_separator(line, '=', false) else {
+            continue;
+        };
+        let mut path = table.clone();
+        path.extend(dotted_path(&line[..equals]));
+        if path == target {
+            return parse_toml_value(&line[equals + 1..]);
         }
     }
     None
 }
 
 fn extract_yaml_key(text: &str, key: &str) -> Option<String> {
-    let parts: Vec<&str> = key.split('.').collect();
-    if parts.len() > 1 {
-        let mut current_idx = 0;
-        let mut current_indent = 0;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let indent = line.len() - line.trim_start().len();
-            let target = parts[current_idx];
-            if let Some((k, v)) = trimmed.split_once(':') {
-                let k = k.trim();
-                if k == target {
-                    if current_idx == parts.len() - 1 {
-                        let val = clean_val(v);
-                        if !val.is_empty() {
-                            return Some(val);
-                        }
-                    } else if v.trim().is_empty() {
-                        current_idx += 1;
-                        current_indent = indent;
-                    }
-                }
-            } else if current_idx > 0 && indent <= current_indent {
-                current_idx = 0;
-            }
-        }
+    let target = dotted_path(key);
+    if target.is_empty() {
+        return None;
     }
-    let target = parts.last().copied().unwrap_or(key);
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('#') {
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    // Indentation of the block sequence currently being scanned. A sequence
+    // index cannot be named by the dotted mapping path this contract
+    // supports, so nothing inside an item may be assembled into that path.
+    let mut sequence_indent: Option<usize> = None;
+    for raw in text.lines() {
+        let line = strip_inline_comment(raw, true);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed == "..." {
             continue;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim() == target || k.trim() == key {
-                let val = clean_val(v);
-                if !val.is_empty() {
-                    return Some(val);
-                }
+        let indent = line.len() - line.trim_start().len();
+        if let Some(sequence) = sequence_indent {
+            if indent > sequence {
+                // A descendant of a sequence item, not of the mapping key
+                // that owns the sequence.
+                continue;
             }
+            sequence_indent = None;
+        }
+        if trimmed == "-" || trimmed.starts_with("- ") {
+            while stack
+                .last()
+                .is_some_and(|(parent_indent, _)| *parent_indent >= indent)
+            {
+                stack.pop();
+            }
+            sequence_indent = Some(indent);
+            continue;
+        }
+        while stack
+            .last()
+            .is_some_and(|(parent_indent, _)| *parent_indent >= indent)
+        {
+            stack.pop();
+        }
+        let Some(colon) = find_separator(trimmed, ':', true) else {
+            continue;
+        };
+        let segment = unquote_path_segment(&trimmed[..colon]);
+        if segment.is_empty() {
+            continue;
+        }
+        let value = &trimmed[colon + 1..];
+        let mut path: Vec<String> = stack.iter().map(|(_, key)| key.clone()).collect();
+        path.push(segment.clone());
+        if path == target {
+            if let Some(value) = parse_yaml_value(value) {
+                return Some(value);
+            }
+        }
+        if value.trim().is_empty() {
+            stack.push((indent, segment));
         }
     }
     None

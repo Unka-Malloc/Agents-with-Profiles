@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `FileSecret` TOML/YAML resolution matches the exact dotted path inside its
+  declared table; a missing path no longer borrows a same-named leaf from
+  another entry. Inline comments are stripped quote-aware, so a quoted value
+  containing `#` is preserved.
+- A prompt-stage `AdapterError` with `uncertainEffect` is no longer replayed
+  on another model or lane, because the first attempt may already have
+  produced billed output. A CLI error outcome that produced output or usage
+  is returned instead of being discarded by an alternate lane.
 - Availability window `HH:MM` bounds now require exactly two ASCII digits
   per field, and `23:59` is minute 1439 — the exclusive `to` bound — rather
   than an alias for `24:00`; `24:00` remains the explicit end-of-day
@@ -39,26 +47,9 @@
   `PATH` hit instead of reporting the agent absent. `PATHEXT` is read
   from the environment with the cmd.exe default set as fallback; Unix
   resolution is unchanged.
-- Release train regenerated under its final names: `.github/release.py`
-  replaces `release-train.py`, and `.github/release.lock` records the
-  engine revision plus digests of its templates, this repository's
-  declaration and each generated output, so a regeneration always travels
-  with a verifiable source record. `publish.yml` fires only on the
-  `verify` train's `workflow_run` completion — always the default
-  branch's own copy; there is deliberately no dispatch trigger and no tag
-  path on the OIDC file. Its gate binds the run to a succeeded
-  `verify.yml` on the default branch and derives live/dry-run and the
-  release kind from metadata GitHub minted — the run's event and the
-  signed verify job name (`sig=1`/`sched=`/`rehearse`/`version`/`level`/
-  `cand=`), never from the `release-inputs` artifact, whose only fields
-  are `sha` and `release`. The release job runs in the protected
-  `release` environment — a live publish always meets that approval —
-  and recomputes the version decision and the publish order from the
-  bound commit inside the OIDC job; a scheduled train stays a rehearsal.
-  Releasing manually means dispatching `verify.yml` on the default
-  branch with `rehearse: false`, optionally naming `version`, `level` or
-  `candidate`; the run still flows into `publish.yml` and through the
-  environment gate.
+- The generated release train was removed. `docs/releasing.md` records the
+  manual `cargo publish` path for this single package instead of the former
+  `verify.yml`/`publish.yml` OIDC train and its lock file.
 
 ## 0.2.0
 

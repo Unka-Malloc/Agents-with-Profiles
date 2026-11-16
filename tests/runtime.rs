@@ -11,7 +11,7 @@ use awp::{
     RegistryDocument, SessionRequest, TurnRequest,
 };
 #[cfg(unix)]
-use awp::{EnvValue, PromptChannel, RpcCallSpec, RpcLaneSpec};
+use awp::{EnvPolicy, EnvValue, PromptChannel, RpcCallSpec, RpcLaneSpec};
 #[cfg(unix)]
 use serde_json::json;
 #[cfg(unix)]
@@ -823,6 +823,115 @@ async fn exhausted_model_chain_never_reaches_alternate_lane() {
 
     let error = session.prompt("work".to_owned()).await.unwrap_err();
     assert_eq!(error.code, "agent_quota_exhausted");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_error_outcome_with_output_does_not_replay_on_alternate_lane() {
+    // The primary exits non-zero after printing a turn. Its output is
+    // already paid and visible in the event stream, so the alternate lane
+    // must not run the same prompt again and replace that result.
+    let registry = registry_with_lanes(
+        cli_spec(
+            "paid",
+            "sh",
+            &["-c", "exec 0<&-; echo paid-output; exit 1"],
+            PromptChannel::Stdin,
+        ),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("paid".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert!(
+        outcome.text.contains("paid-output"),
+        "completed output is retained: {outcome:?}"
+    );
+    assert!(!outcome.text.contains("alt|"), "alternate did not replay");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn uncertain_prompt_failure_does_not_replay_on_alternate_lane() {
+    // The primary prints a chunk and then reports a usage limit. The
+    // refusal is uncertain-effect: replaying it on the alternate would
+    // duplicate a turn that may already have been billed.
+    let registry = registry_with_lanes(
+        cli_spec(
+            "uncertain",
+            "sh",
+            &[
+                "-c",
+                "exec 0<&-; echo partial; echo 'usage limit reached' >&2; exit 1",
+            ],
+            PromptChannel::Stdin,
+        ),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("uncertain".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert!(error.uncertain_effect);
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn uncertain_prompt_failure_does_not_advance_the_model_chain() {
+    // A quota refusal after streamed output is uncertain-effect even when
+    // the model chain has another entry. Advancing it would resubmit the
+    // full prompt and duplicate the paid turn.
+    let mut primary = quota_fixture_spec("prime,fallback", "prime");
+    let EnvPolicy::Sanitized { set, .. } = &mut primary.command.env else {
+        panic!("quota fixture uses a sanitized environment");
+    };
+    set.insert(
+        "AWP_FIXTURE_QUOTA_AFTER_OUTPUT".to_owned(),
+        EnvValue::Literal("1".to_owned()),
+    );
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("fixture".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert!(error.uncertain_effect);
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
     session.close().await.unwrap();
 }
 

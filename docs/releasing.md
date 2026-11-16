@@ -1,71 +1,38 @@
 # Releasing the crate
 
-Releases run on the generated release train under `.github/workflows/`:
-`verify.yml` selects, verifies and packages a candidate; `publish.yml`
-holds the only job trusted with the crates.io OIDC identity. Both files
-are generated from the release declaration recorded in
-`.github/release.lock` — regenerate them instead of editing by hand.
+This repository publishes the single package `agents-with-profiles` (library
+and binary `awp`) manually from a reviewed default-branch commit. There is no
+generated release train and no publishing workflow.
 
-## The two workflows
+The package depends on `a4aa`; publish a new `a4aa` before this crate when the
+release needs one.
 
-- **`verify.yml` — the verify train.** Every Friday it rehearses a
-  release of the last commit merged into the default branch before the
-  23:59 UTC+08:00 cutoff, bumping by the highest
-  `release:patch|minor|major` label among the candidate's pull requests
-  (patch when none is set). A manual dispatch releases the head of the
-  default branch — or the `candidate` input's commit — at the exact
-  `version` input or at a `level` bump; `rehearse: true` runs the whole
-  pipeline as a dry-run with nothing pushed, tagged or uploaded.
-- **`publish.yml` — the release side.** `workflow_run` on the completed
-  `verify` train is its only trigger — there is deliberately no
-  `workflow_dispatch` and no tag path on the OIDC file — so the workflow
-  that executes under the publishing identity is always the default
-  branch's own copy. Its gate binds the run to a succeeded `verify.yml`
-  execution on the default branch and derives live/dry-run and the
-  release kind from metadata GitHub minted — the run's event and the
-  signed verify job name (`sig=1`/`sched=`/`rehearse`/`version`/`level`/
-  `cand=`), never from the `release-inputs` artifact, whose only fields
-  are `sha` and `release`. The release job runs in the `release`
-  environment, recomputes the version decision from the bound commit,
-  bumps the workspace, promotes it to `stable`, uploads the crates in
-  dependency-first order through crates.io Trusted Publishing — no stored
-  secret — then tags `v<next>`, moves `release` and merges the tag back
-  into the bound source branch.
+## Before publishing
 
-A candidate identical to the last published release is skipped; a rerun
-after a partial upload finishes the same version instead of skipping
-past it.
+1. Bump `version` in `Cargo.toml` — this is one package, so there is no
+   separate version file to bump.
+2. Move the `Unreleased` notes in `CHANGELOG.md` under the new version.
+3. Run `./scripts/verify.sh` — formatting, clippy with warnings denied, and
+   the full test suite. `./scripts/feature-matrix.sh` covers the trimmed
+   feature combinations.
+4. Run `cargo package --list` and `cargo publish --dry-run`; check that the
+   packaged surface is the intended one and that every dependency version is
+   already available from crates.io.
 
-## Releasing manually
+## Publishing
 
-Dispatch `verify.yml` on the default branch with `rehearse: false`,
-optionally naming `version`, `level` or `candidate`. A live
-(non-rehearsal) run flows into `publish.yml` and still meets the
-`release` environment's approval; a scheduled train stays a rehearsal
-and never publishes.
+1. Commit the version bump and changelog, and merge that commit to the default
+   branch.
+2. Tag that commit `v<version>` and push the tag.
+3. From that commit, run `cargo publish --locked` with a crates.io token that
+   may publish `agents-with-profiles`; use `--dry-run` first when unsure.
+4. Confirm the crates.io page or `cargo info agents-with-profiles` reports the
+   new version.
 
-## One-time infrastructure
+Local checks prove the candidate; only `cargo publish` uploads.
 
-Two settings live outside the generated files and are created once per
-repository:
+## Credentials
 
-- A `release` environment with required reviewers and a
-  deployment-branch rule allowing only the default branch. The
-  environment — not the in-file ref check, which stays as a second
-  lock — is what confines a dispatch's reach.
-- crates.io Trusted Publishing for the crate bound to that `release`
-  environment and to `publish.yml` as the workflow filename — registries
-  mint the OIDC token for that file, which is why the publishing job
-  lives there and not in `verify.yml`.
-
-## Manual checks (fallback)
-
-When the train itself is unavailable the same gates still run locally:
-
-1. `./scripts/verify.sh` — formatting, clippy with warnings denied, the
-   whole workspace test suite.
-2. `cargo package --list` and `cargo publish --dry-run` — the packaged
-   surface is the intended one.
-
-Local checks prove the candidate; uploading stays with the train's OIDC
-identity and never runs from a local checkout.
+`cargo publish` reads its registry token from Cargo's credentials store
+(`~/.cargo/credentials.toml`) or `CARGO_REGISTRY_TOKEN`. Never commit a token,
+place one in this repository, or pass it on a command line.

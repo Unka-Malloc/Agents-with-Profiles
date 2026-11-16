@@ -452,6 +452,18 @@ const MODEL_EXHAUSTION: &[&str] = &[
     "invalid 'authorization' header",
 ];
 
+/// A failure whose effect is uncertain may already have produced and billed
+/// output. Opening a session or applying a selector happens before a model
+/// turn, so those stages keep their existing progression; a prompt-stage
+/// failure is propagated instead of replaying a possibly duplicated turn.
+fn uncertain_turn(error: &a4aa::AdapterError) -> bool {
+    error.uncertain_effect
+        && !matches!(
+            error.stage,
+            "session/open" | "session/set_model" | "session/set_config_option"
+        )
+}
+
 /// A requested model the agent cannot express (`agent_configuration_unavailable`
 /// names the rejected slot in its detail).
 fn model_rejected(error: &a4aa::AdapterError) -> bool {
@@ -672,6 +684,10 @@ impl VirtualSession {
                 let outcome = loop {
                     let outcome = session.read().await.prompt(request.clone()).await;
                     let next = match &outcome {
+                        // The prompt may already have produced billed output.
+                        // Advancing the model and resubmitting would duplicate
+                        // that turn, so the uncertain failure is propagated.
+                        Err(error) if uncertain_turn(error) => break outcome,
                         // The model itself could not serve this turn:
                         // advance the chain and resubmit — the lane's own
                         // configuration surface applies the per-turn model
@@ -695,6 +711,11 @@ impl VirtualSession {
                     request.model = Some(next);
                 };
                 let lane_failed = match &outcome {
+                    // A prompt-stage failure with uncertain effect may have
+                    // produced billed output that is already in the event
+                    // stream; replaying it on another lane would duplicate
+                    // the turn and discard the completed work.
+                    Err(error) if uncertain_turn(error) => break 'lanes outcome,
                     // The whole model chain exhausted on this lane — the
                     // failure is provider-side, so the caller's next
                     // profile is the right escalation, not another lane.
@@ -702,8 +723,14 @@ impl VirtualSession {
                     Err(_) => true,
                     // A lane that reports the turn as failed without an
                     // error channel — cli's nonzero exit surfaces as
-                    // `stop_reason: "error"` — could not serve this turn.
-                    Ok(result) => result.stop_reason == "error",
+                    // `stop_reason: "error"` — could not serve this turn
+                    // only when it also produced no output and reported no
+                    // usage. Output or usage proves the paid turn ran.
+                    Ok(result) => {
+                        result.stop_reason == "error"
+                            && result.text.trim().is_empty()
+                            && result.usage.is_none()
+                    }
                 };
                 if !lane_failed {
                     break 'lanes outcome;

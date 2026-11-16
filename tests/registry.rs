@@ -156,8 +156,8 @@ fn overlay_replacement_carries_host_declarations() {
     let base: RegistryDocument = serde_json::from_value(json!({
         "agents": {
             "a": rpc_agent(
-                json!([{"name": "project-automation", "command": "pa", "args": [], "env": []}]),
-                json!(["project-automation"])
+                json!([{"name": "test-tools", "command": "tt", "args": [], "env": []}]),
+                json!(["test-tools"])
             )
         },
         "profiles": {"p": {"agent": "a"}}
@@ -178,10 +178,10 @@ fn overlay_replacement_carries_host_declarations() {
         panic!("rpc lane");
     };
     assert_eq!(rpc.mcp_servers.len(), 1);
-    assert_eq!(rpc.mcp_servers[0]["name"], "project-automation");
+    assert_eq!(rpc.mcp_servers[0]["name"], "test-tools");
     assert_eq!(
         rpc.mcp_config.as_ref().unwrap().tools_approval_servers,
-        ["project-automation"]
+        ["test-tools"]
     );
     let awp::EnvPolicy::InheritAll { set } = &agent.command.env else {
         panic!("fidelity policy survives");

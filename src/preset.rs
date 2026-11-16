@@ -449,10 +449,9 @@ mod tests {
             let LaneSpec::Rpc(rpc) = &mut entry.spec.lane else {
                 panic!("codex drives the rpc lane");
             };
-            rpc.mcp_config.as_mut().unwrap().tools_approval_servers =
-                vec!["project-automation".into()];
+            rpc.mcp_config.as_mut().unwrap().tools_approval_servers = vec!["test-tools".into()];
             rpc.mcp_servers = vec![serde_json::json!({
-                "name": "project-automation", "command": "pa", "args": [], "env": []
+                "name": "test-tools", "command": "tt", "args": [], "env": []
             })];
             let EnvPolicy::InheritAll { set } = &mut entry.spec.command.env else {
                 panic!("presets inherit the host environment");
@@ -467,7 +466,7 @@ mod tests {
         };
         assert_eq!(
             rpc.mcp_config.as_ref().unwrap().tools_approval_servers,
-            ["project-automation"]
+            ["test-tools"]
         );
         assert_eq!(rpc.mcp_servers.len(), 1);
         let EnvPolicy::InheritAll { set } = &entry.spec.command.env else {

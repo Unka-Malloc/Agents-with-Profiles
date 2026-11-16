@@ -389,6 +389,8 @@ fn failure(message: &str) -> i32 {
 ///   and honors `session/set_config_option`; `AWP_FIXTURE_QUOTA=m1` makes
 ///   prompts answered while `m1` is current fail with a provider
 ///   rate-limit error — the model-fallback test surface.
+///   `AWP_FIXTURE_QUOTA_AFTER_OUTPUT=1` streams a chunk before that error
+///   so the refusal carries uncertain effect.
 fn fixture_agent() -> i32 {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -405,6 +407,10 @@ fn fixture_agent() -> i32 {
         .filter(|entry| !entry.is_empty())
         .map(str::to_owned)
         .collect();
+    // Stream one chunk before the quota error so the refusal carries
+    // `uncertain_effect`: the prompt may already have produced billed work.
+    let quota_after_output =
+        std::env::var("AWP_FIXTURE_QUOTA_AFTER_OUTPUT").is_ok_and(|value| value == "1");
     let mut current_model = models.first().cloned().unwrap_or_default();
 
     let write = |value: Value| {
@@ -501,6 +507,17 @@ fn fixture_agent() -> i32 {
                     continue;
                 }
                 if quota.iter().any(|m| m == &current_model) {
+                    if quota_after_output {
+                        write(json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id.clone(),
+                                "update": {"sessionUpdate": "agent_message_chunk",
+                                           "content": {"type": "text", "text": "partial"}}
+                            }
+                        }));
+                    }
                     write(json!({
                         "jsonrpc": "2.0", "id": id.unwrap_or(Value::Null),
                         "error": {"code": -32000,

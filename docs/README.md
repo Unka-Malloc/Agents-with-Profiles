@@ -11,5 +11,5 @@
 - [agent-capabilities.md](agent-capabilities.md) — survey of each agent's
   native mechanisms (hook dialects, plugins, subagents, rules, skills, MCP,
   permissions) for the CAwP layer that maps profile declarations onto them.
-- [releasing.md](releasing.md) — the release train contract and the
-  one-time repository/registry infrastructure it depends on.
+- [releasing.md](releasing.md) — the manual `cargo publish` procedure and the
+  pre-release checks for this crate.

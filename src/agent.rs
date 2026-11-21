@@ -330,6 +330,16 @@ impl VirtualAgent {
                     .await;
                 match result {
                     Err(error) if model_failure(&error) => {
+                        // Only a setup call that consumes the model can
+                        // answer about it: where the open binds nothing —
+                        // the model is only a stored default feeding later
+                        // prompts — every retry re-sends the identical
+                        // call, so the refusal is the lane's answer and
+                        // the walk moves on.
+                        if !model_binds_at_open(spec, resuming(&lane_request)) {
+                            lane_error = Some(error);
+                            break None;
+                        }
                         let Some(next) = next_model(&chain, lane_request.config.model.as_deref())
                         else {
                             // Model exhaustion is provider-side: remaining
@@ -760,6 +770,12 @@ impl EventRelay {
     /// queue so a just-arrived event cannot be missed.
     fn billable(&self) -> bool {
         self.evidence.billable.load(Ordering::Acquire)
+    }
+
+    /// The armed window's output flag — read after `flush` settled the
+    /// queue so a just-arrived event cannot be missed.
+    fn output(&self) -> bool {
+        self.evidence.output.load(Ordering::Acquire)
     }
 
     /// Close the window and read the attempt's `(output, billable)`
@@ -1817,9 +1833,14 @@ impl VirtualSession {
                 // and that decides how a chain retry applies the next
                 // entry: a per-turn surface takes it on the request, a
                 // session-bound one re-establishes the session.
-                let (probe, relay) = {
+                let (probe, relay, active_spec, installed_open) = {
                     let lane = lane.lock().await;
-                    (lane.probe.clone(), lane.relay.clone())
+                    (
+                        lane.probe.clone(),
+                        lane.relay.clone(),
+                        lane.specs[lane.index].clone(),
+                        lane.open.clone(),
+                    )
                 };
                 let (turn_selectors, session_model) = {
                     let guard = session.read().await;
@@ -1936,8 +1957,20 @@ impl VirtualSession {
                     // dispatch probe offers no wire evidence at all.
                     if let Some(accepted) = pending_model.take() {
                         let confirmed = match &outcome {
+                            // A served turn confirms the candidate; an
+                            // `error` outcome confirms it only with
+                            // positive work evidence — text, truncation,
+                            // usage or output the attempt produced — the
+                            // same reading the lane-fallback decision
+                            // makes of an unserved turn.
                             Ok(result) => {
                                 !matches!(result.stop_reason.as_str(), "cancelled" | "interrupted")
+                                    && (result.stop_reason != "error"
+                                        || !result.text.is_empty()
+                                        || result.truncated
+                                        || result.usage.is_some()
+                                        || relay.output()
+                                        || probe.wire_event())
                             }
                             Err(error) => {
                                 !model_failure(error) && (billed || probe.dispatch_confirmed(error))
@@ -1998,10 +2031,27 @@ impl VirtualSession {
                     // default publish only when the lane accepts it.
                     let session_bound = if turn_model != SelectorSupport::Unsupported {
                         false
-                    } else if session_model != SelectorSupport::Unsupported {
-                        true
                     } else {
-                        break outcome;
+                        // The retry re-establishes this lane's session to
+                        // bind the candidate — meaningful only when the
+                        // setup call this request actually selects carries
+                        // the model on the wire. The session's aggregate
+                        // rpc support counts `session_resume` even for a
+                        // fresh session that never calls it, which would
+                        // reopen the identical session once per chain
+                        // entry and replay the identical prompt without a
+                        // model.
+                        let binds = match &active_spec.lane {
+                            LaneSpec::Rpc(_) => {
+                                model_binds_at_open(&active_spec, resuming(&installed_open))
+                            }
+                            _ => session_model != SelectorSupport::Unsupported,
+                        };
+                        if binds {
+                            true
+                        } else {
+                            break outcome;
+                        }
                     };
                     model_state
                         .lock()
@@ -2220,6 +2270,11 @@ impl VirtualSession {
                             if closing.load(Ordering::Acquire) {
                                 break 'lanes outcome;
                             }
+                            // The abandoned open never completed — a
+                            // session-bound candidate whose
+                            // model-carrying setup call never dispatched
+                            // goes back to the chain for the next turn.
+                            restore_candidate(&model_state, pending_bind.take());
                             break 'lanes Ok(cancelled_outcome());
                         }
                     };

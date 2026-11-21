@@ -5389,3 +5389,305 @@ async fn cancel_during_quota_refusal_keeps_the_untried_model() {
     );
     session.close().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_initial_open_quota_without_binding_walks_to_next_lane() {
+    // The primary's only model placeholder is in its prompt: the
+    // `session/open` it fails carries no model, so retrying the
+    // identical call cannot answer a quota refusal. The initial open
+    // must not spend the chain on it — the walk moves straight to the
+    // alternate, which binds the chain head and serves.
+    let dir = TestDirectory::new("rpc-initial-open-quota");
+    let refusing = dir.path().join("rpc_refuse_open.py");
+    std::fs::write(&refusing, RPC_QUOTA_REFUSES_OPEN).unwrap();
+    let refusing_log = dir.path().join("refusing.log");
+    let mut primary = rpc_spec(
+        "refusing",
+        &refusing,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut primary, &refusing_log);
+    let serving = dir.path().join("rpc_serving.py");
+    std::fs::write(&serving, RPC_SESSION_MODEL_LOG).unwrap();
+    let serving_log = dir.path().join("serving.log");
+    let alternate = rpc_session_bound_spec("serving", &serving, &serving_log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("refusing".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned(), "tertiary".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|prime|work");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+    let calls_log = std::fs::read_to_string(&refusing_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open"],
+        "an initial open call that binds no model must not consume the chain: {calls_log}"
+    );
+    let calls_log = std::fs::read_to_string(&serving_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open|prime", "session/prompt|prime"],
+        "the alternate binds the chain head and serves: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_fresh_session_never_retries_through_a_resume_only_selector() {
+    // The lane's only model placeholder sits in `session_resume` — a
+    // call this fresh session never makes. The aggregate session
+    // support still reports model, so a session-bound retry would
+    // reopen the identical fresh session and replay the identical
+    // prompt once per chain entry. With the selected setup call
+    // deciding, the refusal propagates and the chain stays untouched.
+    let dir = TestDirectory::new("rpc-resume-only-retry");
+    let script = dir.path().join("rpc_refuse.py");
+    std::fs::write(&script, RPC_REFUSES_MODEL_AT_PROMPT).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec("refusing", &script, json!({}), json!({"text": "{prompt}"}));
+    rpc_add_resume(&mut primary);
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with(
+        primary,
+        ProfilePatch {
+            agent: Some("refusing".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+
+    // The refusal propagated without consuming `fallback`: the next
+    // turn walks the same single prompt — never a pointless reopen.
+    let error = session.prompt("again".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open|unset",
+            "session/prompt|unset",
+            "session/prompt|unset",
+        ],
+        "a fresh session must not spend the chain on a resume-only selector: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer whose `initialize` handshake sleeps before answering and
+/// whose `session/open` binds the model: a cancel mid-initialize
+/// interrupts the replacement open before the model-carrying call can
+/// dispatch.
+#[cfg(unix)]
+const RPC_SLOW_INIT_SESSION_MODEL: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_model = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "initialize":
+        log.write("initialize\n")
+        log.flush()
+        time.sleep(1.0)
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/open":
+        session_model = params.get("model")
+        log.write("session/open|{}\n".format(session_model))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model") or session_model
+        log.write("session/prompt|{}\n".format(model))
+        log.flush()
+        if model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_during_replacement_initialize_restores_the_untried_model() {
+    // `prime` is refused at the prompt; the session-bound retry removes
+    // `fallback` from the chain and re-opens this lane — but `cancel`
+    // lands while the model-less `initialize` is still in flight,
+    // before the model-carrying `session/open` can dispatch. The
+    // untried candidate goes back to the chain: the next turn's retry
+    // binds it and is served.
+    let dir = TestDirectory::new("rpc-cancel-init-reopen");
+    let script = dir.path().join("rpc_slow_init.py");
+    std::fs::write(&script, RPC_SLOW_INIT_SESSION_MODEL).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_session_bound_spec("init-model", &script, &log);
+    let LaneSpec::Rpc(lane) = &mut primary.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.initialize = Some(RpcCallSpec {
+        method: "initialize".to_owned(),
+        params: json!({}),
+    });
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("init-model".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("work".to_owned()).await })
+    };
+    // The replacement's `initialize` answer is a second out; the cancel
+    // lands mid-handshake by a wide margin.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    session.cancel().await.unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+        .await
+        .expect("the turn outlived cancel during the replacement handshake")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.stop_reason, "cancelled");
+
+    // `fallback` was never dispatched on a model-carrying call: the next
+    // turn's `prime` refusal retries it — and it serves.
+    let outcome = session.prompt("more".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|more");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "initialize",
+            "session/open|prime",
+            "session/prompt|prime",
+            "initialize",
+            "session/prompt|prime",
+            "initialize",
+            "session/open|fallback",
+            "session/prompt|fallback",
+        ],
+        "the cancelled handshake never carried the candidate: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_empty_error_outcome_never_publishes_the_candidate() {
+    // The retry carried `fallback` onto the alternate's per-turn
+    // surface, but the cli process exits before producing anything —
+    // an `error` outcome with no text and no usage is the same
+    // unserved answer the lane-fallback check reads. It must not
+    // publish the candidate: `active_model` and the next implicit
+    // prompt keep the last accepted entry.
+    let dir = TestDirectory::new("cli-error-no-publish");
+    let script = dir.path().join("rpc_quota_close.py");
+    std::fs::write(&script, RPC_QUOTA_THEN_CLOSES_STDIN).unwrap();
+    let primary = rpc_spec(
+        "unaccepted",
+        &script,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    let log = dir.path().join("models.log");
+    let record = format!("echo \"$0\" >> {}; exit 1", log.display());
+    let alternate = cli_spec(
+        "fails",
+        "sh",
+        &["-c", &record, "{model}", "{prompt}"],
+        PromptChannel::ArgOnly,
+    );
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("unaccepted".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+
+    // The unserved candidate never became the default: the next
+    // implicit prompt rides the last accepted model — `prime` — not
+    // the `fallback` the empty error outcome would have published.
+    let outcome = session.prompt("again".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+    let models_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        models_log.lines().collect::<Vec<_>>(),
+        vec!["fallback", "prime"],
+        "an unserved candidate must not publish as the session default: {models_log}"
+    );
+    session.close().await.unwrap();
+}

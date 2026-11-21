@@ -307,9 +307,14 @@ impl VirtualAgent {
         // reads the current turn's verdict cell through it.
         let reservations = ReservationSlot::default();
         let mut lane_error = None;
+        // The chain position the establishment walk reached: candidates a
+        // lane already refused stay spent for every later lane, so the
+        // alternate resumes with the entry the previous lane was
+        // attempting — never the chain head it already proved refused.
+        let mut lane_model = chain.first().cloned();
         for (lane_index, spec) in self.specs.iter().enumerate() {
             let (mut lane_request, turn_model_default, turn_effort_default) =
-                lane_open(spec, &request, &self.profile, chain.first().cloned());
+                lane_open(spec, &request, &self.profile, lane_model.clone());
             // A requested model the lane cannot express at establishment
             // advances the chain before the first turn is even attempted.
             let session = loop {
@@ -340,6 +345,7 @@ impl VirtualAgent {
                         // call, so the refusal is the lane's answer and
                         // the walk moves on.
                         if !refused_call_binds_model(spec, resuming(&lane_request), &probe) {
+                            lane_model = lane_request.config.model.clone().or(lane_model);
                             lane_error = Some(error);
                             break None;
                         }
@@ -357,6 +363,12 @@ impl VirtualAgent {
                         lane_request.config.model = Some(next);
                     }
                     Err(error) => {
+                        // The candidate this lane's walk last attempted
+                        // carries to the next lane: refused entries
+                        // already advanced the request past themselves,
+                        // and a lane that never got to express a model
+                        // leaves the cursor untouched.
+                        lane_model = lane_request.config.model.clone().or(lane_model);
                         lane_error = Some(error);
                         break None;
                     }
@@ -898,6 +910,23 @@ struct SetupJournal {
 struct SecretJournal {
     outcomes: Vec<(String, bool)>,
     phase_start: usize,
+}
+
+/// The two facts one call's own resolutions can leave on a name —
+/// tracked separately because `substitute_resolved` keeps them in
+/// different places: a lookup that returned a value leaves the name in
+/// `values`, where every embedded token substitutes it, while any empty
+/// lookup lands the name on `absent`, the list a whole-leaf member
+/// drops on. Two lookups of one name inside a single call can disagree,
+/// so both facts can hold at once.
+#[derive(Clone, Copy, Default)]
+struct SecretPresence {
+    /// At least one lookup in this call's slice returned a value —
+    /// embedded `{secret:NAME}` tokens substitute it.
+    value: bool,
+    /// At least one lookup in this call's slice came back empty —
+    /// a whole-leaf `{secret:NAME}` member drops.
+    absent: bool,
 }
 
 /// The selector values a call's params template resolves against — the
@@ -1528,7 +1557,7 @@ impl DispatchProbe {
         journal: &SecretJournal,
         calls: &[SetupWire],
         index: usize,
-    ) -> std::collections::BTreeMap<String, bool> {
+    ) -> std::collections::BTreeMap<String, SecretPresence> {
         let offset: usize = calls
             .iter()
             .take(index)
@@ -1542,7 +1571,7 @@ impl DispatchProbe {
     fn prompt_secrets_view(
         &self,
         journal: &SecretJournal,
-    ) -> std::collections::BTreeMap<String, bool> {
+    ) -> std::collections::BTreeMap<String, SecretPresence> {
         let offset: usize = self
             .turn_calls
             .iter()
@@ -1552,14 +1581,15 @@ impl DispatchProbe {
     }
 
     /// The presence records inside one call's outcome slice: a
-    /// duplicate name keeps the failed resolution — the adapter's
+    /// duplicate name accumulates both facts — the adapter's `values`
+    /// keeps a returned value for embedded substitution while its
     /// `absent` list persists once a lookup came back empty, matching
     /// `vars`.
     fn secret_slice(
         journal: &SecretJournal,
         offset: usize,
         count: usize,
-    ) -> std::collections::BTreeMap<String, bool> {
+    ) -> std::collections::BTreeMap<String, SecretPresence> {
         journal
             .outcomes
             .iter()
@@ -1569,8 +1599,14 @@ impl DispatchProbe {
                 std::collections::BTreeMap::new(),
                 |mut view, (name, resolved)| {
                     view.entry(name.clone())
-                        .and_modify(|seen| *seen &= resolved)
-                        .or_insert(*resolved);
+                        .and_modify(|seen| {
+                            seen.value |= *resolved;
+                            seen.absent |= !*resolved;
+                        })
+                        .or_insert(SecretPresence {
+                            value: *resolved,
+                            absent: !*resolved,
+                        });
                     view
                 },
             )
@@ -2067,7 +2103,7 @@ fn slot_carries_model(
     path: &[String],
     leaf: &str,
     vars: &ProbeVars,
-    secrets: &std::collections::BTreeMap<String, bool>,
+    secrets: &std::collections::BTreeMap<String, SecretPresence>,
 ) -> bool {
     if !leaf_carries_model(leaf, vars) {
         return false;
@@ -2248,10 +2284,15 @@ enum LeafClass {
     Literal,
 }
 
+/// `whole` distinguishes the two questions a secret name answers: a
+/// whole-leaf member drops on the `absent` list, while an embedded
+/// token substitutes whatever `values` retained — mixed resolutions on
+/// one name carry both facts, so neither collapses into the other.
 fn leaf_class(
     name: &str,
     vars: &ProbeVars,
-    secrets: &std::collections::BTreeMap<String, bool>,
+    secrets: &std::collections::BTreeMap<String, SecretPresence>,
+    whole: bool,
 ) -> LeafClass {
     if vars.absent.contains(name) {
         LeafClass::Absent
@@ -2260,11 +2301,26 @@ fn leaf_class(
     } else if name.starts_with("secret:") {
         // A secret resolves through the adapter's own resolver — the
         // journaled presence is the answer the substitution used. A
-        // resolved secret is present but unreadable; an unresolved one
-        // is absent; before any resolution it is merely possible.
+        // whole-leaf member drops when any lookup in the call's slice
+        // came back empty — a value another lookup retained does not
+        // revive it. An embedded token substitutes whatever a returned
+        // value left in `values`; with no value at all it stays
+        // literal. Before any resolution the name is merely possible.
         match secrets.get(name) {
-            Some(true) => LeafClass::Wild,
-            Some(false) => LeafClass::Absent,
+            Some(presence) if whole => {
+                if presence.absent {
+                    LeafClass::Absent
+                } else {
+                    LeafClass::Wild
+                }
+            }
+            Some(presence) => {
+                if presence.value {
+                    LeafClass::Wild
+                } else {
+                    LeafClass::Absent
+                }
+            }
             None => LeafClass::Flexible,
         }
     } else if vars.wild.contains(name) {
@@ -2296,7 +2352,7 @@ fn whole_placeholder(leaf: &serde_json::Value) -> Option<&str> {
 fn expected_leaf(
     leaf: &str,
     vars: &ProbeVars,
-    secrets: &std::collections::BTreeMap<String, bool>,
+    secrets: &std::collections::BTreeMap<String, SecretPresence>,
 ) -> Option<String> {
     let mut output = String::new();
     let mut rest = leaf;
@@ -2306,7 +2362,7 @@ fn expected_leaf(
         match tail.find(['{', '}']) {
             Some(end) if tail.as_bytes()[end] == b'}' => {
                 let name = &tail[..end];
-                match leaf_class(name, vars, secrets) {
+                match leaf_class(name, vars, secrets, false) {
                     LeafClass::Wild | LeafClass::Flexible => return None,
                     _ => match vars.known.get(name) {
                         // A value the lane put in `values` — an empty
@@ -2340,11 +2396,11 @@ fn expected_leaf(
 fn droppable(
     leaf: &serde_json::Value,
     vars: &ProbeVars,
-    secrets: &std::collections::BTreeMap<String, bool>,
+    secrets: &std::collections::BTreeMap<String, SecretPresence>,
 ) -> bool {
     whole_placeholder(leaf).is_some_and(|name| {
         matches!(
-            leaf_class(name, vars, secrets),
+            leaf_class(name, vars, secrets, true),
             LeafClass::Absent | LeafClass::Flexible
         )
     })
@@ -2364,13 +2420,13 @@ fn resolved_call_consistent(
     template: &serde_json::Value,
     params: &serde_json::Value,
     vars: &ProbeVars,
-    secrets: &std::collections::BTreeMap<String, bool>,
+    secrets: &std::collections::BTreeMap<String, SecretPresence>,
 ) -> bool {
     fn produces(
         template: &serde_json::Value,
         params: &serde_json::Value,
         vars: &ProbeVars,
-        secrets: &std::collections::BTreeMap<String, bool>,
+        secrets: &std::collections::BTreeMap<String, SecretPresence>,
     ) -> bool {
         match (template, params) {
             (serde_json::Value::Object(tmap), serde_json::Value::Object(pmap)) => {
@@ -2405,15 +2461,16 @@ fn resolved_call_consistent(
 fn turn_call_skipped(
     template: &serde_json::Value,
     vars: &ProbeVars,
-    secrets: &std::collections::BTreeMap<String, bool>,
+    secrets: &std::collections::BTreeMap<String, SecretPresence>,
 ) -> bool {
     let serde_json::Value::Object(map) = template else {
         return false;
     };
     !map.is_empty()
         && map.values().all(|leaf| {
-            whole_placeholder(leaf)
-                .is_some_and(|name| matches!(leaf_class(name, vars, secrets), LeafClass::Absent))
+            whole_placeholder(leaf).is_some_and(|name| {
+                matches!(leaf_class(name, vars, secrets, true), LeafClass::Absent)
+            })
         })
 }
 
@@ -3510,6 +3567,16 @@ impl VirtualSession {
             // never publishes, and neither does one whose attempt died
             // before dispatch.
             let mut pending_model: Option<String> = None;
+            // The pending candidate the serving attempt actually carried
+            // and dropped unconfirmed — kept so a refusal attributed to
+            // it can retire the session's stored default: an entry the
+            // provider just refused must not ride every later implicit
+            // prompt on the installed session's stored model.
+            let mut attempted_pending: Option<String> = None;
+            // This turn ends on a re-established session whose stored
+            // default is cleared of the refused pending candidate —
+            // nothing replays on it; the refusal still answers the turn.
+            let mut retire_default = false;
             // Lane events travel through the relay on the lane state: a
             // forwarder task drains the lane's tap into the caller's
             // stream for the session's whole lifetime — a notification
@@ -3798,6 +3865,8 @@ impl VirtualSession {
                                 .unwrap_or_else(|error| error.into_inner());
                             chain.active = Some(accepted);
                             chain.pending = None;
+                        } else {
+                            attempted_pending = Some(accepted);
                         }
                     }
                     // A cancelled outcome can arrive after a model-free
@@ -3928,6 +3997,38 @@ impl VirtualSession {
                 };
                 relay.flush().await;
                 let (emitted_output, emitted_billable) = relay.disarm();
+                // A refused pending candidate is spent — but a session
+                // that stores it as the default would resend it on every
+                // later implicit prompt. The retire is only for a stored
+                // default the open never carried: a model the open itself
+                // bound is a real session binding and keeps the "last
+                // accepted" reading even when a prompt refuses it.
+                // Re-establishing this lane's session with the chain's
+                // last accepted entry retires the poisoned default; the
+                // refusal still answers this turn, nothing replays on the
+                // replacement.
+                if !session_retry
+                    && matches!(&outcome, Err(error) if model_failure(error)
+                        && turn_refusal_binds_model(error, &probe))
+                    && attempted_pending.is_some()
+                    && installed_open.config.model == attempted_pending
+                    && !probe.model_setup_sent()
+                {
+                    session_retry = true;
+                    retire_default = true;
+                    // The refused entry is spent everywhere: a scheduled
+                    // copy rides the same reopen's projection as the
+                    // candidate, and an unconfirmed `pending` claim is no
+                    // longer the chain's awaiting entry — the
+                    // re-established session binds the last accepted one.
+                    driver_model = None;
+                    let mut chain = model_state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if chain.pending == attempted_pending {
+                        chain.pending = None;
+                    }
+                }
                 // A session-bound retry keeps its lane: the session is
                 // reopened below with the accepted model. Any other
                 // outcome answers the lane question from the evidence.
@@ -4268,7 +4369,13 @@ impl VirtualSession {
                             // counted against the reopened lane.
                             lane.relay =
                                 EventRelay::spawn(next_tap_rx, lane.events.clone(), probe.clone());
-                            match pending_bind.take().or_else(|| driver_model.clone()) {
+                            // The same candidate the projection routed:
+                            // a pending entry the installed open
+                            // accepted without carry evidence rides this
+                            // switch exactly like a scheduled one — it
+                            // publishes only once the serving lane's own
+                            // wire carried it.
+                            match pending_bind.take().or_else(|| pending_candidate.clone()) {
                                 // A candidate the lane switch carried and
                                 // bound into the open request is already
                                 // the replacement's session model — the
@@ -4408,6 +4515,12 @@ impl VirtualSession {
                         request.text =
                             compose_prompt(profile.instructions.as_deref(), &request.text);
                         instructions_included = true;
+                    }
+                    // A retire reopen only clears the stored default —
+                    // the refusal already answered this turn, so nothing
+                    // replays on the replacement session.
+                    if retire_default {
+                        break 'lanes outcome;
                     }
                     prior = Some(outcome);
                     continue 'lanes;
@@ -5584,6 +5697,61 @@ mod tests {
             br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
         );
         assert!(probe.refused_turn_binds_model());
+    }
+
+    /// Two lookups of one name inside a single call can disagree: the
+    /// adapter keeps a returned value in `values` for embedded
+    /// substitution while its `absent` list still drops the whole-leaf
+    /// member — `{"auth": "{secret:T}", "hdr": "Bearer {secret:T}"}`
+    /// emits `{"hdr": "Bearer v"}` when the first lookup returned `v`
+    /// and the second came back empty. Collapsing both facts into
+    /// absent mis-reads the real frame's `hdr` as a literal token and
+    /// lets the same-method prompt claim the call's frame.
+    #[test]
+    fn mixed_secret_resolution_drops_the_member_but_substitutes_the_leaf() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                pre_turn: vec![a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"auth": "{secret:AWP_TOKEN}", "hdr": "Bearer {secret:AWP_TOKEN}"}),
+                }],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"payload": "{prompt}|{model}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        probe.reset("work", Some("fallback"), None);
+        // The adapter's own resolutions in substitution order: the
+        // `auth` lookup returned a value, the `hdr` lookup came back
+        // empty — the member drops, the token still substitutes.
+        {
+            let mut secrets = probe
+                .secrets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            secrets.outcomes.push(("secret:AWP_TOKEN".to_owned(), true));
+            secrets
+                .outcomes
+                .push(("secret:AWP_TOKEN".to_owned(), false));
+        }
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/prompt","id":1,"params":{"hdr":"Bearer v"}}"#,
+        );
+        assert!(!probe.dispatched());
+        assert!(!probe.prompt_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        // The refusal answers the model-free preparation call — never
+        // the prompt's model verdict.
+        assert!(!probe.refused_turn_binds_model());
     }
 
     /// A lane with no session call at all leaves `{sessionId}`

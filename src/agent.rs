@@ -18,7 +18,8 @@ use std::sync::Arc;
 use a4aa::{
     Adapter, AgentEvent, AgentSession, AgentSpec, BeforeTurn, Capabilities, Direction, EnvPolicy,
     LaneKind, LaneSpec, Observer, PermissionHandler, SecretResolver, SelectorPhase,
-    SelectorSupport, SessionRequest, SharedObserver, TokenUsage, TurnOutcome, TurnRequest,
+    SelectorSupport, SelectorSupportSet, SessionRequest, SharedObserver, TokenUsage, TurnOutcome,
+    TurnRequest,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -468,6 +469,23 @@ fn next_model(chain: &[String], current: Option<&str>) -> Option<String> {
     match current.and_then(|value| chain.iter().position(|entry| entry == value)) {
         Some(index) => chain.get(index + 1).cloned(),
         None => chain.first().cloned(),
+    }
+}
+
+/// Return a scheduled candidate to the chain when its attempt never
+/// started: the entry left `remaining` at schedule time and no prompt or
+/// open ever carried it, so it is still a viable fallback the next turn
+/// must be allowed to try. A candidate that already published as the
+/// chain's active entry — or one still queued — is not re-added.
+fn restore_candidate(chain: &std::sync::Mutex<ModelChain>, candidate: Option<String>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    let mut chain = chain.lock().unwrap_or_else(|error| error.into_inner());
+    if chain.active.as_deref() != Some(candidate.as_str())
+        && !chain.remaining.iter().any(|entry| entry == &candidate)
+    {
+        chain.remaining.insert(0, candidate);
     }
 }
 
@@ -1458,37 +1476,88 @@ fn model_failure(error: &a4aa::AdapterError) -> bool {
 /// the returned `(request, turn_model, turn_effort)` defaults instead.
 /// Used at open and again on every lane switch — a request normalized for
 /// one lane is never replayed verbatim onto another.
+/// Whether the request resumes an existing session — the adapter's own
+/// normalization: an empty or whitespace-only id opens a fresh session,
+/// so the setup call is `session_open`, never `session_resume`.
+fn resuming(request: &SessionRequest) -> bool {
+    request
+        .resume
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Whether one of the rpc lane's setup calls — `initialize`, or the
+/// session call this request actually selects — consumes one of `names`.
+/// A process-scoped lane has no session calls at all; resuming selects
+/// `session_resume` with `session_open` as fallback, and a fresh session
+/// only ever calls `session_open`, so a `session_resume`-only
+/// placeholder must not read as used by a fresh open.
+fn rpc_setup_uses(rpc: &a4aa::RpcLaneSpec, resuming: bool, names: &[&str]) -> bool {
+    let uses = |call: &a4aa::RpcCallSpec| {
+        names
+            .iter()
+            .any(|name| contains_placeholder(&call.params, name))
+    };
+    let setup = if rpc.session_scope == a4aa::SessionScope::Process {
+        None
+    } else if resuming {
+        rpc.session_resume.as_ref().or(rpc.session_open.as_ref())
+    } else {
+        rpc.session_open.as_ref()
+    };
+    rpc.initialize.as_ref().is_some_and(&uses) || setup.is_some_and(&uses)
+}
+
+/// Session-phase selector support for the setup call this request
+/// actually selects — the same classification the adapter's session
+/// validation applies at open, so a projected value never reaches a
+/// call that cannot consume it. The session model and effort still
+/// count the lane's turn surface: a stored `config` value substitutes
+/// into every later prompt template whether or not a setup call binds
+/// it. Lanes without a per-call classification keep their declared
+/// session support.
+fn session_selectors(spec: &AgentSpec, request: &SessionRequest) -> SelectorSupportSet {
+    let LaneSpec::Rpc(rpc) = &spec.lane else {
+        return spec.selector_support(SelectorPhase::Session);
+    };
+    let resuming = resuming(request);
+    let uses_turn = |names: &[&str]| {
+        let uses = |call: &a4aa::RpcCallSpec| {
+            names
+                .iter()
+                .any(|name| contains_placeholder(&call.params, name))
+        };
+        uses(&rpc.prompt) || rpc.pre_turn.iter().any(uses)
+    };
+    let support = |applied: bool| {
+        if applied {
+            SelectorSupport::Applied
+        } else {
+            SelectorSupport::Unsupported
+        }
+    };
+    SelectorSupportSet {
+        model: support(
+            rpc_setup_uses(rpc, resuming, &["model", "modelProvider", "modelId"])
+                || uses_turn(&["model", "modelProvider", "modelId"]),
+        ),
+        effort: support(rpc_setup_uses(rpc, resuming, &["effort"]) || uses_turn(&["effort"])),
+        mode: support(rpc_setup_uses(rpc, resuming, &["mode"])),
+        permission: support(rpc_setup_uses(rpc, resuming, &["permission"])),
+    }
+}
+
 /// Whether the lane's session establishment consumes the model selector
 /// on the wire — an actual open-time binding — as opposed to storing the
 /// open request's model as the default every later turn inherits. Rpc
-/// mirrors the adapter's own discovery: a `model`, `modelProvider` or
-/// `modelId` placeholder inside `initialize` or inside the session setup
-/// call this request actually selects — a process-scoped lane has no
-/// session calls at all. Resuming selects `session_resume` with
-/// `session_open` as fallback; a fresh session only ever calls
-/// `session_open`, so a `session_resume`-only placeholder must not read
-/// as an open-time binding for a fresh session.
-/// Acp negotiates the model in its session handshake and serve applies
-/// it through the server's model endpoint; cli substitutes it into every
-/// spawn's argv, so its open model is always a stored default.
+/// checks the setup calls the request actually selects. Acp negotiates
+/// the model in its session handshake and serve applies it through the
+/// server's model endpoint; cli substitutes it into every spawn's argv,
+/// so its open model is always a stored default.
 fn model_binds_at_open(spec: &AgentSpec, resuming: bool) -> bool {
     match &spec.lane {
         LaneSpec::Cli(_) => false,
-        LaneSpec::Rpc(rpc) => {
-            let uses = |call: &a4aa::RpcCallSpec| {
-                ["model", "modelProvider", "modelId"]
-                    .iter()
-                    .any(|name| contains_placeholder(&call.params, name))
-            };
-            let setup = if rpc.session_scope == a4aa::SessionScope::Process {
-                None
-            } else if resuming {
-                rpc.session_resume.as_ref().or(rpc.session_open.as_ref())
-            } else {
-                rpc.session_open.as_ref()
-            };
-            rpc.initialize.as_ref().is_some_and(&uses) || setup.is_some_and(&uses)
-        }
+        LaneSpec::Rpc(rpc) => rpc_setup_uses(rpc, resuming, &["model", "modelProvider", "modelId"]),
         _ => spec.selector_support(SelectorPhase::Session).model != SelectorSupport::Unsupported,
     }
 }
@@ -1514,12 +1583,12 @@ fn lane_open(
     profile: &Profile,
     head_model: Option<String>,
 ) -> (SessionRequest, Option<String>, Option<String>) {
-    let session_selectors = spec.selector_support(SelectorPhase::Session);
+    let session_support = session_selectors(spec, request);
     let mut turn_model_default = None;
     let mut turn_effort_default = None;
     let mut lane_request = request.clone();
     if lane_request.config.model.is_none() {
-        if session_selectors.model != SelectorSupport::Unsupported {
+        if session_support.model != SelectorSupport::Unsupported {
             lane_request.config.model = head_model;
         } else {
             turn_model_default = head_model;
@@ -1529,7 +1598,7 @@ fn lane_open(
         lane_request.config.mode = profile.mode.clone();
     }
     if lane_request.config.effort.is_none() {
-        if session_selectors.effort != SelectorSupport::Unsupported {
+        if session_support.effort != SelectorSupport::Unsupported {
             lane_request.config.effort = profile.effort.clone();
         } else {
             turn_effort_default = profile.effort.clone();
@@ -1820,6 +1889,10 @@ impl VirtualSession {
                         ));
                     }
                     if cancellation.load(Ordering::Acquire) != cancel_mark {
+                        // A scheduled candidate the cancelled retry never
+                        // dispatched goes back to the chain: the next turn
+                        // can still try a model no request carried.
+                        restore_candidate(&model_state, pending_model.take());
                         break 'lanes prior.take().unwrap_or_else(|| Ok(cancelled_outcome()));
                     }
                     // One iteration is one physical prompt attempt: reset
@@ -1908,6 +1981,13 @@ impl VirtualSession {
                         _ => None,
                     };
                     let Some(next) = next else { break outcome };
+                    // A cancellation that landed while the prompt was in
+                    // flight ends the turn with the lane's real answer —
+                    // before the next chain entry is spent on a retry
+                    // that can never dispatch.
+                    if cancellation.load(Ordering::Acquire) != cancel_mark {
+                        break 'lanes outcome;
+                    }
                     // Decide which surface carries the next entry before
                     // spending it: a per-turn selector takes it on the
                     // request, a session-bound selector re-establishes
@@ -2088,7 +2168,7 @@ impl VirtualSession {
                         if new_open.config.model.as_deref() == Some(candidate.as_str())
                             && spec.selector_support(SelectorPhase::Turn).model
                                 != SelectorSupport::Unsupported
-                            && !model_binds_at_open(&spec, new_open.resume.is_some())
+                            && !model_binds_at_open(&spec, resuming(&new_open))
                         {
                             new_open.config.model = model_state
                                 .lock()
@@ -2115,8 +2195,11 @@ impl VirtualSession {
                     // The cancellation mark moved before this candidate's
                     // open even began — the completed attempt's result is
                     // the turn's real answer; replaying nothing is the
-                    // point, not rewriting that result as cancelled.
+                    // point, not rewriting that result as cancelled. A
+                    // session-bound candidate whose reopen never ran
+                    // returns to the chain for the next turn.
                     if cancellation.load(Ordering::Acquire) != cancel_mark {
+                        restore_candidate(&model_state, pending_bind.take());
                         break 'lanes outcome;
                     }
                     // The replacement session opens while the installed
@@ -2213,7 +2296,13 @@ impl VirtualSession {
                                 // the replay ever confirms it. Publish it
                                 // now so a refused or cancelled replay
                                 // cannot leave `active_model` disagreeing
-                                // with the binding the session keeps.
+                                // with the binding the session keeps. It
+                                // is no longer pending, so the shared
+                                // re-projection below replaces the stale
+                                // per-turn default: the next implicit
+                                // prompt must not send the replaced model
+                                // while `active_model` reports the new
+                                // binding.
                                 Some(carried_model)
                                     if lane.open.config.model.as_deref()
                                         == Some(carried_model.as_str()) =>
@@ -2224,7 +2313,6 @@ impl VirtualSession {
                                         .active = Some(carried_model.clone());
                                     driver_model = Some(carried_model.clone());
                                     pending_model = Some(carried_model);
-                                    carried = true;
                                 }
                                 // A candidate deliverable on the lane's
                                 // per-turn surface stays pending until the
@@ -2261,7 +2349,16 @@ impl VirtualSession {
                             // session-bound retry or a fallback's fresh
                             // alternate. The candidate stays pending: the
                             // installed session and the accepted binding
-                            // carry no sign of it.
+                            // carry no sign of it. But only a setup call
+                            // that consumes the model can answer about
+                            // it: where the open binds nothing — the
+                            // model is only a stored default feeding
+                            // later prompts — every retry re-sends the
+                            // identical call, so the refusal is the
+                            // lane's answer and the walk moves on.
+                            if !model_binds_at_open(&spec, resuming(&new_open)) {
+                                continue;
+                            }
                             let next = {
                                 let mut chain = model_state
                                     .lock()
@@ -2281,9 +2378,13 @@ impl VirtualSession {
                         }
                         Err(_) => continue,
                     }
-                    // A carried candidate keeps the last accepted turn
-                    // default until its acceptance evidence lands; the
-                    // effort default is unrelated to the model chain and
+                    // A candidate still pending acceptance on the
+                    // per-turn surface keeps the last accepted turn
+                    // default until its evidence lands; every other
+                    // install re-projects the default — including a
+                    // candidate already bound at open, where the
+                    // replaced lane's default is now stale. The effort
+                    // default is unrelated to the model chain and
                     // always re-projects.
                     if !carried {
                         *turn_model_default

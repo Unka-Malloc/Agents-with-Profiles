@@ -330,13 +330,15 @@ impl VirtualAgent {
                     .await;
                 match result {
                     Err(error) if model_failure(&error) => {
-                        // Only a setup call that consumes the model can
-                        // answer about it: where the open binds nothing —
-                        // the model is only a stored default feeding later
+                        // Only the setup call that produced the refusal
+                        // can answer about the model: where it binds
+                        // nothing — a model-free `initialize` ahead of a
+                        // model-carrying `session/open`, or an open whose
+                        // model is only a stored default feeding later
                         // prompts — every retry re-sends the identical
                         // call, so the refusal is the lane's answer and
                         // the walk moves on.
-                        if !model_binds_at_open(spec, resuming(&lane_request)) {
+                        if !refused_call_binds_model(spec, resuming(&lane_request), &probe) {
                             lane_error = Some(error);
                             break None;
                         }
@@ -862,6 +864,19 @@ struct DispatchProbe {
     /// writer stops at the failed write, so on a `writer_failed` report
     /// the last observed `Sent` names the failed write.
     last_sent_was_prompt: AtomicBool,
+    /// The declared setup calls — `initialize`, `session_open`,
+    /// `session_resume` — whose params template consumes the model. An
+    /// rpc lane reports every setup failure as `rpc/call`, so the last
+    /// request the writer attempted names the call a refusal answers and
+    /// whether a chain entry could change that call's answer.
+    model_setup_methods: Vec<String>,
+    /// Whether the most recent `Sent` frame was a model-carrying setup
+    /// call — the failing call's identity on a setup refusal.
+    last_sent_model_setup: AtomicBool,
+    /// Whether a model-carrying setup call ever reached the wire — an
+    /// open abandoned mid-flight may already have delivered the
+    /// candidate it binds to a peer that never got to reply.
+    model_setup_sent: AtomicBool,
     /// An in-turn notification reached the wire: every id-less inbound
     /// frame after dispatch becomes a lane event, so receipt is output
     /// evidence even when the lane's delivery task has not forwarded it
@@ -892,6 +907,9 @@ impl DispatchProbe {
             expected_prompts: std::sync::Mutex::new(Vec::new()),
             dispatched: AtomicBool::new(false),
             last_sent_was_prompt: AtomicBool::new(false),
+            model_setup_methods: Vec::new(),
+            last_sent_model_setup: AtomicBool::new(false),
+            model_setup_sent: AtomicBool::new(false),
             turn_event: AtomicBool::new(false),
             turn_billable: AtomicBool::new(false),
         };
@@ -938,6 +956,20 @@ impl DispatchProbe {
                     .retain(|(path, _)| !overwritten.contains(path[0].as_str()));
             }
             probe.prompt_carries_text = !probe.prompt_slots.is_empty();
+            probe.model_setup_methods = [
+                rpc.initialize.as_ref(),
+                rpc.session_open.as_ref(),
+                rpc.session_resume.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|call| {
+                ["model", "modelProvider", "modelId"]
+                    .iter()
+                    .any(|name| contains_placeholder(&call.params, name))
+            })
+            .map(|call| call.method.clone())
+            .collect();
         }
         Arc::new(probe)
     }
@@ -976,6 +1008,22 @@ impl DispatchProbe {
     /// transport confirmed failed.
     fn last_write_was_prompt(&self) -> bool {
         self.last_sent_was_prompt.load(Ordering::Acquire)
+    }
+
+    /// Whether the call an open-stage refusal answers carried the model:
+    /// the last request the writer attempted was a model-carrying setup
+    /// call. A refusal from a model-free call — a `quota` answer from a
+    /// `initialize` that binds nothing — repeats identically on every
+    /// retry, so it is the lane's answer, not the model's.
+    fn last_sent_model_setup(&self) -> bool {
+        self.last_sent_model_setup.load(Ordering::Acquire)
+    }
+
+    /// Whether a model-carrying setup call already reached the wire: an
+    /// open abandoned mid-flight may have delivered its candidate to the
+    /// peer even though no reply arrived.
+    fn model_setup_sent(&self) -> bool {
+        self.model_setup_sent.load(Ordering::Acquire)
     }
 
     /// Whether a same-method request frame is this attempt's prompt call
@@ -1053,6 +1101,7 @@ impl DispatchProbe {
             .collect();
         self.dispatched.store(false, Ordering::Release);
         self.last_sent_was_prompt.store(false, Ordering::Release);
+        self.last_sent_model_setup.store(false, Ordering::Release);
         self.turn_event.store(false, Ordering::Release);
         self.turn_billable.store(false, Ordering::Release);
     }
@@ -1285,12 +1334,30 @@ impl Observer for DispatchProbe {
             // record precedes the write, so the last observed `Sent`
             // names the write a `writer_failed` report refers to.
             Direction::Sent => {
-                let prompt = serde_json::from_slice::<serde_json::Value>(bytes)
-                    .ok()
-                    .is_some_and(|frame| self.is_prompt_frame(&frame));
+                let frame = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+                let prompt = frame
+                    .as_ref()
+                    .is_some_and(|frame| self.is_prompt_frame(frame));
                 self.last_sent_was_prompt.store(prompt, Ordering::Release);
                 if prompt {
                     self.dispatched.store(true, Ordering::Release);
+                }
+                // The request the writer attempted last names the call a
+                // setup refusal answers: only a model-carrying setup call
+                // can produce a model answer a chain entry changes.
+                let model_setup = frame.as_ref().is_some_and(|frame| {
+                    frame.get("id").is_some()
+                        && frame
+                            .get(self.method_field.as_str())
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|method| {
+                                self.model_setup_methods.iter().any(|setup| setup == method)
+                            })
+                });
+                self.last_sent_model_setup
+                    .store(model_setup, Ordering::Release);
+                if model_setup {
+                    self.model_setup_sent.store(true, Ordering::Release);
                 }
             }
             // Inbound frames: a response settles a pending call, a request
@@ -1439,6 +1506,19 @@ fn turn_output(event: &AgentEvent, probe: &DispatchProbe) -> bool {
     }
 }
 
+/// Whether an `error`-reported outcome still proves the attempt produced
+/// work: the outcome's own text, truncation mark or usage record, or
+/// in-turn output — every tap event on a lane with no dispatch point,
+/// billable wire evidence on a probed one. A bare turn-start
+/// notification is bookkeeping, not served work.
+fn error_outcome_served(result: &TurnOutcome, emitted_output: bool, probe: &DispatchProbe) -> bool {
+    !result.text.is_empty()
+        || result.truncated
+        || result.usage.is_some()
+        || emitted_output
+        || probe.wire_billable()
+}
+
 /// A requested model the agent cannot express (`agent_configuration_unavailable`
 /// names the rejected slot in its detail).
 fn model_rejected(error: &a4aa::AdapterError) -> bool {
@@ -1575,6 +1655,21 @@ fn model_binds_at_open(spec: &AgentSpec, resuming: bool) -> bool {
         LaneSpec::Cli(_) => false,
         LaneSpec::Rpc(rpc) => rpc_setup_uses(rpc, resuming, &["model", "modelProvider", "modelId"]),
         _ => spec.selector_support(SelectorPhase::Session).model != SelectorSupport::Unsupported,
+    }
+}
+
+/// Whether the call an open-stage model refusal answers carried the
+/// model. Rpc reports every setup failure as `rpc/call`, so the wire
+/// journal names the failing call: only a refusal from a model-carrying
+/// setup call — `session/open`, `session_resume`, or a model-consuming
+/// `initialize` — is an answer about the model worth a chain entry. A
+/// model-free call's refusal repeats identically on every retry, so it
+/// is the lane's answer and the walk moves on. Lanes without wire
+/// visibility keep the declared open-binding reading.
+fn refused_call_binds_model(spec: &AgentSpec, resuming: bool, probe: &DispatchProbe) -> bool {
+    match &spec.lane {
+        LaneSpec::Rpc(_) if probe.has_dispatch_point() => probe.last_sent_model_setup(),
+        _ => model_binds_at_open(spec, resuming),
     }
 }
 
@@ -1966,11 +2061,7 @@ impl VirtualSession {
                             Ok(result) => {
                                 !matches!(result.stop_reason.as_str(), "cancelled" | "interrupted")
                                     && (result.stop_reason != "error"
-                                        || !result.text.is_empty()
-                                        || result.truncated
-                                        || result.usage.is_some()
-                                        || relay.output()
-                                        || probe.wire_event())
+                                        || error_outcome_served(result, relay.output(), &probe))
                             }
                             Err(error) => {
                                 !model_failure(error) && (billed || probe.dispatch_confirmed(error))
@@ -2139,13 +2230,11 @@ impl VirtualSession {
                         // only when it also produced no output and reported no
                         // usage. Output — even when the retained cap dropped
                         // the text entirely or an empty result record hid an
-                        // earlier stream — or usage proves the paid turn ran.
+                        // earlier stream — or usage proves the paid turn ran;
+                        // bookkeeping-only wire activity does not.
                         Ok(result) => {
                             result.stop_reason == "error"
-                                && result.text.is_empty()
-                                && !result.truncated
-                                && result.usage.is_none()
-                                && !(emitted_output || probe.wire_event())
+                                && !error_outcome_served(result, emitted_output, &probe)
                         }
                     }
                 };
@@ -2271,10 +2360,15 @@ impl VirtualSession {
                                 break 'lanes outcome;
                             }
                             // The abandoned open never completed — a
-                            // session-bound candidate whose
-                            // model-carrying setup call never dispatched
-                            // goes back to the chain for the next turn.
-                            restore_candidate(&model_state, pending_bind.take());
+                            // session-bound candidate goes back to the
+                            // chain only when its model-carrying setup
+                            // call never dispatched: one the wire already
+                            // carried may be bound on the peer, and
+                            // restoring it would resend the same setup
+                            // request next turn.
+                            if !probe.model_setup_sent() {
+                                restore_candidate(&model_state, pending_bind.take());
+                            }
                             break 'lanes Ok(cancelled_outcome());
                         }
                     };
@@ -2404,14 +2498,16 @@ impl VirtualSession {
                             // session-bound retry or a fallback's fresh
                             // alternate. The candidate stays pending: the
                             // installed session and the accepted binding
-                            // carry no sign of it. But only a setup call
-                            // that consumes the model can answer about
-                            // it: where the open binds nothing — the
-                            // model is only a stored default feeding
-                            // later prompts — every retry re-sends the
-                            // identical call, so the refusal is the
-                            // lane's answer and the walk moves on.
-                            if !model_binds_at_open(&spec, resuming(&new_open)) {
+                            // carry no sign of it. But only the setup
+                            // call that produced the refusal can answer
+                            // about the model: where it binds nothing —
+                            // a model-free `initialize` ahead of a
+                            // model-carrying `session/open`, or an open
+                            // whose model is only a stored default
+                            // feeding later prompts — every retry
+                            // re-sends the identical call, so the refusal
+                            // is the lane's answer and the walk moves on.
+                            if !refused_call_binds_model(&spec, resuming(&new_open), &probe) {
                                 continue;
                             }
                             let next = {

@@ -9659,9 +9659,10 @@ async fn rpc_omitted_open_fallback_never_publishes() {
     // The open's only model surface is a whole `{modelProvider}` member:
     // the qualified `vnd/prime` resolves it, the refusal advances the
     // chain, and the unqualified `fallback` drops the member entirely —
-    // the peer opens with its own default. The requested fallback was
-    // never on the wire: it must neither publish as active nor leave
-    // the chain — the refused qualified entry stays the served reading.
+    // the peer opens with its own default. The refused entry is spent
+    // and the requested fallback was never on the wire: nothing
+    // publishes — the omitted candidate stays pending until a serving
+    // turn's frame provably carries it, and this prompt carries none.
     let dir = TestDirectory::new("rpc-omitted-open");
     let script = dir.path().join("rpc_provider_open.py");
     std::fs::write(&script, RPC_PROVIDER_OPEN_REFUSES_VENDOR).unwrap();
@@ -9693,15 +9694,377 @@ async fn rpc_omitted_open_fallback_never_publishes() {
     assert_eq!(outcome.text.trim_end(), "served|peerdefault|work");
     assert_eq!(
         session.active_model().as_deref(),
-        Some("vnd/prime"),
-        "the fallback's provider member never reached the wire — it \
-         cannot publish as the session's model"
+        None,
+        "the refused `vnd/prime` is spent and the omitted fallback \
+         never reached the wire — neither publishes as the session's \
+         model"
     );
     let calls_log = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
         calls_log.lines().collect::<Vec<_>>(),
         vec!["session/open|vnd", "session/open|unset", "session/prompt"],
         "the unqualified open omitted the provider member: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that refuses a `vnd` provider at open and echoes the
+/// `model` the prompt actually carries — the serving turn's own proof.
+#[cfg(unix)]
+const RPC_PROVIDER_OPEN_SERVES_CARRIED: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        provider = params.get("provider")
+        log.write("session/open|{}\n".format(provider or "unset"))
+        log.flush()
+        if provider == "vnd":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+            continue
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_serving_turn_commits_the_omitted_open_fallback() {
+    // The open's model surface is a whole `{modelProvider}` member: the
+    // qualified `vnd/prime` resolves it and is refused, the unqualified
+    // `fallback` drops the member and opens the peer's default — the
+    // fallback the session stores was never on the wire. The prompt's
+    // `{model}` slot then carries the stored candidate on the first
+    // implicit turn: a serving turn on the frame that provably carried
+    // it is the commit evidence — the refused head never publishes and
+    // the fallback no longer stays queued.
+    let dir = TestDirectory::new("rpc-omitted-open-carry");
+    let script = dir.path().join("rpc_provider_open.py");
+    std::fs::write(&script, RPC_PROVIDER_OPEN_SERVES_CARRIED).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "carriedopen",
+        &script,
+        json!({"provider": "{modelProvider}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with(
+        primary,
+        ProfilePatch {
+            agent: Some("carriedopen".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    assert_eq!(
+        session.active_model().as_deref(),
+        Some("fallback"),
+        "the serving turn's frame provably carried the fallback — the \
+         pending candidate commits and the refused head stays spent"
+    );
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open|vnd",
+            "session/open|unset",
+            "session/prompt|fallback"
+        ],
+        "the fallback reached the wire on the prompt, not the open: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer whose `session/prompt` method doubles as a configuration
+/// call: a `note` member means the frame is the pre-turn call — served
+/// until the peer has refused a real prompt, failed afterwards. Frames
+/// carrying `payload` are prompts; `prime` payloads are quota-refused.
+#[cfg(unix)]
+const RPC_SHARED_METHOD_PRE_TURN_ERRORS: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+refused = False
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        if "note" in params:
+            log.write("note|{}\n".format(params.get("note") or "unset"))
+            log.flush()
+            if refused:
+                send({"jsonrpc": "2.0", "id": request_id,
+                      "error": {"code": -32603, "message":
+                                "internal failure in configure"}})
+            else:
+                send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        else:
+            payload = params.get("payload", "")
+            log.write("session/prompt|{}\n".format(payload))
+            log.flush()
+            if payload.endswith("prime"):
+                refused = True
+                send({"jsonrpc": "2.0", "id": request_id,
+                      "error": {"code": -32000, "message":
+                                "resource_exhausted: quota exceeded for this model"}})
+            else:
+                send({"jsonrpc": "2.0", "id": request_id,
+                      "result": {"text": "served|{}".format(payload)}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_pre_turn_frame_never_counts_as_the_prompt() {
+    // A model-free pre-turn call shares the prompt's method, and the
+    // prompt's own template mixes `{prompt}` with `{model}` — no
+    // verifiable text position tells the frames apart on the wire. If
+    // the probe owns the frame as the prompt anyway, the pre-turn
+    // call's non-quota failure lands on a dispatched-looking record and
+    // publishes the candidate the prompt never ran. Attributing the
+    // frame to its actual call first keeps dispatch unset: the error
+    // is the lane's answer, the turn falls to the alternate lane, and
+    // the refused `prime` stays the published model.
+    let dir = TestDirectory::new("rpc-shared-method");
+    let script = dir.path().join("rpc_shared_method.py");
+    std::fs::write(&script, RPC_SHARED_METHOD_PRE_TURN_ERRORS).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "sharedmethod",
+        &script,
+        json!({"model": "{model}"}),
+        json!({"payload": "{prompt}|{model}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.pre_turn = vec![RpcCallSpec {
+            method: "session/prompt".to_owned(),
+            params: json!({"note": "configure"}),
+        }];
+    }
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("sharedmethod".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    assert_eq!(
+        session.active_model().as_deref(),
+        Some("prime"),
+        "the prompt never ran for `fallback` — a pre-turn frame's error \
+         cannot publish it"
+    );
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open|prime",
+            "note|configure",
+            "session/prompt|work|prime",
+            "note|configure",
+        ],
+        "the retry's only `session/prompt` frame was the pre-turn call: \
+         {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_agent_lane_without_session_call_keeps_the_id_absent() {
+    // An agent-scoped lane with no session-open call substitutes the
+    // session id it holds — none: `{sessionId}` is known-absent, so the
+    // id-only `session/select` resolves `{}` and the lane skips it. If
+    // the probe leaves the id "maybe present" waiting on a response
+    // that cannot exist, the skipped call claims the model frame and
+    // the quota refusal reads as the lane's answer.
+    let dir = TestDirectory::new("rpc-no-session-call");
+    let script = dir.path().join("rpc_sessionless.py");
+    std::fs::write(&script, RPC_SESSIONLESS_SELECT_REFUSES_PRIME).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "nosessioncall",
+        &script,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.session_open = None;
+        lane.pre_turn = vec![
+            RpcCallSpec {
+                method: "session/select".to_owned(),
+                params: json!({"session": "{sessionId}"}),
+            },
+            RpcCallSpec {
+                method: "session/select".to_owned(),
+                params: json!({"session": "{model}"}),
+            },
+        ];
+    }
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with(
+        primary,
+        ProfilePatch {
+            agent: Some("nosessioncall".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/select|prime",
+            "session/select|fallback",
+            "session/prompt|fallback",
+        ],
+        "no session call exists — the skipped id call cannot claim the \
+         model frame: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_null_params_open_binds_the_session_answer() {
+    // The session call's params template is the default null: the lane
+    // emits `params: null`, and the frame must claim that call — a
+    // matcher that normalizes null to `{}` loses the journaled
+    // identity, the open's answer never settles the session id's
+    // presence, and the skipped id-only select claims the model frame
+    // instead.
+    let dir = TestDirectory::new("rpc-null-open");
+    let script = dir.path().join("rpc_sessionless.py");
+    std::fs::write(&script, RPC_SESSIONLESS_SELECT_REFUSES_PRIME).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "nullopen",
+        &script,
+        serde_json::Value::Null,
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.pre_turn = vec![
+            RpcCallSpec {
+                method: "session/select".to_owned(),
+                params: json!({"session": "{sessionId}"}),
+            },
+            RpcCallSpec {
+                method: "session/select".to_owned(),
+                params: json!({"session": "{model}"}),
+            },
+        ];
+    }
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with(
+        primary,
+        ProfilePatch {
+            agent: Some("nullopen".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open",
+            "session/select|prime",
+            "session/select|fallback",
+            "session/prompt|fallback",
+        ],
+        "the null-params open claimed its call and bound its answer: \
+         {calls_log}"
     );
     session.close().await.unwrap();
 }

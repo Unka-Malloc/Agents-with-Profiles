@@ -308,9 +308,6 @@ impl VirtualAgent {
         let reservations = ReservationSlot::default();
         let mut lane_error = None;
         for (lane_index, spec) in self.specs.iter().enumerate() {
-            // The last candidate this lane's open attempts actually put
-            // on the wire — a refused qualified model whose refusal bound.
-            let mut carried_model: Option<String> = None;
             let (mut lane_request, turn_model_default, turn_effort_default) =
                 lane_open(spec, &request, &self.profile, chain.first().cloned());
             // A requested model the lane cannot express at establishment
@@ -347,10 +344,9 @@ impl VirtualAgent {
                             break None;
                         }
                         // A refusal that binds the model proves the wire
-                        // carried this candidate — remember it so a later
-                        // open that omits its model slot publishes the
-                        // carried entry rather than the phantom request.
-                        carried_model = lane_request.config.model.clone();
+                        // carried this candidate — the entry is spent:
+                        // refused candidates never publish as the
+                        // session's model and the chain moves on.
                         let Some(next) = next_model(&chain, lane_request.config.model.as_deref())
                         else {
                             // Model exhaustion is provider-side: remaining
@@ -373,22 +369,28 @@ impl VirtualAgent {
             // The requested model publishes only with carry evidence: an
             // open whose model slot resolves absent — an unqualified
             // `{modelProvider}` — omits the member, the peer binds its own
-            // default, and the omitted fallback neither publishes nor
-            // leaves the chain. A lane whose establishment call binds
-            // nothing keeps the stored-default reading.
+            // default, and the omitted candidate waits pending until a
+            // serving turn's frame provably carried it. A lane whose
+            // establishment call binds nothing keeps the stored-default
+            // reading, and a refused entry is spent — tracked out of
+            // `active`, `pending` and `remaining` alike.
             let bound = !model_binds_at_open(spec, resuming(&effective_request))
                 || !probe.has_dispatch_point()
                 || probe.model_setup_sent();
-            let active_model = if bound {
-                effective_request
-                    .config
-                    .model
-                    .clone()
-                    .or_else(|| turn_model_default.clone())
+            let (active_model, pending_model) = if bound {
+                (
+                    effective_request
+                        .config
+                        .model
+                        .clone()
+                        .or_else(|| turn_model_default.clone()),
+                    None,
+                )
             } else {
-                carried_model
+                (None, effective_request.config.model.clone())
             };
-            let remaining_models = remaining_models(&chain, active_model.as_deref());
+            let remaining_models =
+                remaining_models(&chain, pending_model.as_deref().or(active_model.as_deref()));
             return Ok(VirtualSession {
                 session: Arc::new(tokio::sync::RwLock::new(session)),
                 profile: self.profile.clone(),
@@ -396,6 +398,7 @@ impl VirtualAgent {
                 turn_effort_default: Arc::new(std::sync::Mutex::new(turn_effort_default)),
                 model_state: Arc::new(std::sync::Mutex::new(ModelChain {
                     active: active_model,
+                    pending: pending_model,
                     remaining: remaining_models,
                 })),
                 lane: Arc::new(tokio::sync::Mutex::new(LaneState {
@@ -480,11 +483,18 @@ impl LaneState {
     }
 }
 
-/// Model fallback state for one session: the model currently selected and
-/// the remaining chain entries a failed turn may advance to.
+/// Model fallback state for one session: the model currently selected,
+/// an accepted-but-unconfirmed candidate, and the remaining chain
+/// entries a failed turn may advance to.
 #[derive(Default)]
 struct ModelChain {
     active: Option<String>,
+    /// The candidate the session's open accepted without carry
+    /// evidence — an open whose model slot resolved absent bound the
+    /// peer's own default, so the stored entry waits here until a
+    /// serving turn's frame provably carried it, then publishes as
+    /// `active`. A refused entry never lands here: it is spent.
+    pending: Option<String>,
     remaining: Vec<String>,
 }
 
@@ -510,17 +520,21 @@ fn next_model(chain: &[String], current: Option<&str>) -> Option<String> {
 /// started: the entry left `remaining` at schedule time and no prompt or
 /// open ever carried it, so it is still a viable fallback the next turn
 /// must be allowed to try. A candidate that already published as the
-/// chain's active entry — or one still queued — is not re-added.
+/// chain's active entry, one still pending the serving lane's carry
+/// evidence — it rides the session's stored model into every prompt
+/// already — or one still queued, is not re-added.
 fn restore_candidate(chain: &std::sync::Mutex<ModelChain>, candidate: Option<String>) {
     let Some(candidate) = candidate else {
         return;
     };
     let mut chain = chain.lock().unwrap_or_else(|error| error.into_inner());
-    if chain.active.as_deref() != Some(candidate.as_str())
-        && !chain.remaining.iter().any(|entry| entry == &candidate)
+    if chain.active.as_deref() == Some(candidate.as_str())
+        || chain.pending.as_deref() == Some(candidate.as_str())
+        || chain.remaining.iter().any(|entry| entry == &candidate)
     {
-        chain.remaining.insert(0, candidate);
+        return;
     }
+    chain.remaining.insert(0, candidate);
 }
 
 /// Provider-side model exhaustion or rejection signatures. Matched against
@@ -870,6 +884,22 @@ struct SetupJournal {
     sent: Vec<SentSetup>,
 }
 
+/// The adapter's secret resolutions in arrival order — presence only,
+/// never a resolved value. `substitute_resolved` resolves a call's
+/// `{secret:NAME}` leaves contiguously, right before the call's frame is
+/// written or the call is skipped, so the slice one call owns is located
+/// by the occurrence counts of the calls issued before it in the same
+/// phase. `phase_start` is where the current phase's first call began
+/// resolving: spawn-time env resolutions precede the setup calls, and
+/// every `reset` opens a fresh turn-phase slice. A presence a later
+/// call's resolution produced therefore never rewrites an earlier
+/// call's skip decision on the same name.
+#[derive(Default)]
+struct SecretJournal {
+    outcomes: Vec<(String, bool)>,
+    phase_start: usize,
+}
+
 /// The selector values a call's params template resolves against — the
 /// subset of the lane's substitution inputs the wire journal can prove.
 /// Values the journal cannot know — secrets and peer-assigned session
@@ -1021,6 +1051,10 @@ struct DispatchProbe {
     /// slot — the request's model reached the wire below the prompt's
     /// own dispatch.
     prompt_model_sent: AtomicBool,
+    /// The prompt template's `{secret:NAME}` occurrence count — the
+    /// width of the outcome slice the prompt's own resolution owns
+    /// after every declared pre-turn call's.
+    prompt_secret_count: usize,
     /// The substituted value each `prompt_slots` leaf must carry on the
     /// prompt call's frame — computed at `reset` from this attempt's
     /// prompt text, so the check is an exact payload comparison rather
@@ -1074,10 +1108,11 @@ struct DispatchProbe {
     /// session call's response supplies or omits it.
     session_id: std::sync::Mutex<SessionIdVar>,
     /// Secret presence journaled by the adapter's own resolutions: each
-    /// `{secret:NAME}` key records whether the resolver produced a value
-    /// — never the value itself — so a skipped secret-only call cannot
-    /// claim a later same-method frame.
-    secrets: Arc<std::sync::Mutex<std::collections::BTreeMap<String, bool>>>,
+    /// `resolve()` records whether the resolver produced a value — never
+    /// the value itself — and the outcome's position names the call
+    /// whose substitution asked for it, so a skipped secret-only call
+    /// cannot claim a later same-method frame on a newer resolution.
+    secrets: Arc<std::sync::Mutex<SecretJournal>>,
     /// Requests journal against `setup_calls` until `reset` opens the
     /// turn phase — the open's calls precede every prompt — and
     /// against `turn_calls` afterwards, so a same-method collision
@@ -1145,6 +1180,7 @@ impl DispatchProbe {
             prompt_slots: Vec::new(),
             prompt_model_slots: Vec::new(),
             prompt_model_sent: AtomicBool::new(false),
+            prompt_secret_count: 0,
             prompt_at_root: false,
             expected_prompts: std::sync::Mutex::new(Vec::new()),
             dispatched: AtomicBool::new(false),
@@ -1158,7 +1194,7 @@ impl DispatchProbe {
             cwd: String::new(),
             session_call: None,
             session_id: std::sync::Mutex::new(SessionIdVar::Absent),
-            secrets: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            secrets: Arc::new(std::sync::Mutex::new(SecretJournal::default())),
             setup_phase: AtomicBool::new(true),
             setup_journal: std::sync::Mutex::new(SetupJournal {
                 claimed: Vec::new(),
@@ -1173,6 +1209,14 @@ impl DispatchProbe {
             turn_event: AtomicBool::new(false),
             turn_billable: AtomicBool::new(false),
         };
+        // Spawn-time env resolutions precede every call's — they occupy
+        // the outcome stream's leading entries in `set`-map order, so
+        // the setup phase's first call slice begins after them.
+        probe
+            .secrets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase_start = env_secret_count(&spec.command.env);
         if let LaneSpec::Cli(cli) = &spec.lane {
             probe.usage_path = cli.usage_path.clone();
             probe.result_selector = cli.result_selector.clone();
@@ -1200,6 +1244,7 @@ impl DispatchProbe {
             probe.usage_path = rpc.usage_path.clone();
             probe.prompt_slots = prompt_slots(&rpc.prompt.params);
             probe.prompt_model_slots = model_slots(&rpc.prompt.params);
+            probe.prompt_secret_count = secret_occurrences(&rpc.prompt.params);
             probe.prompt_at_root = rpc
                 .envelope
                 .as_ref()
@@ -1236,21 +1281,6 @@ impl DispatchProbe {
             probe.session_model = request.config.model.clone();
             probe.session_effort = request.config.effort.clone();
             probe.session_instructions = request.config.instructions.clone();
-            probe.session_id =
-                std::sync::Mutex::new(if rpc.session_scope == a4aa::SessionScope::Process {
-                    // Process-scoped ids are minted per spawn — present on
-                    // the wire but unknowable to the journal.
-                    SessionIdVar::Wild
-                } else {
-                    match request.resume.as_deref().filter(|v| !v.trim().is_empty()) {
-                        // A resume binding is the session id verbatim.
-                        Some(id) => SessionIdVar::Known(id.to_owned()),
-                        // A fresh session's id is assigned by the peer's
-                        // open response — unknowable presence and value
-                        // until that response is journaled.
-                        None => SessionIdVar::Flexible,
-                    }
-                });
             // The session call is the setup list's tail when one exists;
             // only it substitutes the resume binding — `initialize` runs
             // without a session id. Every other setup var is the open
@@ -1266,6 +1296,30 @@ impl DispatchProbe {
                 _ => rpc.session_open.is_some().then(|| setup_calls.len() - 1),
             };
             probe.session_call = session_index;
+            probe.session_id =
+                std::sync::Mutex::new(if rpc.session_scope == a4aa::SessionScope::Process {
+                    // Process-scoped ids are minted per spawn — present on
+                    // the wire but unknowable to the journal.
+                    SessionIdVar::Wild
+                } else {
+                    match (
+                        session_index.is_some(),
+                        request.resume.as_deref().filter(|v| !v.trim().is_empty()),
+                    ) {
+                        // A resume binding is the session id verbatim.
+                        (true, Some(id)) => SessionIdVar::Known(id.to_owned()),
+                        // A fresh session's id is assigned by the peer's
+                        // open response — unknowable presence and value
+                        // until that response is journaled.
+                        (true, None) => SessionIdVar::Flexible,
+                        // No session call exists to assign an id: the
+                        // adapter substitutes the id it holds — none —
+                        // so `{sessionId}` is known-absent, never
+                        // flexible, and an id-only call skips like any
+                        // other call whose leaves all resolved absent.
+                        (false, _) => SessionIdVar::Absent,
+                    }
+                });
             let config_input = |session_id: SessionIdVar| SelectorInput {
                 cwd: &cwd,
                 prompt: "",
@@ -1463,6 +1517,65 @@ impl DispatchProbe {
         self.turn_model_sent.load(Ordering::Acquire)
     }
 
+    /// The presence map for one declared call's own resolutions: the
+    /// adapter resolves a call's `{secret:NAME}` leaves contiguously in
+    /// issue order, so the call owns the `outcomes` slice its occurrence
+    /// count spans. A presence a later call's resolution produced on the
+    /// same name belongs to that call — it never un-skips an earlier
+    /// call whose own resolution came back empty.
+    fn call_secrets(
+        &self,
+        journal: &SecretJournal,
+        calls: &[SetupWire],
+        index: usize,
+    ) -> std::collections::BTreeMap<String, bool> {
+        let offset: usize = calls
+            .iter()
+            .take(index)
+            .map(|call| secret_occurrences(&call.template))
+            .sum();
+        Self::secret_slice(journal, offset, secret_occurrences(&calls[index].template))
+    }
+
+    /// The prompt's own resolutions — it substitutes after every
+    /// declared pre-turn call inside the same turn phase.
+    fn prompt_secrets_view(
+        &self,
+        journal: &SecretJournal,
+    ) -> std::collections::BTreeMap<String, bool> {
+        let offset: usize = self
+            .turn_calls
+            .iter()
+            .map(|call| secret_occurrences(&call.template))
+            .sum();
+        Self::secret_slice(journal, offset, self.prompt_secret_count)
+    }
+
+    /// The presence records inside one call's outcome slice: a
+    /// duplicate name keeps the failed resolution — the adapter's
+    /// `absent` list persists once a lookup came back empty, matching
+    /// `vars`.
+    fn secret_slice(
+        journal: &SecretJournal,
+        offset: usize,
+        count: usize,
+    ) -> std::collections::BTreeMap<String, bool> {
+        journal
+            .outcomes
+            .iter()
+            .skip(journal.phase_start + offset)
+            .take(count)
+            .fold(
+                std::collections::BTreeMap::new(),
+                |mut view, (name, resolved)| {
+                    view.entry(name.clone())
+                        .and_modify(|seen| *seen &= resolved)
+                        .or_insert(*resolved);
+                    view
+                },
+            )
+    }
+
     /// Whether this attempt's prompt frame populated a surviving model
     /// slot — the request's model reached the wire. `true` for lanes
     /// without an observable dispatch point, whose model rides the spawn
@@ -1613,6 +1726,16 @@ impl DispatchProbe {
                 .turn_claimed
                 .iter_mut()
                 .for_each(|claimed| *claimed = false);
+        }
+        {
+            let mut secrets = self
+                .secrets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // The turn phase's first call resolves from here — the
+            // outcomes already journaled belong to env and the open's
+            // setup calls.
+            secrets.phase_start = secrets.outcomes.len();
         }
         *self
             .prompt_id
@@ -1862,6 +1985,106 @@ fn model_slots(template: &serde_json::Value) -> Vec<(Vec<String>, String)> {
     let mut slots = Vec::new();
     walk(template, &mut path, &mut slots);
     slots
+}
+
+/// The `{secret:NAME}` occurrences inside a params template, counted in
+/// the document order the lane's `secret_names` walk produces — the
+/// number of `resolve()` records the adapter writes when it substitutes
+/// this call. An unclosed `secret:` token is literal text, the same
+/// read the lane makes.
+fn secret_occurrences(template: &serde_json::Value) -> usize {
+    match template {
+        serde_json::Value::Object(map) => map.values().map(secret_occurrences).sum(),
+        serde_json::Value::Array(items) => items.iter().map(secret_occurrences).sum(),
+        serde_json::Value::String(leaf) => {
+            let mut count = 0;
+            let mut rest = leaf.as_str();
+            while let Some(open) = rest.find("{secret:") {
+                let tail = &rest[open + 8..];
+                match tail.find('}') {
+                    Some(end) => {
+                        count += 1;
+                        rest = &tail[end + 1..];
+                    }
+                    None => break,
+                }
+            }
+            count
+        }
+        _ => 0,
+    }
+}
+
+/// The `{"secret": "ref"}` env entries the lane resolves before it
+/// issues any call — in `set`-map order, contiguous, so the outcome
+/// stream's setup slice begins after them. Extra env entries the open
+/// request carries are literals and resolve nothing.
+fn env_secret_count(env: &EnvPolicy) -> usize {
+    match env {
+        EnvPolicy::Sanitized { set, .. } | EnvPolicy::InheritAll { set } => set
+            .values()
+            .filter(|value| {
+                matches!(
+                    value,
+                    a4aa::EnvValue::Source(a4aa::EnvSource::Secret { .. })
+                )
+            })
+            .count(),
+    }
+}
+
+/// The params document a journaled request frame carries, normalized
+/// the way the lane's encoder produced it: an inline envelope merges an
+/// object document into the frame root, and a null or absent `params`
+/// member resolves against the template's own shape — an object
+/// template's call emits the empty document, a null template's emits
+/// null. Keeping the null lets a default-null call claim its own frame.
+fn frame_params(
+    frame: &serde_json::Value,
+    call: &SetupWire,
+    overwritten: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
+    if call.params_at_root {
+        strip_overwritten(frame, overwritten)
+    } else {
+        match frame.get("params") {
+            Some(params) if !params.is_null() => params.clone(),
+            _ if call.template.is_object() => serde_json::Value::Object(Default::default()),
+            _ => serde_json::Value::Null,
+        }
+    }
+}
+
+/// Whether the frame's params prove a declared model slot carried a
+/// selector value: the leaf's `{model}`-family token resolved non-empty
+/// under `vars` — a populated field whose model token came back empty
+/// is scaffolding — and the string the frame carries at the slot's
+/// position is the resolved leaf, or at least contains the resolved
+/// token when an unreadable placeholder shares the leaf. The template's
+/// declaration alone never credits a send another call produced.
+fn slot_carries_model(
+    params: &serde_json::Value,
+    path: &[String],
+    leaf: &str,
+    vars: &ProbeVars,
+    secrets: &std::collections::BTreeMap<String, bool>,
+) -> bool {
+    if !leaf_carries_model(leaf, vars) {
+        return false;
+    }
+    let Some(value) = slot_at(params, path).and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    match expected_leaf(leaf, vars, secrets) {
+        Some(expected) => value == expected,
+        None => MODEL_NAMES.iter().any(|name| {
+            leaf.contains(&format!("{{{name}}}"))
+                && vars
+                    .known
+                    .get(*name)
+                    .is_some_and(|known| !known.is_empty() && value.contains(known.as_str()))
+        }),
+    }
 }
 
 /// The journal key for a request id — the same normalization the peer
@@ -2318,15 +2541,16 @@ fn record_progress(record: &serde_json::Value) -> bool {
     .any(claim)
 }
 
-/// The adapter's secret resolver, wrapped to journal each name's
+/// The adapter's secret resolver, wrapped to journal each resolution's
 /// presence for the probe's call matching: `substitute_resolved`
 /// resolves a call's `{secret:NAME}` leaves immediately before that
-/// call's frame is written, so the journaled answer is the presence the
-/// emitting — or skipping — substitution used. Only presence is
-/// recorded, never the secret value itself.
+/// call's frame is written — or the call is skipped — so the outcome's
+/// position in the stream attributes presence to the call whose
+/// substitution asked for it. Only presence is recorded, never the
+/// secret value itself.
 struct ProbeSecrets {
     inner: Arc<dyn SecretResolver>,
-    journal: Arc<std::sync::Mutex<std::collections::BTreeMap<String, bool>>>,
+    journal: Arc<std::sync::Mutex<SecretJournal>>,
 }
 
 #[async_trait::async_trait]
@@ -2336,7 +2560,8 @@ impl SecretResolver for ProbeSecrets {
         self.journal
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(format!("secret:{reference}"), resolved.is_some());
+            .outcomes
+            .push((format!("secret:{reference}"), resolved.is_some()));
         resolved
     }
 }
@@ -2358,69 +2583,34 @@ impl Observer for DispatchProbe {
                 let outbound_response = frame
                     .as_ref()
                     .is_some_and(|frame| self.outbound_response(frame));
-                let prompt = !outbound_response
-                    && frame
-                        .as_ref()
-                        .is_some_and(|frame| self.is_prompt_frame(frame));
-                self.last_sent_was_prompt.store(prompt, Ordering::Release);
-                if prompt {
-                    self.dispatched.store(true, Ordering::Release);
-                    // A surviving model slot marks the frame
-                    // model-carrying only when a `{model}`-family token
-                    // in its leaf resolved to a value under the
-                    // attempt's vars — `provider:{modelProvider}` still
-                    // emits `provider:` for an unqualified candidate, and
-                    // that scaffolding carried no model the peer could
-                    // have bound.
-                    let model_sent = {
-                        let journal = self
-                            .setup_journal
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        self.prompt_model_slots
-                            .iter()
-                            .any(|(_, leaf)| leaf_carries_model(leaf, &journal.turn_vars))
-                    };
-                    if model_sent {
-                        self.prompt_model_sent.store(true, Ordering::Release);
-                    }
-                    // The request id correlates the prompt's synchronous
-                    // response — usage that lives only inside that reply
-                    // still proves billed work happened.
-                    if let Some(id) = frame
-                        .as_ref()
-                        .and_then(|frame| frame.get("id"))
-                        .and_then(setup_id_key)
-                    {
-                        *self
-                            .prompt_id
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner()) = Some(id);
-                    }
-                }
-                // A declared setup or pre-turn request is journaled by
-                // request id: the refusal's response then names the
-                // exact call it answers. Outbound callback replies are
-                // response frames, never requests, and the prompt frame
-                // itself claims no journal slot — its refusal binds the
-                // session's bound model regardless of its params. A
-                // request claims the first unclaimed call whose method
-                // it carries in the phase the lane is in — setup calls
-                // while the open issues them, pre-turn calls once the
-                // turn phase holds — the adapter's own issue order.
-                // Whether the frame's params populate a declared model
-                // slot decides if a chain entry could change that
-                // call's answer.
+                let setup_phase = self.setup_phase.load(Ordering::Acquire);
+                let mut prompt = false;
+                let mut claimed_model = None;
                 if let Some(frame) = frame.as_ref() {
-                    if !outbound_response && !prompt {
+                    if !outbound_response {
+                        // A declared setup or pre-turn request is
+                        // journaled by request id: the refusal's
+                        // response then names the exact call it
+                        // answers. Every request claims its actual call
+                        // before it may read as the prompt — the adapter
+                        // issues the phase's calls ahead of the prompt,
+                        // so a same-method frame belongs to the earliest
+                        // unclaimed call whose resolved shape produced
+                        // it. In the setup phase the prompt never
+                        // issues; once the turn phase holds only a
+                        // request no pre-turn call produced can be the
+                        // prompt. Outbound callback replies are response
+                        // frames, never requests. Whether the frame's
+                        // params populate a declared model slot decides
+                        // if a chain entry could change that call's
+                        // answer.
                         let request = frame.get("id").and_then(setup_id_key).zip(
                             frame
                                 .get(self.method_field.as_str())
                                 .and_then(serde_json::Value::as_str),
                         );
                         if let Some((id, method)) = request {
-                            let setup_phase = self.setup_phase.load(Ordering::Acquire);
-                            let claimed = {
+                            claimed_model = {
                                 let mut guard = self
                                     .setup_journal
                                     .lock()
@@ -2431,7 +2621,7 @@ impl Observer for DispatchProbe {
                                 } else {
                                     (&self.turn_calls, &mut journal.turn_claimed)
                                 };
-                                let secrets = self
+                                let secret_journal = self
                                     .secrets
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner());
@@ -2457,22 +2647,15 @@ impl Observer for DispatchProbe {
                                         } else {
                                             &journal.turn_vars
                                         };
-                                        let params = if call.params_at_root {
-                                            strip_overwritten(frame, &self.overwritten)
-                                        } else {
-                                            // An absent or null params
-                                            // member resolves as the
-                                            // empty object — an empty
-                                            // template's call still
-                                            // claims its own frame.
-                                            frame
-                                                .get("params")
-                                                .filter(|params| !params.is_null())
-                                                .cloned()
-                                                .unwrap_or_else(|| {
-                                                    serde_json::Value::Object(Default::default())
-                                                })
-                                        };
+                                        // The call's own resolutions —
+                                        // a skipped call's skip decision
+                                        // is the presence its
+                                        // substitution saw, never a
+                                        // newer resolution on the same
+                                        // name.
+                                        let secrets =
+                                            self.call_secrets(&secret_journal, calls, index);
+                                        let params = frame_params(frame, call, &self.overwritten);
                                         let template = if call.params_at_root {
                                             strip_overwritten(&call.template, &self.overwritten)
                                         } else {
@@ -2493,17 +2676,20 @@ impl Observer for DispatchProbe {
                                     } else {
                                         &journal.turn_vars
                                     };
+                                    let secrets = self.call_secrets(&secret_journal, calls, index);
+                                    let params = frame_params(frame, call, &self.overwritten);
                                     // A claimed call carried the model
-                                    // only where a `{model}`-family
-                                    // token in one of its slot leaves
-                                    // resolved to a value — a populated
-                                    // field whose model token came back
-                                    // empty is scaffolding, not a model
-                                    // the peer could have bound.
-                                    let carries_model = call
-                                        .model_slots
-                                        .iter()
-                                        .any(|(_, leaf)| leaf_carries_model(leaf, vars));
+                                    // only where the frame's own value
+                                    // at a declared slot proves a
+                                    // `{model}`-family token resolved
+                                    // to a value — a populated field
+                                    // whose model token came back empty
+                                    // is scaffolding, not a model the
+                                    // peer could have bound.
+                                    let carries_model =
+                                        call.model_slots.iter().any(|(path, leaf)| {
+                                            slot_carries_model(&params, path, leaf, vars, &secrets)
+                                        });
                                     journal.sent.push(SentSetup {
                                         id,
                                         carries_model,
@@ -2514,14 +2700,76 @@ impl Observer for DispatchProbe {
                                     None
                                 }
                             };
-                            if claimed == Some(true) {
-                                if setup_phase {
-                                    self.model_setup_sent.store(true, Ordering::Release);
+                        }
+                        // Only a request no declared call produced can
+                        // be the prompt — and only once the turn phase
+                        // holds: the open's calls precede every prompt.
+                        if claimed_model.is_none() && !setup_phase && self.is_prompt_frame(frame) {
+                            prompt = true;
+                            self.dispatched.store(true, Ordering::Release);
+                            // The selector must have reached this frame:
+                            // a surviving model slot marks the frame
+                            // model-carrying only when the frame's own
+                            // params prove a `{model}`-family token
+                            // resolved to a value —
+                            // `provider:{modelProvider}` still emits
+                            // `provider:` for an unqualified candidate,
+                            // and that scaffolding carried no model the
+                            // peer could have bound.
+                            let model_sent = {
+                                let journal = self
+                                    .setup_journal
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                let secret_journal = self
+                                    .secrets
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                let secrets = self.prompt_secrets_view(&secret_journal);
+                                let params = if self.prompt_at_root {
+                                    strip_overwritten(frame, &self.overwritten)
                                 } else {
-                                    self.turn_model_sent.store(true, Ordering::Release);
-                                }
+                                    frame
+                                        .get("params")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null)
+                                };
+                                self.prompt_model_slots.iter().any(|(path, leaf)| {
+                                    slot_carries_model(
+                                        &params,
+                                        path,
+                                        leaf,
+                                        &journal.turn_vars,
+                                        &secrets,
+                                    )
+                                })
+                            };
+                            if model_sent {
+                                self.prompt_model_sent.store(true, Ordering::Release);
+                            }
+                            // The request id correlates the prompt's
+                            // synchronous response — usage that lives
+                            // only inside that reply still proves billed
+                            // work happened.
+                            if let Some(id) = frame.get("id").and_then(setup_id_key) {
+                                *self
+                                    .prompt_id
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner()) = Some(id);
                             }
                         }
+                    }
+                }
+                // Every `Sent` refreshes which frame the writer is on:
+                // the record precedes the write, so the last observed
+                // `Sent` names the write a `writer_failed` report refers
+                // to.
+                self.last_sent_was_prompt.store(prompt, Ordering::Release);
+                if claimed_model == Some(true) {
+                    if setup_phase {
+                        self.model_setup_sent.store(true, Ordering::Release);
+                    } else {
+                        self.turn_model_sent.store(true, Ordering::Release);
                     }
                 }
             }
@@ -3429,11 +3677,32 @@ impl VirtualSession {
                     // candidate's record before the guards below read it:
                     // a prompt or pre-turn frame that carried the
                     // request's model reached the wire — the same "sent
-                    // stays spent" rule the replacement opens apply.
+                    // stays spent" rule the replacement opens apply. The
+                    // session's stored model rides the frame the same way
+                    // when the request omits the selector: an open that
+                    // left its candidate unconfirmed keeps it pending,
+                    // and a frame whose resolved model is that candidate
+                    // is its carry evidence — the same serving-lane rule.
+                    let sent = probe.prompt_model_sent() || probe.turn_model_sent();
                     if request.model.is_some() && request.model == driver_model {
-                        let sent = probe.prompt_model_sent() || probe.turn_model_sent();
                         pending_sent |= sent;
                         serving_sent |= sent;
+                    }
+                    {
+                        let mut chain = model_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        let wire_model = request
+                            .model
+                            .clone()
+                            .or_else(|| installed_open.config.model.clone());
+                        if sent && chain.pending.is_some() && chain.pending == wire_model {
+                            pending_sent = true;
+                            serving_sent = true;
+                            if pending_model.is_none() {
+                                pending_model = chain.pending.take();
+                            }
+                        }
                     }
                     // A cancel that landed while the prompt sat in
                     // admission ends the turn: the lane was idle when
@@ -3524,10 +3793,11 @@ impl VirtualSession {
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner()) =
                                 Some(accepted.clone());
-                            model_state
+                            let mut chain = model_state
                                 .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .active = Some(accepted);
+                                .unwrap_or_else(|error| error.into_inner());
+                            chain.active = Some(accepted);
+                            chain.pending = None;
                         }
                     }
                     // A cancelled outcome can arrive after a model-free
@@ -3763,7 +4033,20 @@ impl VirtualSession {
                     // (the provider already refused the entry before it),
                     // and any other reopen carries the last accepted
                     // chain entry forward.
-                    let pending_candidate = pending_bind.clone().or_else(|| driver_model.clone());
+                    let pending_candidate = pending_bind
+                        .clone()
+                        .or_else(|| driver_model.clone())
+                        .or_else(|| {
+                            // A candidate the installed open accepted
+                            // without carry evidence rides the switch
+                            // too — the new lane's binding is its next
+                            // chance to prove itself.
+                            model_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .pending
+                                .clone()
+                        });
                     let head = pending_candidate.clone().or_else(|| {
                         model_state
                             .lock()
@@ -4009,10 +4292,12 @@ impl VirtualSession {
                                         && (!probe.has_dispatch_point()
                                             || probe.model_setup_sent()) =>
                                 {
-                                    model_state
+                                    let mut chain = model_state
                                         .lock()
-                                        .unwrap_or_else(|error| error.into_inner())
-                                        .active = Some(carried_model.clone());
+                                        .unwrap_or_else(|error| error.into_inner());
+                                    chain.active = Some(carried_model.clone());
+                                    chain.pending = None;
+                                    drop(chain);
                                     driver_model = Some(carried_model.clone());
                                     pending_model = Some(carried_model);
                                 }
@@ -4032,10 +4317,11 @@ impl VirtualSession {
                                 // replacement carries is the last
                                 // accepted chain entry — publish it.
                                 None => {
-                                    model_state
+                                    let mut chain = model_state
                                         .lock()
-                                        .unwrap_or_else(|error| error.into_inner())
-                                        .active = accepted;
+                                        .unwrap_or_else(|error| error.into_inner());
+                                    chain.active = accepted;
+                                    chain.pending = None;
                                 }
                                 // A candidate this lane cannot deliver —
                                 // its binding never reached the wire and
@@ -5136,14 +5422,17 @@ mod tests {
             },
             Some("prime"),
         );
-        // The adapter's resolver journaled the name absent — the
-        // presence record `wrap_secrets` produces at substitution time.
+        probe.reset("work", None, None);
+        // The adapter's resolver journaled the name absent at the
+        // secret-only call's own substitution — the outcome record
+        // `wrap_secrets` produces, inside the turn-phase slice that
+        // call owns.
         probe
             .secrets
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert("secret:AWP_TOKEN".to_owned(), false);
-        probe.reset("work", None, None);
+            .outcomes
+            .push(("secret:AWP_TOKEN".to_owned(), false));
         probe.record(
             "rpc",
             Direction::Sent,
@@ -5190,5 +5479,204 @@ mod tests {
             br#"{"method":"session/prompt","id":9,"params":{"vendor":"v:vnd","text":"work"}}"#,
         );
         assert!(probe.prompt_model_sent());
+    }
+
+    /// A same-method pre-turn call's frame is that call's, never the
+    /// prompt's — even when the prompt template offers no verifiable
+    /// `{prompt}` position for the wire to tell them apart. The frame
+    /// claims its call before the prompt check can own it, so a
+    /// model-free preparation call marks neither dispatch nor the
+    /// candidate's send, and its refusal cannot bind the model.
+    #[test]
+    fn pre_turn_frame_claims_its_call_before_the_prompt() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                pre_turn: vec![a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"note": "configure"}),
+                }],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"payload": "{prompt}|{model}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        probe.reset("work", Some("fallback"), None);
+        // The pre-turn frame claims its own call — the prompt template's
+        // model slot can never credit the candidate a send the prompt
+        // never made.
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/prompt","id":1,"params":{"note":"configure"}}"#,
+        );
+        assert!(!probe.dispatched());
+        assert!(!probe.prompt_model_sent());
+        assert!(!probe.turn_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        // The refusal answers the model-free preparation call — never
+        // the prompt's model verdict.
+        assert!(!probe.refused_turn_binds_model());
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/prompt","id":2,"params":{"payload":"work|fallback"}}"#,
+        );
+        assert!(probe.dispatched());
+        assert!(probe.prompt_model_sent());
+    }
+
+    /// Presence belongs to the call whose substitution asked for it:
+    /// the secret-only call resolves `AWP_TOKEN` to nothing and is
+    /// skipped, and a later same-method call's own resolution of the
+    /// same name — this time producing a value — must not reopen the
+    /// skipped call's claim on the frame it produced.
+    #[test]
+    fn later_secret_resolution_never_unskips_the_call() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                pre_turn: vec![
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"choice": "{secret:AWP_TOKEN}"}),
+                    },
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"choice": "{secret:AWP_TOKEN}-{model}"}),
+                    },
+                ],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        probe.reset("work", None, None);
+        // The adapter's own resolutions in substitution order: the
+        // first call's lookup failed, the second's produced a value.
+        {
+            let mut secrets = probe
+                .secrets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            secrets
+                .outcomes
+                .push(("secret:AWP_TOKEN".to_owned(), false));
+            secrets.outcomes.push(("secret:AWP_TOKEN".to_owned(), true));
+        }
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/select","id":1,"params":{"choice":"tok-prime"}}"#,
+        );
+        assert!(probe.turn_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_turn_binds_model());
+    }
+
+    /// A lane with no session call at all leaves `{sessionId}`
+    /// known-absent — there is no open response to wait on, so the
+    /// id-only pre-turn call resolves `{}` and skips like any other
+    /// absent-leaf call.
+    #[test]
+    fn no_session_call_keeps_the_id_absent() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                session_open: None,
+                pre_turn: vec![
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"session": "{sessionId}"}),
+                    },
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"session": "{model}"}),
+                    },
+                ],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        probe.reset("work", None, None);
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/select","id":1,"params":{"session":"prime"}}"#,
+        );
+        assert!(probe.turn_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_turn_binds_model());
+    }
+
+    /// A session call declared with default null params emits `null` —
+    /// not `{}` — and still claims its own journal slot, so the open's
+    /// answer settles the session id's presence. Normalizing null to
+    /// `{}` would lose the binding and leave the id flexible: the
+    /// id-only call then claims the model frame.
+    #[test]
+    fn null_params_open_binds_its_answer() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                session_open: Some(a4aa::RpcCallSpec {
+                    method: "session/open".to_owned(),
+                    params: serde_json::Value::Null,
+                }),
+                pre_turn: vec![
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"session": "{sessionId}"}),
+                    },
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"session": "{model}"}),
+                    },
+                ],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/open","id":0,"params":null}"#,
+        );
+        probe.record("rpc", Direction::Received, br#"{"id":0,"result":{}}"#);
+        probe.reset("work", None, None);
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/select","id":1,"params":{"session":"prime"}}"#,
+        );
+        assert!(probe.turn_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_turn_binds_model());
     }
 }

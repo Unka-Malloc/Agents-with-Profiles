@@ -808,6 +808,11 @@ impl EventRelay {
 struct SetupWire {
     method: String,
     params_at_root: bool,
+    /// The call's params template: the journaled request claims the call
+    /// whose template could have produced the frame's resolved params —
+    /// a same-method call the adapter skipped because its optional leaves
+    /// all resolved empty never matches.
+    template: serde_json::Value,
     /// Params-root-relative paths whose template leaf declares a
     /// `{model}`-family placeholder — a populated wire slot makes the
     /// frame model-carrying.
@@ -904,6 +909,19 @@ struct DispatchProbe {
     result_selector: Option<String>,
     result_selector_field: Option<String>,
     result_path: Option<String>,
+    /// A cli lane's raw stream records are the records themselves — the
+    /// lane's own selectors read the full NDJSON document, not a
+    /// `params` member inside it.
+    cli: bool,
+    /// A json-lines cli lane's outcome text is the retained raw stream
+    /// when no result record supplied authoritative text — raw NDJSON
+    /// bytes, not evidence of their own.
+    json_lines: bool,
+    /// The frame-root fields an inline envelope stamps over a merged
+    /// object params document — positions a journaled template cannot be
+    /// held to, since the stamped value replaced whatever the call
+    /// resolved there.
+    overwritten: std::collections::BTreeSet<String>,
     /// Whether the lane's prompt params template carries `{prompt}` in at
     /// least one leaf the wire can verify — the prompt call is then the
     /// same-method frame whose configured payload fields hold this
@@ -918,6 +936,15 @@ struct DispatchProbe {
     /// the expected wire value is the leaf with `{prompt}` replaced by
     /// this attempt's armed text.
     prompt_slots: Vec<(Vec<String>, String)>,
+    /// The prompt params template's `{model}`-family positions that
+    /// survive the lane's encoding — a slot the inline envelope stamps
+    /// over never reaches the wire, so a populated surviving slot is what
+    /// makes the prompt frame model-carrying.
+    prompt_model_slots: Vec<Vec<String>>,
+    /// Whether this attempt's prompt frame populated an effective model
+    /// slot — the request's model reached the wire below the prompt's
+    /// own dispatch.
+    prompt_model_sent: AtomicBool,
     /// The substituted value each `prompt_slots` leaf must carry on the
     /// prompt call's frame — computed at `reset` from this attempt's
     /// prompt text, so the check is an exact payload comparison rather
@@ -1005,8 +1032,13 @@ impl DispatchProbe {
             result_selector: None,
             result_selector_field: None,
             result_path: None,
+            cli: false,
+            json_lines: false,
+            overwritten: std::collections::BTreeSet::new(),
             prompt_carries_text: false,
             prompt_slots: Vec::new(),
+            prompt_model_slots: Vec::new(),
+            prompt_model_sent: AtomicBool::new(false),
             prompt_at_root: false,
             expected_prompts: std::sync::Mutex::new(Vec::new()),
             dispatched: AtomicBool::new(false),
@@ -1031,6 +1063,8 @@ impl DispatchProbe {
             probe.result_selector = cli.result_selector.clone();
             probe.result_selector_field = cli.result_selector_field.clone();
             probe.result_path = cli.result_path.clone();
+            probe.cli = true;
+            probe.json_lines = cli.json_lines;
         }
         if let LaneSpec::Rpc(rpc) = &spec.lane {
             if !rpc.prompt.method.is_empty() {
@@ -1050,6 +1084,7 @@ impl DispatchProbe {
             probe.text_path = rpc.text_path.clone();
             probe.usage_path = rpc.usage_path.clone();
             probe.prompt_slots = prompt_slots(&rpc.prompt.params);
+            probe.prompt_model_slots = model_slots(&rpc.prompt.params);
             probe.prompt_at_root = rpc
                 .envelope
                 .as_ref()
@@ -1066,6 +1101,7 @@ impl DispatchProbe {
                     .as_ref()
                     .is_some_and(|envelope| envelope.params_inline)
                     && call.params.is_object(),
+                template: call.params.clone(),
                 model_slots: model_slots(&call.params),
             };
             probe.setup_calls = rpc_setup_calls(rpc, resuming)
@@ -1102,7 +1138,11 @@ impl DispatchProbe {
                     probe
                         .prompt_slots
                         .retain(|(path, _)| !overwritten.contains(path[0].as_str()));
+                    probe
+                        .prompt_model_slots
+                        .retain(|path| !overwritten.contains(path[0].as_str()));
                 }
+                probe.overwritten = overwritten.clone();
                 for call in probe
                     .setup_calls
                     .iter_mut()
@@ -1222,6 +1262,28 @@ impl DispatchProbe {
         self.turn_model_sent.load(Ordering::Acquire)
     }
 
+    /// Whether this attempt's prompt frame populated a surviving model
+    /// slot — the request's model reached the wire. `true` for lanes
+    /// without an observable dispatch point, whose model rides the spawn
+    /// itself rather than a frame the journal can inspect.
+    fn prompt_model_sent(&self) -> bool {
+        self.method.is_none() || self.prompt_model_sent.load(Ordering::Acquire)
+    }
+
+    /// Whether an outcome's text is the retained raw stream rather than
+    /// an actual result — a json-lines cli lane falls back to the
+    /// retained NDJSON bytes when no result record supplied text, and
+    /// every record inside it was already classified through the event
+    /// relay. Text that parses as nothing but records is that fallback:
+    /// it repeats the stream, it does not add evidence.
+    fn retained_stream_text(&self, text: &str) -> bool {
+        self.json_lines
+            && !text.is_empty()
+            && text.lines().all(|line| {
+                serde_json::from_str::<serde_json::Value>(line.trim_end_matches('\r')).is_ok()
+            })
+    }
+
     /// Whether a same-method request frame is this attempt's prompt call
     /// rather than a configured pre-turn call sharing the method. The
     /// lane builds the prompt frame from the prompt params template:
@@ -1302,6 +1364,7 @@ impl DispatchProbe {
         // claim `turn_calls`, never another open's setup entries.
         self.setup_phase.store(false, Ordering::Release);
         self.turn_model_sent.store(false, Ordering::Release);
+        self.prompt_model_sent.store(false, Ordering::Release);
         {
             let mut journal = self
                 .setup_journal
@@ -1349,6 +1412,9 @@ impl DispatchProbe {
     /// the record itself — either way its carriers sit at their
     /// conventional positions regardless of the wire envelope.
     fn billable_raw(&self, raw: &serde_json::Value) -> bool {
+        if self.cli {
+            return self.billable_notification(None, raw);
+        }
         self.billable_notification(
             raw.get("method").and_then(serde_json::Value::as_str),
             raw.get("params").unwrap_or(raw),
@@ -1368,7 +1434,11 @@ impl DispatchProbe {
     /// `usage` / `message.usage` positions follow, resolved where
     /// `billable_raw` reads the record.
     fn bookkeeping_raw(&self, raw: &serde_json::Value) -> bool {
-        let root = raw.get("params").unwrap_or(raw);
+        let root = if self.cli {
+            raw
+        } else {
+            raw.get("params").unwrap_or(raw)
+        };
         if let (Some(selector), Some(path)) =
             (self.result_selector.as_deref(), self.result_path.as_deref())
         {
@@ -1598,6 +1668,71 @@ fn extract_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serd
     Some(cursor)
 }
 
+/// An object document without the members an inline envelope stamps
+/// over the merged params — the journaled call cannot be held to a
+/// position the encoder replaced.
+fn strip_overwritten(
+    value: &serde_json::Value,
+    overwritten: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter(|(key, _)| !overwritten.contains(key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Whether `template` could have resolved to the params a journaled
+/// request carries — the resolved call's identity when declared calls
+/// share a wire method. Every member the frame carries must trace to a
+/// template position: a literal must match exactly, a placeholder leaf
+/// may become any string. Every member it lacks must be a whole-leaf
+/// `{placeholder}` — the only shape the lane's substitution drops.
+/// An empty params document belongs only to an empty template: a
+/// non-empty template whose optional leaves all resolved empty is the
+/// call the lane skipped, which produced no frame at all.
+fn resolved_call_consistent(template: &serde_json::Value, params: &serde_json::Value) -> bool {
+    fn droppable(leaf: &serde_json::Value) -> bool {
+        matches!(
+            leaf,
+            serde_json::Value::String(text)
+                if text.starts_with('{')
+                    && text.ends_with('}')
+                    && !text[1..text.len() - 1].contains(['{', '}'])
+        )
+    }
+    fn produces(template: &serde_json::Value, params: &serde_json::Value) -> bool {
+        match (template, params) {
+            (serde_json::Value::Object(tmap), serde_json::Value::Object(pmap)) => {
+                if pmap.is_empty() {
+                    return tmap.is_empty();
+                }
+                pmap.keys().all(|key| tmap.contains_key(key))
+                    && tmap.iter().all(|(key, leaf)| match pmap.get(key) {
+                        Some(value) => produces(leaf, value),
+                        None => droppable(leaf),
+                    })
+            }
+            (serde_json::Value::String(leaf), serde_json::Value::String(value)) => {
+                leaf.contains('{') || leaf == value
+            }
+            (serde_json::Value::Array(titems), serde_json::Value::Array(pitems)) => {
+                titems.len() == pitems.len()
+                    && titems
+                        .iter()
+                        .zip(pitems.iter())
+                        .all(|(template, params)| produces(template, params))
+            }
+            _ => template == params,
+        }
+    }
+    produces(template, params)
+}
+
 /// Mirror of the lane's notification text extraction, reduced to a
 /// presence check: a declared `text_path` resolves a string leaf or an
 /// array whose `{type:"text",text}` blocks concatenate to text; otherwise
@@ -1746,6 +1881,22 @@ impl Observer for DispatchProbe {
                 self.last_sent_was_prompt.store(prompt, Ordering::Release);
                 if prompt {
                     self.dispatched.store(true, Ordering::Release);
+                    // A populated surviving model slot marks the frame
+                    // model-carrying — the request's selector reached the
+                    // wire below the prompt's own dispatch.
+                    let model_sent = frame.as_ref().is_some_and(|frame| {
+                        let params = if self.prompt_at_root {
+                            frame
+                        } else {
+                            frame.get("params").unwrap_or(&serde_json::Value::Null)
+                        };
+                        self.prompt_model_slots
+                            .iter()
+                            .any(|slot| slot_at(params, slot).is_some_and(|value| !value.is_null()))
+                    });
+                    if model_sent {
+                        self.prompt_model_sent.store(true, Ordering::Release);
+                    }
                     // The request id correlates the prompt's synchronous
                     // response — usage that lives only inside that reply
                     // still proves billed work happened.
@@ -1792,9 +1943,41 @@ impl Observer for DispatchProbe {
                                 } else {
                                     (&self.turn_calls, &mut journal.turn_claimed)
                                 };
+                                // A request claims the first unclaimed
+                                // call whose resolved shape the frame
+                                // could be — the adapter's own issue
+                                // order, but skipping a call whose
+                                // optional leaves all resolved empty
+                                // shifts a same-method frame onto the
+                                // call the adapter actually issued.
                                 if let Some(index) =
                                     calls.iter().enumerate().find_map(|(index, call)| {
-                                        (!flags[index] && call.method == method).then_some(index)
+                                        if flags[index] || call.method != method {
+                                            return None;
+                                        }
+                                        let params = if call.params_at_root {
+                                            strip_overwritten(frame, &self.overwritten)
+                                        } else {
+                                            // An absent or null params
+                                            // member resolves as the
+                                            // empty object — an empty
+                                            // template's call still
+                                            // claims its own frame.
+                                            frame
+                                                .get("params")
+                                                .filter(|params| !params.is_null())
+                                                .cloned()
+                                                .unwrap_or_else(|| {
+                                                    serde_json::Value::Object(Default::default())
+                                                })
+                                        };
+                                        let template = if call.params_at_root {
+                                            strip_overwritten(&call.template, &self.overwritten)
+                                        } else {
+                                            call.template.clone()
+                                        };
+                                        resolved_call_consistent(&template, &params)
+                                            .then_some(index)
                                     })
                                 {
                                     flags[index] = true;
@@ -2051,7 +2234,7 @@ fn turn_progress(event: &AgentEvent, probe: &DispatchProbe) -> bool {
 /// turn-start notification or an all-zero usage record is bookkeeping,
 /// not served work.
 fn error_outcome_served(result: &TurnOutcome, emitted_output: bool, probe: &DispatchProbe) -> bool {
-    !result.text.is_empty()
+    (!result.text.is_empty() && !probe.retained_stream_text(&result.text))
         || result.truncated
         || result.usage.as_ref().is_some_and(billable_usage)
         || emitted_output
@@ -2223,9 +2406,15 @@ fn session_selectors(spec: &AgentSpec, request: &SessionRequest) -> SelectorSupp
         }
     };
     SelectorSupportSet {
+        // Model support counts only slots that survive the lane's
+        // encoding: a `{model}` an inline envelope stamps over never
+        // reaches the wire, so it neither binds at open nor carries a
+        // turn — the same effective reading the probe enforces.
         model: support(
-            rpc_setup_uses(rpc, resuming, &["model", "modelProvider", "modelId"])
-                || uses_turn(&["model", "modelProvider", "modelId"]),
+            rpc_setup_calls(rpc, resuming)
+                .into_iter()
+                .any(|call| rpc_call_binds_model(rpc, call))
+                || rpc_turn_binds_model(rpc),
         ),
         effort: support(rpc_setup_uses(rpc, resuming, &["effort"]) || uses_turn(&["effort"])),
         mode: support(rpc_setup_uses(rpc, resuming, &["mode"])),
@@ -2247,6 +2436,30 @@ fn model_binds_at_open(spec: &AgentSpec, resuming: bool) -> bool {
             .into_iter()
             .any(|call| rpc_call_binds_model(rpc, call)),
         _ => spec.selector_support(SelectorPhase::Session).model != SelectorSupport::Unsupported,
+    }
+}
+
+/// Whether the rpc lane's turn surface can carry the model selector on
+/// the wire — a `{model}`-family slot in the prompt or a pre-turn call
+/// that survives the encoding, read the same effective way
+/// `model_binds_at_open` reads the setup calls.
+fn rpc_turn_binds_model(rpc: &a4aa::RpcLaneSpec) -> bool {
+    rpc_call_binds_model(rpc, &rpc.prompt)
+        || rpc
+            .pre_turn
+            .iter()
+            .any(|call| rpc_call_binds_model(rpc, call))
+}
+
+/// Whether a per-turn model retry can actually reach the wire on this
+/// lane — its declared per-turn support, reduced for rpc to the slots
+/// the frame's encoding leaves standing. A `{model}` leaf the envelope
+/// overwrites still reports `Applied` upstream, but sending it changes
+/// nothing on the wire.
+fn turn_binds_model(spec: &AgentSpec) -> bool {
+    match &spec.lane {
+        LaneSpec::Rpc(rpc) => rpc_turn_binds_model(rpc),
+        _ => spec.selector_support(SelectorPhase::Turn).model != SelectorSupport::Unsupported,
     }
 }
 
@@ -2563,7 +2776,17 @@ impl VirtualSession {
                         guard.selector_support(SelectorPhase::Session).model,
                     )
                 };
-                let turn_model = turn_selectors.model;
+                // Declared per-turn model support, reduced to the slots
+                // the lane's encoding leaves standing: a `{model}` an
+                // inline envelope stamps over never reaches the wire, so
+                // it cannot carry a chain retry.
+                let turn_model = if matches!(&active_spec.lane, LaneSpec::Rpc(_))
+                    && !turn_binds_model(&active_spec)
+                {
+                    SelectorSupport::Unsupported
+                } else {
+                    turn_selectors.model
+                };
                 // Re-project the turn's selectors onto the lane now serving
                 // it. A driver-managed value follows this lane's surface:
                 // the chain candidate a retry is carrying, the caller's
@@ -2631,7 +2854,12 @@ impl VirtualSession {
                         // lane's own probe record. A candidate an earlier
                         // lane's setup already sent stays spent — the
                         // peer may have bound it.
-                        if !pending_sent && !probe.model_setup_sent() {
+                        let pending_candidate =
+                            pending_model.clone().or_else(|| driver_model.clone());
+                        if !(pending_sent
+                            || probe.model_setup_sent()
+                                && installed_open.config.model == pending_candidate)
+                        {
                             restore_candidate(
                                 &model_state,
                                 pending_model.take().or_else(|| driver_model.take()),
@@ -2654,7 +2882,7 @@ impl VirtualSession {
                     // request's model reached the wire — the same "sent
                     // stays spent" rule the replacement opens apply.
                     if request.model.is_some() && request.model == driver_model {
-                        pending_sent |= probe.dispatched() || probe.turn_model_sent();
+                        pending_sent |= probe.prompt_model_sent() || probe.turn_model_sent();
                     }
                     // A cancel that landed while the prompt sat in
                     // admission ends the turn: the lane was idle when
@@ -2671,8 +2899,16 @@ impl VirtualSession {
                         // The candidate whose attempt ended at admission
                         // never dispatched — same restoration rule: it
                         // returns to the chain only while no wire ever
-                        // carried it.
-                        if !pending_sent && !probe.model_setup_sent() {
+                        // carried it, and the installed probe's setup
+                        // send counts only when it carried *this*
+                        // candidate — its flag alone can describe the
+                        // open's other model.
+                        let pending_candidate =
+                            pending_model.clone().or_else(|| driver_model.clone());
+                        if !(pending_sent
+                            || probe.model_setup_sent()
+                                && installed_open.config.model == pending_candidate)
+                        {
                             restore_candidate(
                                 &model_state,
                                 pending_model.take().or_else(|| driver_model.take()),
@@ -2710,7 +2946,12 @@ impl VirtualSession {
                                         || error_outcome_served(result, relay.output(), &probe))
                             }
                             Err(error) => {
-                                !model_failure(error) && (billed || probe.dispatch_confirmed(error))
+                                // Dispatch evidence publishes only a
+                                // candidate the wire could have carried —
+                                // send tracking already folded this
+                                // attempt's prompt and pre-turn record.
+                                !model_failure(error)
+                                    && (billed || pending_sent && probe.dispatch_confirmed(error))
                             }
                         };
                         if confirmed {
@@ -2723,6 +2964,23 @@ impl VirtualSession {
                                 .unwrap_or_else(|error| error.into_inner())
                                 .active = Some(accepted);
                         }
+                    }
+                    // A cancelled outcome can arrive after a model-free
+                    // pre-turn call completes and before the candidate
+                    // reaches the prompt — the take above already dropped
+                    // it. Restore by the candidate's own folded send
+                    // record: the installed probe's setup flag alone can
+                    // describe the open's other model.
+                    if !pending_sent
+                        && matches!(&outcome, Ok(result) if matches!(
+                            result.stop_reason.as_str(),
+                            "cancelled" | "interrupted"
+                        ))
+                    {
+                        restore_candidate(
+                            &model_state,
+                            pending_model.take().or_else(|| driver_model.take()),
+                        );
                     }
                     let next = match &outcome {
                         // The reservation refused this turn: its verdict is
@@ -2974,8 +3232,7 @@ impl VirtualSession {
                     // refusal before the candidate could reach the prompt.
                     if let Some(candidate) = &pending_candidate {
                         if new_open.config.model.as_deref() == Some(candidate.as_str())
-                            && spec.selector_support(SelectorPhase::Turn).model
-                                != SelectorSupport::Unsupported
+                            && turn_binds_model(&spec)
                             && !model_binds_at_open(&spec, resuming(&new_open))
                         {
                             new_open.config.model = model_state
@@ -3193,10 +3450,7 @@ impl VirtualSession {
                                 // model selector never carries the
                                 // candidate; its replay proves nothing
                                 // about it, so it must not publish.
-                                Some(carried_model)
-                                    if spec.selector_support(SelectorPhase::Turn).model
-                                        != SelectorSupport::Unsupported =>
-                                {
+                                Some(carried_model) if turn_binds_model(&spec) => {
                                     driver_model = Some(carried_model.clone());
                                     pending_model = Some(carried_model);
                                     carried = true;
@@ -3215,8 +3469,17 @@ impl VirtualSession {
                                 // the per-turn surface cannot carry it —
                                 // goes back to the chain rather than
                                 // publishing a model the peer never saw.
+                                // Only an unsent candidate returns: one
+                                // any wire already carried stays spent.
+                                // A restored entry stops riding the
+                                // driver's own carry — it waits in the
+                                // chain instead of also replaying on the
+                                // next lane.
                                 Some(carried_model) => {
-                                    restore_candidate(&model_state, Some(carried_model));
+                                    if !pending_sent {
+                                        restore_candidate(&model_state, Some(carried_model));
+                                        driver_model = None;
+                                    }
                                 }
                             }
                         }
@@ -3824,6 +4087,235 @@ mod tests {
         assert!(model_binds_at_open(
             &spec(rpc(serde_json::json!({"note": "{model}"}))),
             false,
+        ));
+    }
+
+    /// A skipped call leaves no frame, so a same-method request must
+    /// claim the call the adapter actually issued — not the first
+    /// unclaimed template. Here the effort call's leaves all resolve
+    /// empty so the lane skips it; the one select frame on the wire is
+    /// the model call's, and its refusal is the model's answer.
+    #[test]
+    fn skipped_same_method_call_keeps_the_later_calls_verdict() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                pre_turn: vec![
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"effort": "{effort}"}),
+                    },
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"model": "{model}", "keep": "x"}),
+                    },
+                ],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}", "model": "{model}"}),
+                },
+                ..Default::default()
+            },
+            false,
+        );
+        probe.reset("work");
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/select","id":1,"params":{"model":"prime","keep":"x"}}"#,
+        );
+        assert!(probe.turn_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_turn_binds_model());
+    }
+
+    /// The same effective reading applies to the turn surface: an
+    /// inline envelope stamps `id` over the merged prompt params, so a
+    /// `{model}` leaf there reaches the wire as the request id — it
+    /// cannot carry a chain retry. A surviving root position still
+    /// binds.
+    #[test]
+    fn overwritten_inline_turn_slot_reports_no_turn_surface() {
+        let rpc = |prompt_params: serde_json::Value| a4aa::RpcLaneSpec {
+            session_open: Some(a4aa::RpcCallSpec {
+                method: "session/open".to_owned(),
+                params: serde_json::json!({}),
+            }),
+            prompt: a4aa::RpcCallSpec {
+                method: "session/prompt".to_owned(),
+                params: prompt_params,
+            },
+            envelope: Some(a4aa::RpcEnvelopeSpec {
+                method_field: "cmd".to_owned(),
+                params_inline: true,
+                response_method: Some("response".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let spec = |rpc| AgentSpec {
+            id: "rpc".to_owned(),
+            client_name: None,
+            lane: LaneSpec::Rpc(Box::new(rpc)),
+            command: a4aa::CommandSpec {
+                program: "fixture".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+            },
+            max_output_bytes: None,
+            seatbelted_permission: None,
+        };
+        assert!(!turn_binds_model(&spec(rpc(
+            serde_json::json!({"text": "{prompt}", "id": "{model}"})
+        ))));
+        assert!(turn_binds_model(&spec(rpc(
+            serde_json::json!({"text": "{prompt}", "note": "{model}"})
+        ))));
+    }
+
+    /// The prompt frame itself reports whether the model reached the
+    /// wire: a slot the inline envelope stamps over is absent from the
+    /// encoded params, so the sent frame populates no surviving slot —
+    /// while a frame whose slot carries a value is model-sent.
+    #[test]
+    fn prompt_frame_reports_only_surviving_model_slots() {
+        let spec = |prompt_params: serde_json::Value| AgentSpec {
+            id: "rpc".to_owned(),
+            client_name: None,
+            lane: LaneSpec::Rpc(Box::new(a4aa::RpcLaneSpec {
+                session_open: Some(a4aa::RpcCallSpec {
+                    method: "session/open".to_owned(),
+                    params: serde_json::json!({}),
+                }),
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: prompt_params,
+                },
+                envelope: Some(a4aa::RpcEnvelopeSpec {
+                    method_field: "cmd".to_owned(),
+                    params_inline: true,
+                    response_method: Some("response".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            command: a4aa::CommandSpec {
+                program: "fixture".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+            },
+            max_output_bytes: None,
+            seatbelted_permission: None,
+        };
+        let masked = DispatchProbe::new(
+            None,
+            &spec(serde_json::json!({"text": "{prompt}", "id": "{model}"})),
+            false,
+        );
+        masked.reset("work");
+        masked.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"cmd":"session/prompt","id":7,"text":"work"}"#,
+        );
+        assert!(masked.dispatched());
+        assert!(!masked.prompt_model_sent());
+
+        let carried = DispatchProbe::new(
+            None,
+            &spec(serde_json::json!({"text": "{prompt}", "note": "{model}"})),
+            false,
+        );
+        carried.reset("work");
+        carried.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"cmd":"session/prompt","id":7,"text":"work","note":"prime"}"#,
+        );
+        assert!(carried.prompt_model_sent());
+    }
+
+    /// A cli record's selectors read the record itself, never an
+    /// unwrapped member: a failed turn's terminal record carries an
+    /// empty `params` sibling, and reading the member instead of the
+    /// record would mistake it for progress.
+    #[test]
+    fn cli_result_record_reads_selectors_at_the_record_root() {
+        let probe = DispatchProbe::new(
+            None,
+            &AgentSpec {
+                id: "cli".to_owned(),
+                client_name: None,
+                lane: LaneSpec::Cli(Box::new(a4aa::CliLaneSpec {
+                    json_lines: true,
+                    result_selector: Some("result".to_owned()),
+                    result_path: Some("result".to_owned()),
+                    usage_path: Some("usage".to_owned()),
+                    ..Default::default()
+                })),
+                command: a4aa::CommandSpec {
+                    program: "fixture".to_owned(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+                max_output_bytes: None,
+                seatbelted_permission: None,
+            },
+            false,
+        );
+        assert!(
+            probe.bookkeeping_raw(&serde_json::json!({"type":"result","result":"","params":{}}))
+        );
+    }
+
+    /// A json_lines cli outcome whose text is the retained raw stream —
+    /// every line a record — repeats bookkeeping the relay already
+    /// classified: it is not served evidence. Any non-record line is
+    /// real output.
+    #[test]
+    fn retained_ndjson_text_is_not_served_evidence() {
+        let probe = DispatchProbe::new(
+            None,
+            &AgentSpec {
+                id: "cli".to_owned(),
+                client_name: None,
+                lane: LaneSpec::Cli(Box::new(a4aa::CliLaneSpec {
+                    json_lines: true,
+                    ..Default::default()
+                })),
+                command: a4aa::CommandSpec {
+                    program: "fixture".to_owned(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+                max_output_bytes: None,
+                seatbelted_permission: None,
+            },
+            false,
+        );
+        let outcome = |text: &str| a4aa::TurnOutcome {
+            stop_reason: "error".to_owned(),
+            text: text.to_owned(),
+            truncated: false,
+            exit_code: Some(1),
+            usage: None,
+        };
+        assert!(!error_outcome_served(
+            &outcome("{\"type\":\"usage\",\"usage\":{\"inputTokens\":0,\"outputTokens\":0}}\n{\"type\":\"summary\",\"usage\":{\"inputTokens\":0,\"outputTokens\":0}}\n"),
+            false,
+            &probe,
+        ));
+        assert!(error_outcome_served(
+            &outcome("{\"type\":\"usage\"}\nplain tail"),
+            false,
+            &probe,
         ));
     }
 }

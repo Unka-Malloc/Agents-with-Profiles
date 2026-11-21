@@ -369,7 +369,7 @@ impl VirtualAgent {
                     requested: request.clone(),
                     open: effective_request,
                     events: events.clone(),
-                    relay: EventRelay::spawn(tap_rx, events.clone()),
+                    relay: EventRelay::spawn(tap_rx, events.clone(), probe.clone()),
                     secrets: self.secrets.clone(),
                     observer: self.observer.clone(),
                     permission: self.permission.clone(),
@@ -602,10 +602,12 @@ impl EventRelay {
     /// Start draining `tap` into `events` on the session runtime. The
     /// forwarder keeps running until the lane's tap closes *and* the last
     /// relay handle drops — a dead lane's queued leftovers still reach
-    /// the caller.
+    /// the caller. `probe` carries the lane's notification carriers so a
+    /// raw event's billable check matches the wire journal's reading.
     fn spawn(
         mut tap: mpsc::UnboundedReceiver<AgentEvent>,
         events: mpsc::UnboundedSender<AgentEvent>,
+        probe: Arc<DispatchProbe>,
     ) -> Self {
         let (flush, mut barriers) = mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
         let evidence = Arc::new(RelayEvidence {
@@ -639,7 +641,7 @@ impl EventRelay {
                         Some(ack) => {
                             if let Some(rx) = &mut tap {
                                 while let Ok(event) = rx.try_recv() {
-                                    Self::forward(&forwarding, &events, event);
+                                    Self::forward(&forwarding, &events, &probe, event);
                                 }
                             }
                             let _ = ack.send(());
@@ -647,7 +649,7 @@ impl EventRelay {
                         None => barriers_open = false,
                     },
                     event = event => match event {
-                        Some(event) => Self::forward(&forwarding, &events, event),
+                        Some(event) => Self::forward(&forwarding, &events, &probe, event),
                         None => tap = None,
                     },
                 }
@@ -664,11 +666,12 @@ impl EventRelay {
     fn forward(
         evidence: &RelayEvidence,
         events: &mpsc::UnboundedSender<AgentEvent>,
+        probe: &DispatchProbe,
         event: AgentEvent,
     ) {
         if evidence.armed.load(Ordering::Acquire) {
             evidence.output.store(true, Ordering::Release);
-            if turn_output(&event) {
+            if turn_output(&event, probe) {
                 evidence.billable.store(true, Ordering::Release);
             }
         }
@@ -834,10 +837,9 @@ impl DispatchProbe {
         self.turn_billable.store(false, Ordering::Release);
     }
 
-    /// Mirror of the lane's own evidence normalization: an id-less frame
-    /// is billable when its method carries stream text at the declared
-    /// carrier, or a usage record at the configured `usage_path` — the
-    /// conventional carriers when unset — has a nonzero counter.
+    /// Mirror of the lane's own evidence normalization over a wire frame:
+    /// the method and payload sit at the envelope's declared fields when
+    /// one is configured, at `method`/`params` otherwise.
     fn billable_frame(&self, frame: &serde_json::Value) -> bool {
         let method = frame
             .get(self.method_field.as_str())
@@ -846,6 +848,25 @@ impl DispatchProbe {
             Some(field) => frame.get(field).unwrap_or(frame),
             None => frame.get("params").unwrap_or(&serde_json::Value::Null),
         };
+        self.billable_notification(method, params)
+    }
+
+    /// The event-tap form of the same normalization: the lane rebuilds a
+    /// relayed notification as a `{method, params}` document already
+    /// decoded from the frame, so its carriers sit at their conventional
+    /// positions regardless of the wire envelope.
+    fn billable_raw(&self, raw: &serde_json::Value) -> bool {
+        self.billable_notification(
+            raw.get("method").and_then(serde_json::Value::as_str),
+            raw.get("params").unwrap_or(&serde_json::Value::Null),
+        )
+    }
+
+    /// An id-less payload is billable when its method carries stream text
+    /// at the declared carrier, or a usage record at the configured
+    /// `usage_path` — the conventional carriers when unset — has a
+    /// nonzero counter.
+    fn billable_notification(&self, method: Option<&str>, params: &serde_json::Value) -> bool {
         if method.is_some()
             && method == self.text_event_method.as_deref()
             && notification_text(params, self.text_path.as_deref()).is_some()
@@ -1028,6 +1049,22 @@ impl Observer for DispatchProbe {
     }
 }
 
+/// The replay verdict for an `uncertain_effect` prompt failure.
+enum DispatchVerdict {
+    /// Dispatch cannot be ruled out — the turn may already be paid work,
+    /// so the failure propagates and the prompt never replays.
+    PossiblyDispatched,
+    /// Confirmed never dispatched: the lane's own gate refused the prompt
+    /// before anything could queue, or the transport reported the
+    /// prompt's own write failed — the writer stops at a failed line, so
+    /// no peer could have received it. Replays without further checks.
+    NeverDispatched,
+    /// The journal shows no prompt frame, but a frame still queued on
+    /// the lane's writer is invisible to it. Only a final reading taken
+    /// after the transport is stopped can confirm the prompt never left.
+    Unconfirmed,
+}
+
 /// Whether an `uncertain_effect` prompt failure may already have
 /// dispatched the turn. A4AA reports `rpc/call` with uncertain effect for
 /// a transport failure both before and after prompt dispatch, so the flag
@@ -1046,18 +1083,22 @@ impl Observer for DispatchProbe {
 /// reported failure. A `Sent` record whose write was never reported
 /// failed keeps the uncertain reading for the same reason: the frame may
 /// have reached the agent whole or in part.
-fn dispatched_uncertain(error: &a4aa::AdapterError, probe: &DispatchProbe) -> bool {
+fn dispatch_verdict(error: &a4aa::AdapterError, probe: &DispatchProbe) -> DispatchVerdict {
     if error.code == "agent_session_recovery_required" {
-        return false;
+        return DispatchVerdict::NeverDispatched;
     }
     if error.code == "agent_transport_failed"
         && error.detail.as_deref() == Some("writer_failed")
         && probe.last_write_was_prompt()
         && !probe.wire_event()
     {
-        return false;
+        return DispatchVerdict::NeverDispatched;
     }
-    probe.dispatched()
+    if probe.dispatched() {
+        DispatchVerdict::PossiblyDispatched
+    } else {
+        DispatchVerdict::Unconfirmed
+    }
 }
 
 /// `served`-style usage evidence: any nonzero counter proves billed work;
@@ -1075,30 +1116,21 @@ fn billable_usage(usage: &TokenUsage) -> bool {
     .any(|tokens| tokens > 0)
 }
 
-/// Any nonzero counter inside a wire usage payload — the rpc lane relays
-/// usage notifications as raw events, so the billable check reads the
-/// conventional carriers (`params.usage`, `params.message.usage`) rather
-/// than waiting for a canonical `Usage` event.
-fn nonzero_usage(value: &serde_json::Value) -> bool {
-    value
-        .as_object()
-        .is_some_and(|usage| usage.values().any(|v| v.as_u64().is_some_and(|n| n > 0)))
-}
-
 /// Whether one relayed lane event is evidence the turn produced billable
 /// output — streamed text, tool or plan activity, truncation marks —
-/// versus bookkeeping-only session and turn lifecycle notifications.
-fn turn_output(event: &AgentEvent) -> bool {
+/// versus bookkeeping-only session and turn lifecycle notifications. A
+/// raw event is the lane's decoded reconstruction of a notification, so
+/// the dispatch probe answers it with the same normalized counters and
+/// configured carriers the wire journal uses — a sequence number under
+/// `params.usage` is bookkeeping, not billed work.
+fn turn_output(event: &AgentEvent, probe: &DispatchProbe) -> bool {
     match event {
         AgentEvent::MessageChunk { .. }
         | AgentEvent::ToolCall { .. }
         | AgentEvent::Plan { .. }
         | AgentEvent::Truncated => true,
         AgentEvent::Usage { usage, .. } => billable_usage(usage),
-        AgentEvent::Raw { raw } => raw
-            .pointer("/params/usage")
-            .or_else(|| raw.pointer("/params/message/usage"))
-            .is_some_and(nonzero_usage),
+        AgentEvent::Raw { raw } => probe.billable_raw(raw),
     }
 }
 
@@ -1341,24 +1373,44 @@ impl VirtualSession {
                     .unwrap_or_else(|error| error.into_inner()) = Some(turn_reservation.clone());
             }
             let outcome = 'lanes: loop {
-                // This attempt's dispatch probe and event relay: reset the
-                // wire journal so an earlier attempt's frames cannot
-                // misreport dispatch, then settle whatever the lane queued
-                // outside a turn — session-open markers on a fresh lane,
-                // stragglers on a reused one — before opening this
-                // attempt's evidence window, so only output produced
-                // inside it counts toward the fallback decisions.
+                // This attempt's dispatch probe and event relay: settle
+                // whatever the lane queued outside a turn — session-open
+                // markers on a fresh lane, stragglers on a reused one —
+                // before opening this attempt's evidence window, so only
+                // output produced inside it counts toward the fallback
+                // decisions. The wire journal itself resets per physical
+                // prompt below — a dispatch record must never carry into
+                // the next attempt on this lane. The open session reports
+                // its own selector support — negotiated values included —
+                // and that decides how a chain retry applies the next
+                // entry: a per-turn surface takes it on the request, a
+                // session-bound one re-establishes the session.
                 let (probe, relay) = {
                     let lane = lane.lock().await;
-                    lane.probe.reset();
                     (lane.probe.clone(), lane.relay.clone())
+                };
+                let (turn_model, session_model) = {
+                    let guard = session.read().await;
+                    (
+                        guard.selector_support(SelectorPhase::Turn).model,
+                        guard.selector_support(SelectorPhase::Session).model,
+                    )
                 };
                 relay.flush().await;
                 relay.arm();
+                // Set when the next chain entry can only apply by
+                // re-establishing this lane's session — a model bound at
+                // session/open has no per-turn surface to carry it.
+                let mut session_retry = false;
                 // The model loop on the current lane: provider-side model
                 // failures advance the chain and resubmit on the same
                 // session.
                 let outcome = loop {
+                    // One iteration is one physical prompt attempt: reset
+                    // the wire journal so an earlier attempt's dispatch
+                    // record cannot read this attempt's pre-dispatch
+                    // failure as dispatched.
+                    probe.reset();
                     let outcome = {
                         let guard = session.read().await;
                         guard.prompt(request.clone()).await
@@ -1396,6 +1448,18 @@ impl VirtualSession {
                         _ => None,
                     };
                     let Some(next) = next else { break outcome };
+                    // Decide which surface carries the next entry before
+                    // committing the chain position: a per-turn selector
+                    // takes it on the request, a session-bound selector
+                    // re-establishes the session, and a lane with no model
+                    // surface keeps the refused entry active.
+                    let session_bound = if turn_model != SelectorSupport::Unsupported {
+                        false
+                    } else if session_model != SelectorSupport::Unsupported {
+                        true
+                    } else {
+                        break outcome;
+                    };
                     {
                         let mut chain = model_state
                             .lock()
@@ -1403,77 +1467,111 @@ impl VirtualSession {
                         chain.remaining.remove(0);
                         chain.active = Some(next.clone());
                     }
+                    if session_bound {
+                        // The lane binds its model at session
+                        // establishment and has no per-turn surface — a
+                        // request selector would be rejected before
+                        // dispatch. The retry re-opens this lane's
+                        // session to move the session model forward.
+                        session_retry = true;
+                        break outcome;
+                    }
+                    // The lane applies the model per turn: the retry
+                    // carries the next entry, and the accepted entry
+                    // becomes the session's default so later turns
+                    // inherit the model that actually served — not
+                    // the entry the provider just exhausted.
+                    *turn_model_default
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(next.clone());
                     request.model = Some(next);
                 };
                 relay.flush().await;
                 let (emitted_output, emitted_billable) = relay.disarm();
-                let lane_failed = match &outcome {
-                    // A prompt-stage failure with uncertain effect may have
-                    // produced billed output that is already in the event
-                    // stream; replaying it on another lane would duplicate
-                    // the turn and discard the completed work. A4AA cannot
-                    // mark which side of its dispatch boundary a transport
-                    // failure fell on — a dead peer during a pre-turn
-                    // selector call reports the same `rpc/call` as one
-                    // after the prompt left — so the dispatch probe's wire
-                    // record answers the dispatch question before this lane
-                    // is condemned.
-                    Err(error) if uncertain_turn(error) => {
-                        if dispatched_uncertain(error, &probe) {
-                            break 'lanes outcome;
-                        }
-                        // No prompt frame reached the wire — but a frame
-                        // still queued on the lane's writer is invisible to
-                        // the journal, and its write could yet land on a
-                        // peer that stopped answering yet keeps reading.
-                        // Stop the transport first, then take the final
-                        // reading: only a prompt confirmed never written
-                        // may replay on the next lane.
-                        if !probe.dispatched() {
-                            let _ = session.read().await.close().await;
-                            if probe.dispatched() {
-                                break 'lanes outcome;
+                // A session-bound retry keeps its lane: the session is
+                // reopened below with the accepted model. Any other
+                // outcome answers the lane question from the evidence.
+                let lane_failed = if session_retry {
+                    true
+                } else {
+                    match &outcome {
+                        // A prompt-stage failure with uncertain effect may have
+                        // produced billed output that is already in the event
+                        // stream; replaying it on another lane would duplicate
+                        // the turn and discard the completed work. A4AA cannot
+                        // mark which side of its dispatch boundary a transport
+                        // failure fell on — a dead peer during a pre-turn
+                        // selector call reports the same `rpc/call` as one
+                        // after the prompt left — so the dispatch probe's wire
+                        // record answers the dispatch question before this lane
+                        // is condemned.
+                        Err(error) if uncertain_turn(error) => {
+                            match dispatch_verdict(error, &probe) {
+                                DispatchVerdict::PossiblyDispatched => break 'lanes outcome,
+                                DispatchVerdict::NeverDispatched => true,
+                                // No prompt frame reached the wire — but a
+                                // frame still queued on the lane's writer is
+                                // invisible to the journal, and its write
+                                // could yet land on a peer that stopped
+                                // answering yet keeps reading. Stop the
+                                // transport first, then take the final
+                                // reading: only a prompt confirmed never
+                                // written may replay on the next lane.
+                                DispatchVerdict::Unconfirmed => {
+                                    let _ = session.read().await.close().await;
+                                    if probe.dispatched() {
+                                        break 'lanes outcome;
+                                    }
+                                    true
+                                }
                             }
                         }
-                        true
-                    }
-                    // The whole model chain exhausted on this lane — the
-                    // failure is provider-side, so the caller's next
-                    // profile is the right escalation, not another lane.
-                    Err(error) if model_failure(error) => break 'lanes outcome,
-                    // A lane failure after streamed text or billable usage
-                    // may already have produced paid output — replaying it
-                    // on the next lane would duplicate the turn. Evidence
-                    // is whatever this attempt produced: the wire journal
-                    // on lanes with a dispatch frame (attributed at
-                    // receipt, so a generic error cannot outrun it), tap
-                    // events elsewhere. Bookkeeping-only notifications are
-                    // not output evidence: fallback still applies.
-                    Err(_) => !(emitted_billable || probe.wire_billable()),
-                    // A lane that reports the turn as failed without an
-                    // error channel — cli's nonzero exit surfaces as
-                    // `stop_reason: "error"` — could not serve this turn
-                    // only when it also produced no output and reported no
-                    // usage. Output — even when the retained cap dropped
-                    // the text entirely or an empty result record hid an
-                    // earlier stream — or usage proves the paid turn ran.
-                    Ok(result) => {
-                        result.stop_reason == "error"
-                            && result.text.is_empty()
-                            && !result.truncated
-                            && result.usage.is_none()
-                            && !(emitted_output || probe.wire_event())
+                        // The whole model chain exhausted on this lane — the
+                        // failure is provider-side, so the caller's next
+                        // profile is the right escalation, not another lane.
+                        Err(error) if model_failure(error) => break 'lanes outcome,
+                        // A lane failure after streamed text or billable usage
+                        // may already have produced paid output — replaying it
+                        // on the next lane would duplicate the turn. Evidence
+                        // is whatever this attempt produced: the wire journal
+                        // on lanes with a dispatch frame (attributed at
+                        // receipt, so a generic error cannot outrun it), tap
+                        // events elsewhere. Bookkeeping-only notifications are
+                        // not output evidence: fallback still applies.
+                        Err(_) => !(emitted_billable || probe.wire_billable()),
+                        // A lane that reports the turn as failed without an
+                        // error channel — cli's nonzero exit surfaces as
+                        // `stop_reason: "error"` — could not serve this turn
+                        // only when it also produced no output and reported no
+                        // usage. Output — even when the retained cap dropped
+                        // the text entirely or an empty result record hid an
+                        // earlier stream — or usage proves the paid turn ran.
+                        Ok(result) => {
+                            result.stop_reason == "error"
+                                && result.text.is_empty()
+                                && !result.truncated
+                                && result.usage.is_none()
+                                && !(emitted_output || probe.wire_event())
+                        }
                     }
                 };
                 if !lane_failed {
                     break 'lanes outcome;
                 }
                 // A failure no model change can fix — transport, protocol,
-                // a crashed server. Reopen the session on the next lane
-                // and replay the turn there.
+                // a crashed server — or a session-bound model retry whose
+                // lane re-establishes its session to bind the accepted
+                // entry. Reopen on the target lane — this one again for a
+                // session retry, the next declared variant otherwise — and
+                // replay the turn there; a reopen that fails keeps walking.
+                let mut retry_same_lane = session_retry;
                 loop {
                     let mut lane = lane.lock().await;
-                    lane.index += 1;
+                    let same_lane = retry_same_lane;
+                    retry_same_lane = false;
+                    if !same_lane {
+                        lane.index += 1;
+                    }
                     let Some(spec) = lane.specs.get(lane.index).cloned() else {
                         break 'lanes outcome;
                     };
@@ -1485,8 +1583,15 @@ impl VirtualSession {
                         .unwrap_or_else(|error| error.into_inner())
                         .active
                         .clone();
-                    let (new_open, turn_model, turn_effort) =
-                        lane_open(&spec, &lane.requested, &profile, active);
+                    let (mut new_open, turn_model, turn_effort) =
+                        lane_open(&spec, &lane.requested, &profile, active.clone());
+                    if same_lane {
+                        // The refused model was bound at establishment, so
+                        // the retry re-opens this lane with the accepted
+                        // entry in the model slot — the selector phase
+                        // this lane actually supports.
+                        new_open.config.model = active;
+                    }
                     let index = lane.index;
                     let adapter = lane.adapter(index);
                     let (tap_tx, next_tap_rx) = mpsc::unbounded_channel();
@@ -1502,9 +1607,31 @@ impl VirtualSession {
                                 // tap to the caller on its own — leftovers
                                 // are the dead attempt's evidence, never
                                 // counted against the reopened lane.
-                                lane.relay = EventRelay::spawn(next_tap_rx, lane.events.clone());
+                                lane.relay = EventRelay::spawn(
+                                    next_tap_rx,
+                                    lane.events.clone(),
+                                    lane.probe.clone(),
+                                );
                             }
                             Err(open_error) if model_failure(&open_error) => {
+                                // A session-bound retry refused at
+                                // establishment still owns its chain: the
+                                // next entry binds the model slot and this
+                                // same lane re-opens — a per-turn surface
+                                // would have kept walking the chain the
+                                // same way.
+                                if same_lane {
+                                    let mut chain = model_state
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner());
+                                    if let Some(next) = chain.remaining.first().cloned() {
+                                        chain.remaining.remove(0);
+                                        chain.active = Some(next);
+                                        drop(chain);
+                                        retry_same_lane = true;
+                                        continue;
+                                    }
+                                }
                                 break 'lanes Err(open_error);
                             }
                             Err(_) => continue,

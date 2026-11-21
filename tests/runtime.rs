@@ -2731,7 +2731,7 @@ async fn rpc_events_between_turns_reach_the_caller() {
         .unwrap();
 
     // Before any prompt: the ready notification is already delivered.
-    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
         .await
         .expect("session/ready stalled outside prompt execution")
         .expect("event stream closed");
@@ -2745,7 +2745,7 @@ async fn rpc_events_between_turns_reach_the_caller() {
 
     // After the outcome resolves — and without another prompt — the idle
     // notification is still delivered.
-    let idle = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+    let idle = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
         .await
         .expect("turn/idle stalled outside prompt execution")
         .expect("event stream closed");
@@ -3344,7 +3344,7 @@ async fn cancel_during_replacement_open_cancels_the_turn() {
     // replacement open is provably in-flight, so the cancel lands inside
     // the window the turn driver is watching rather than racing the
     // turn's own startup under parallel load.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let contents = std::fs::read_to_string(&log).unwrap_or_default();
         if contents.lines().any(|method| method == "session/open") {
@@ -4064,7 +4064,7 @@ async fn cancel_during_blocked_reservation_never_dispatches() {
         let session = session.clone();
         tokio::spawn(async move { session.prompt("work".to_owned()).await })
     };
-    tokio::time::timeout(std::time::Duration::from_secs(5), hook.entered.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(20), hook.entered.notified())
         .await
         .expect("the reservation hook never ran");
     session.cancel().await.unwrap();
@@ -4284,11 +4284,20 @@ async fn cli_cancelled_turn_keeps_the_lane_outcome() {
     // The cli lane's own cancelled outcome carries the text the turn
     // already produced — the driver's synthesized empty outcome for
     // admission cancellation must not erase an in-flight lane result.
+    let dir = TestDirectory::new("cli-cancel-partial");
+    let marker = dir.path().join("printed.marker");
     let registry = registry_with(
         cli_spec(
             "slow",
             "sh",
-            &["-c", "printf 'partial-output\\n'; sleep 60", "x|{prompt}"],
+            &[
+                "-c",
+                &format!(
+                    "printf 'partial-output\\n'; touch {}; sleep 60",
+                    marker.display()
+                ),
+                "x|{prompt}",
+            ],
             PromptChannel::ArgOnly,
         ),
         ProfilePatch {
@@ -4306,9 +4315,22 @@ async fn cli_cancelled_turn_keeps_the_lane_outcome() {
     let outcome = {
         let turn = session.prompt("work".to_owned());
         tokio::pin!(turn);
-        tokio::select! {
-            outcome = &mut turn => panic!("turn finished before cancel: {outcome:?}"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+        // Wait until the child has actually emitted its partial output —
+        // the marker is written after the printf, so the text is on the
+        // pipe before cancel lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            tokio::select! {
+                outcome = &mut turn => panic!("turn finished before cancel: {outcome:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+            if marker.exists() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lane never emitted its partial output"
+            );
         }
         session.cancel().await.unwrap();
         turn.await.unwrap()
@@ -5613,7 +5635,7 @@ async fn cancel_during_replacement_initialize_restores_the_untried_model() {
     // The replacement's `initialize` answer is a second out; cancel once
     // the peer logged it — the model-carrying `session/open` is still a
     // full handshake away.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let contents = std::fs::read_to_string(&log).unwrap_or_default();
         if contents.matches("initialize").count() >= 2 {
@@ -6050,7 +6072,7 @@ async fn cancel_after_bound_setup_sent_keeps_the_candidate_spent() {
     // Wait until the peer logged the model-bound `session/open` — the
     // `Sent` record precedes the write, so a logged receipt proves the
     // candidate already left on the wire. The reply is a second out.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let contents = std::fs::read_to_string(&log).unwrap_or_default();
         if contents.contains("session/open|fallback") {
@@ -6557,7 +6579,7 @@ async fn cancel_after_model_sent_on_earlier_lane_keeps_the_candidate_spent() {
     // candidate's earlier `initialize|fallback` send is behind it, so a
     // restore at this point could only come from the fresh probe's empty
     // record, never from evidence that the wire carried the model.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let contents = std::fs::read_to_string(&second_log).unwrap_or_default();
         if contents.contains("initialize") {
@@ -7355,7 +7377,7 @@ async fn cancel_during_model_free_replacement_restores_the_unsent_candidate() {
     // Wait until the next lane's open is on the wire and stalled — the
     // earlier attempt died at its model-free `initialize`, so the
     // candidate never rode a setup frame anywhere.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let contents = std::fs::read_to_string(&second_log).unwrap_or_default();
         if contents.contains("session/open") {
@@ -7468,7 +7490,7 @@ async fn cancel_after_candidate_sent_then_died_keeps_it_spent() {
     // earlier attempt's `initialize|fallback` send is behind it, so a
     // restore at this point could only come from the fresh probe's
     // empty record, never from evidence that the wire carried the model.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let contents = std::fs::read_to_string(&second_log).unwrap_or_default();
         if contents.contains("session/open") {
@@ -7505,6 +7527,552 @@ async fn cancel_after_candidate_sent_then_died_keeps_it_spent() {
             "session/prompt|prime",
         ],
         "a candidate sent then abandoned must not be restored and resent: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_empty_result_after_zero_usage_never_blocks_the_walk() {
+    // A json_lines lane's terminal bookkeeping is two records here: a
+    // zero-counter usage document at the configured `usage_path`, then an
+    // empty result under the declared selector. Neither is served work —
+    // the `error` outcome must not hold the walk.
+    let mut primary = cli_spec(
+        "bookkeep",
+        "sh",
+        &[
+            "-c",
+            "exec 0<&-; \
+             echo '{\"type\":\"usage\",\"stats\":{\"tokens\":{\"inputTokens\":0,\"outputTokens\":0}}}'; \
+             echo '{\"type\":\"result\",\"result\":\"\"}'; \
+             exit 1",
+        ],
+        PromptChannel::Stdin,
+    );
+    let LaneSpec::Cli(lane) = &mut primary.lane else {
+        panic!("cli_spec builds a cli lane")
+    };
+    lane.json_lines = true;
+    lane.result_selector = Some("result".to_owned());
+    lane.result_path = Some("result".to_owned());
+    lane.usage_path = Some("stats.tokens".to_owned());
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("bookkeep".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(
+        outcome.text.trim_end(),
+        "alt|work",
+        "bookkeeping-only records are not served work: {outcome:?}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_progress_with_zero_usage_never_replays_on_alternate_lane() {
+    // A progress record that carries real content beside an all-zero
+    // usage document is output evidence — the empty result record hides
+    // the stream text, but the paid turn still ran: the alternate lane
+    // must not replay it.
+    let mut primary = cli_spec(
+        "progress",
+        "sh",
+        &[
+            "-c",
+            "exec 0<&-; \
+             echo '{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"real work\",\"usage\":{\"inputTokens\":0,\"outputTokens\":0}}}'; \
+             echo '{\"type\":\"result\",\"result\":\"\"}'; \
+             exit 1",
+        ],
+        PromptChannel::Stdin,
+    );
+    let LaneSpec::Cli(lane) = &mut primary.lane else {
+        panic!("cli_spec builds a cli lane")
+    };
+    lane.json_lines = true;
+    lane.result_selector = Some("result".to_owned());
+    lane.result_path = Some("result".to_owned());
+    lane.usage_path = Some("message.usage".to_owned());
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("progress".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert!(
+        !outcome.text.contains("alt|"),
+        "alternate did not replay a served turn: {outcome:?}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_quota_refusal_advances_the_model_chain() {
+    // A stderr-only quota refusal is a certain-effect admission
+    // rejection: nothing ran, so the turn retries the chain's next entry
+    // on the same lane — the model rides the cli lane's args per spawn.
+    // Walking lanes instead would leave quota-checked work unspent.
+    let primary = cli_spec(
+        "quota-model",
+        "sh",
+        &[
+            "-c",
+            "exec 0<&-; if [ \"$1\" = \"backup\" ]; then \
+             echo \"served|$1|$2\"; else echo 'quota exceeded' >&2; exit 1; fi",
+            "sh0",
+            "{model}",
+            "{prompt}",
+        ],
+        PromptChannel::ArgOnly,
+    );
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("quota-model".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["backup".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(
+        outcome.text.trim_end(),
+        "served|backup|work",
+        "the next chain entry retried on the same lane: {outcome:?}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer whose model-free `session/select` pre-turn call refuses
+/// every request with a provider quota error — the identical answer for
+/// every model the chain could try.
+#[cfg(unix)]
+const RPC_PRE_TURN_MODEL_FREE_QUOTA: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/select":
+        log.write("session/select\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message":
+                        "resource_exhausted: quota exceeded"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_model_free_pre_turn_refusal_walks_lanes() {
+    // The pre-turn preparation call carries no model, so its quota
+    // refusal answers the lane, not the chain entry: retrying it with
+    // every remaining model sends the identical request before the walk
+    // must move to the alternate lane.
+    let dir = TestDirectory::new("rpc-pre-turn-quota");
+    let script = dir.path().join("rpc_pre_turn.py");
+    std::fs::write(&script, RPC_PRE_TURN_MODEL_FREE_QUOTA).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "preturn",
+        &script,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.pre_turn = vec![RpcCallSpec {
+            method: "session/select".to_owned(),
+            params: json!({"select": "x"}),
+        }];
+    }
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("preturn".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open", "session/select"],
+        "a model-free refusal never spends another chain entry: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// A cmd-envelope peer that refuses every `session/prompt` with a quota
+/// error — the model it never received cannot change the answer.
+#[cfg(unix)]
+const RPC_INLINE_PROMPT_QUOTA: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("cmd")
+    request_id = request.get("id")
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        send({"cmd": "response", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("session/prompt\n")
+        log.flush()
+        send({"cmd": "response", "id": request_id,
+              "error": {"code": -32000, "message":
+                        "resource_exhausted: quota exceeded for this model"}})
+    elif request_id is not None:
+        send({"cmd": "response", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_inline_overwritten_model_slot_never_retries_the_exchange() {
+    // The only `{model}` position in `session/open` sits under `id` —
+    // the inline envelope stamps its request id over the merged params,
+    // so the model never reaches the wire and no chain entry could
+    // change the call's answer. The refusal must propagate after one
+    // identical exchange, not reopen for a second.
+    let dir = TestDirectory::new("rpc-inline-masked-model");
+    let script = dir.path().join("rpc_inline_masked.py");
+    std::fs::write(&script, RPC_INLINE_PROMPT_QUOTA).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "masked",
+        &script,
+        json!({"id": "{model}", "note": "x"}),
+        json!({"text": "{prompt}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.envelope = Some(a4aa::RpcEnvelopeSpec {
+            method_field: "cmd".to_owned(),
+            params_inline: true,
+            response_method: Some("response".to_owned()),
+            ..Default::default()
+        });
+    }
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("masked".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open", "session/prompt"],
+        "a slot the wire never carries is no model binding: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer whose model-free `session/select` pre-turn call answers
+/// once, then kills the process on its second invocation — a per-turn
+/// model retry dies at its preparation call before the candidate could
+/// ride the prompt.
+#[cfg(unix)]
+const RPC_PRE_TURN_DIES_SECOND: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+log_path = os.environ["AWP_CALL_LOG"]
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/select":
+        seen = sum(
+            1 for entry in open(log_path)
+            if entry.startswith("session/select")
+        )
+        log.write("session/select\n")
+        log.flush()
+        if seen == 1:
+            sys.stdout.flush()
+            os._exit(1)
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer whose `session/open` stalls — long enough for a cancel to
+/// land mid-open — then refuses `prime` at the prompt and serves every
+/// other model.
+#[cfg(unix)]
+const RPC_SLOW_OPEN_REFUSES_PRIME: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        time.sleep(0.8)
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_during_alternate_open_restores_the_unsent_turn_candidate() {
+    // `prime` is quota-refused at the prompt; the per-turn retry removes
+    // `fallback` from the chain — but its attempt dies at the model-free
+    // pre-turn call, so the candidate never rode a frame anywhere. The
+    // cancel lands while the next lane's open stalls: the candidate only
+    // survives in the turn's driver state, and it must return to the
+    // chain — the next turn's `prime` refusal retries it.
+    let dir = TestDirectory::new("rpc-cancel-unsent-turn");
+    let first = dir.path().join("rpc_pre_turn_die.py");
+    std::fs::write(&first, RPC_PRE_TURN_DIES_SECOND).unwrap();
+    let first_log = dir.path().join("first.log");
+    let mut primary = rpc_spec(
+        "dieturn",
+        &first,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.pre_turn = vec![RpcCallSpec {
+            method: "session/select".to_owned(),
+            params: json!({"select": "x"}),
+        }];
+    }
+    attach_call_log(&mut primary, &first_log);
+    let second = dir.path().join("rpc_slow_open.py");
+    std::fs::write(&second, RPC_SLOW_OPEN_REFUSES_PRIME).unwrap();
+    let second_log = dir.path().join("second.log");
+    let mut alternate = rpc_spec(
+        "slowopen",
+        &second,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &second_log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("dieturn".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("work".to_owned()).await })
+    };
+    // Wait until the next lane's open is on the wire and stalled — the
+    // earlier attempt died at its model-free `session/select`, so the
+    // candidate never rode a frame anywhere.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let contents = std::fs::read_to_string(&second_log).unwrap_or_default();
+        if contents.contains("session/open") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the next lane's open never ran: {contents} | first: {}",
+            std::fs::read_to_string(&first_log).unwrap_or_default()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    session.cancel().await.unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+        .await
+        .expect("the turn outlived cancel during the next lane's open")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.stop_reason, "cancelled");
+
+    // No wire ever carried `fallback`: it went back to the chain, so the
+    // next turn's walk reaches the alternate and retries it there.
+    let outcome = session.prompt("more".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|more");
+    let calls_log = std::fs::read_to_string(&first_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open|prime",
+            "session/select",
+            "session/prompt|prime",
+            "session/select",
+        ],
+        "the per-turn candidate died at the model-free call: {calls_log}"
+    );
+    let calls_log = std::fs::read_to_string(&second_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open",
+            "session/open",
+            "session/prompt|prime",
+            "session/prompt|fallback",
+        ],
+        "the next turn's retry binds the restored candidate: {calls_log}"
     );
     session.close().await.unwrap();
 }

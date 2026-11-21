@@ -308,6 +308,9 @@ impl VirtualAgent {
         let reservations = ReservationSlot::default();
         let mut lane_error = None;
         for (lane_index, spec) in self.specs.iter().enumerate() {
+            // The last candidate this lane's open attempts actually put
+            // on the wire — a refused qualified model whose refusal bound.
+            let mut carried_model: Option<String> = None;
             let (mut lane_request, turn_model_default, turn_effort_default) =
                 lane_open(spec, &request, &self.profile, chain.first().cloned());
             // A requested model the lane cannot express at establishment
@@ -325,6 +328,7 @@ impl VirtualAgent {
                 let observer: SharedObserver = Some(probe.clone());
                 let result = self
                     .adapter(spec, &reservations)
+                    .secrets(probe.wrap_secrets(self.secrets.clone()))
                     .observer(observer)
                     .open_session(lane_request.clone(), tap_tx)
                     .await;
@@ -342,6 +346,11 @@ impl VirtualAgent {
                             lane_error = Some(error);
                             break None;
                         }
+                        // A refusal that binds the model proves the wire
+                        // carried this candidate — remember it so a later
+                        // open that omits its model slot publishes the
+                        // carried entry rather than the phantom request.
+                        carried_model = lane_request.config.model.clone();
                         let Some(next) = next_model(&chain, lane_request.config.model.as_deref())
                         else {
                             // Model exhaustion is provider-side: remaining
@@ -361,11 +370,24 @@ impl VirtualAgent {
             let Some((session, effective_request, tap_rx, probe)) = session else {
                 continue;
             };
-            let active_model = effective_request
-                .config
-                .model
-                .clone()
-                .or_else(|| turn_model_default.clone());
+            // The requested model publishes only with carry evidence: an
+            // open whose model slot resolves absent — an unqualified
+            // `{modelProvider}` — omits the member, the peer binds its own
+            // default, and the omitted fallback neither publishes nor
+            // leaves the chain. A lane whose establishment call binds
+            // nothing keeps the stored-default reading.
+            let bound = !model_binds_at_open(spec, resuming(&effective_request))
+                || !probe.has_dispatch_point()
+                || probe.model_setup_sent();
+            let active_model = if bound {
+                effective_request
+                    .config
+                    .model
+                    .clone()
+                    .or_else(|| turn_model_default.clone())
+            } else {
+                carried_model
+            };
             let remaining_models = remaining_models(&chain, active_model.as_deref());
             return Ok(VirtualSession {
                 session: Arc::new(tokio::sync::RwLock::new(session)),
@@ -443,7 +465,7 @@ impl LaneState {
         let probe = DispatchProbe::new(self.observer.clone(), &self.specs[index], request);
         let observer: SharedObserver = Some(probe.clone());
         let mut adapter = Adapter::new(self.specs[index].clone())
-            .secrets(self.secrets.clone())
+            .secrets(probe.wrap_secrets(self.secrets.clone()))
             .observer(observer);
         if let Some(handler) = &self.permission {
             adapter = adapter.permission(handler.clone());
@@ -808,10 +830,10 @@ struct SetupWire {
     /// a same-method call the adapter skipped because its optional leaves
     /// all resolved empty never matches.
     template: serde_json::Value,
-    /// Params-root-relative paths whose template leaf declares a
-    /// `{model}`-family placeholder — a populated wire slot makes the
-    /// frame model-carrying.
-    model_slots: Vec<Vec<String>>,
+    /// Params-root-relative positions whose template leaf declares a
+    /// `{model}`-family placeholder, with the leaf text — a slot is
+    /// model-carrying only when a model token in it resolved to a value.
+    model_slots: Vec<(Vec<String>, String)>,
 }
 
 /// One setup request observed on the wire, awaiting its response.
@@ -822,6 +844,9 @@ struct SentSetup {
     /// only a model-carrying call's refusal is an answer about the
     /// model a chain entry can change.
     carries_model: bool,
+    /// Whether this entry is the session call — its successful response
+    /// is where the session id's presence is learned.
+    binds_session: bool,
 }
 
 /// Sent setup requests still awaiting a response, plus the call claims
@@ -987,10 +1012,11 @@ struct DispatchProbe {
     /// this attempt's armed text.
     prompt_slots: Vec<(Vec<String>, String)>,
     /// The prompt params template's `{model}`-family positions that
-    /// survive the lane's encoding — a slot the inline envelope stamps
-    /// over never reaches the wire, so a populated surviving slot is what
-    /// makes the prompt frame model-carrying.
-    prompt_model_slots: Vec<Vec<String>>,
+    /// survive the lane's encoding, with their leaf text — a slot the
+    /// inline envelope stamps over never reaches the wire, and a leaf
+    /// whose model tokens all resolved empty (`provider:{modelProvider}`
+    /// on an unqualified candidate) emits scaffolding, never a model.
+    prompt_model_slots: Vec<(Vec<String>, String)>,
     /// Whether this attempt's prompt frame populated an effective model
     /// slot — the request's model reached the wire below the prompt's
     /// own dispatch.
@@ -1038,10 +1064,20 @@ struct DispatchProbe {
     session_effort: Option<String>,
     session_instructions: Option<String>,
     cwd: String,
+    /// The setup-call index that binds the session id — the session
+    /// call this open selects — so its successful response settles
+    /// `session_id`'s presence for every later turn-phase call.
+    session_call: Option<usize>,
     /// The session id the turn phase's calls substitute — a resume
     /// binding is known verbatim, a process-minted id is present but
-    /// unreadable, and a peer-assigned id is unknowable either way.
-    session_id: SessionIdVar,
+    /// unreadable, and a peer-assigned id is unknowable until the
+    /// session call's response supplies or omits it.
+    session_id: std::sync::Mutex<SessionIdVar>,
+    /// Secret presence journaled by the adapter's own resolutions: each
+    /// `{secret:NAME}` key records whether the resolver produced a value
+    /// — never the value itself — so a skipped secret-only call cannot
+    /// claim a later same-method frame.
+    secrets: Arc<std::sync::Mutex<std::collections::BTreeMap<String, bool>>>,
     /// Requests journal against `setup_calls` until `reset` opens the
     /// turn phase — the open's calls precede every prompt — and
     /// against `turn_calls` afterwards, so a same-method collision
@@ -1120,7 +1156,9 @@ impl DispatchProbe {
             session_effort: None,
             session_instructions: None,
             cwd: String::new(),
-            session_id: SessionIdVar::Absent,
+            session_call: None,
+            session_id: std::sync::Mutex::new(SessionIdVar::Absent),
+            secrets: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             setup_phase: AtomicBool::new(true),
             setup_journal: std::sync::Mutex::new(SetupJournal {
                 claimed: Vec::new(),
@@ -1198,19 +1236,21 @@ impl DispatchProbe {
             probe.session_model = request.config.model.clone();
             probe.session_effort = request.config.effort.clone();
             probe.session_instructions = request.config.instructions.clone();
-            probe.session_id = if rpc.session_scope == a4aa::SessionScope::Process {
-                // Process-scoped ids are minted per spawn — present on
-                // the wire but unknowable to the journal.
-                SessionIdVar::Wild
-            } else {
-                match request.resume.as_deref().filter(|v| !v.trim().is_empty()) {
-                    // A resume binding is the session id verbatim.
-                    Some(id) => SessionIdVar::Known(id.to_owned()),
-                    // A fresh session's id is assigned by the peer's open
-                    // response — unknowable presence and value.
-                    None => SessionIdVar::Flexible,
-                }
-            };
+            probe.session_id =
+                std::sync::Mutex::new(if rpc.session_scope == a4aa::SessionScope::Process {
+                    // Process-scoped ids are minted per spawn — present on
+                    // the wire but unknowable to the journal.
+                    SessionIdVar::Wild
+                } else {
+                    match request.resume.as_deref().filter(|v| !v.trim().is_empty()) {
+                        // A resume binding is the session id verbatim.
+                        Some(id) => SessionIdVar::Known(id.to_owned()),
+                        // A fresh session's id is assigned by the peer's
+                        // open response — unknowable presence and value
+                        // until that response is journaled.
+                        None => SessionIdVar::Flexible,
+                    }
+                });
             // The session call is the setup list's tail when one exists;
             // only it substitutes the resume binding — `initialize` runs
             // without a session id. Every other setup var is the open
@@ -1225,6 +1265,7 @@ impl DispatchProbe {
                     .then(|| setup_calls.len() - 1),
                 _ => rpc.session_open.is_some().then(|| setup_calls.len() - 1),
             };
+            probe.session_call = session_index;
             let config_input = |session_id: SessionIdVar| SelectorInput {
                 cwd: &cwd,
                 prompt: "",
@@ -1289,7 +1330,7 @@ impl DispatchProbe {
                         .retain(|(path, _)| !overwritten.contains(path[0].as_str()));
                     probe
                         .prompt_model_slots
-                        .retain(|path| !overwritten.contains(path[0].as_str()));
+                        .retain(|(path, _)| !overwritten.contains(path[0].as_str()));
                 }
                 probe.overwritten = overwritten.clone();
                 for call in probe
@@ -1299,13 +1340,24 @@ impl DispatchProbe {
                 {
                     if call.params_at_root {
                         call.model_slots
-                            .retain(|path| !overwritten.contains(path[0].as_str()));
+                            .retain(|(path, _)| !overwritten.contains(path[0].as_str()));
                     }
                 }
             }
             probe.prompt_carries_text = !probe.prompt_slots.is_empty();
         }
         Arc::new(probe)
+    }
+
+    /// Wrap the host's secret resolver so every resolution the adapter
+    /// performs also journals the name's presence — never the value —
+    /// into the call-matching journal. Resolution precedes the frame
+    /// that uses it, so presence is always settled at claim time.
+    fn wrap_secrets(&self, inner: Arc<dyn SecretResolver>) -> Arc<dyn SecretResolver> {
+        Arc::new(ProbeSecrets {
+            inner,
+            journal: self.secrets.clone(),
+        })
     }
 
     /// Whether the lane has an observable dispatch point — the wire
@@ -1546,7 +1598,11 @@ impl DispatchProbe {
                 instructions: self.session_instructions.as_deref(),
                 permission: None,
                 provider: None,
-                session_id: self.session_id.clone(),
+                session_id: self
+                    .session_id
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone(),
             });
             journal.sent.clear();
             journal
@@ -1755,21 +1811,35 @@ fn prompt_slots(template: &serde_json::Value) -> Vec<(Vec<String>, String)> {
     slots
 }
 
-/// Every `{model}`-family position in a params template: the path from
-/// the params root to each leaf declaring `{model}`, `{modelProvider}`
-/// or `{modelId}` — the same placeholder set the lane's selector
-/// discovery reads. A populated wire slot marks the frame as carrying a
-/// model.
-fn model_slots(template: &serde_json::Value) -> Vec<Vec<String>> {
-    const MODEL_NAMES: &[&str] = &["model", "modelProvider", "modelId"];
-    fn walk(value: &serde_json::Value, path: &mut Vec<String>, slots: &mut Vec<Vec<String>>) {
+/// The `{model}`-family placeholder names a model slot can declare —
+/// the same set the lane's selector discovery reads.
+const MODEL_NAMES: &[&str] = &["model", "modelProvider", "modelId"];
+
+/// Whether a model slot's leaf carried a selector value under `vars`:
+/// a populated wire field is model-carrying only when one of the
+/// leaf's model tokens resolved to something — `provider:{modelProvider}`
+/// still emits `provider:` for an unqualified candidate, and that
+/// scaffolding is no model the peer could have bound.
+fn leaf_carries_model(leaf: &str, vars: &ProbeVars) -> bool {
+    MODEL_NAMES.iter().any(|name| {
+        leaf.contains(&format!("{{{name}}}"))
+            && vars.known.get(*name).is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn model_slots(template: &serde_json::Value) -> Vec<(Vec<String>, String)> {
+    fn walk(
+        value: &serde_json::Value,
+        path: &mut Vec<String>,
+        slots: &mut Vec<(Vec<String>, String)>,
+    ) {
         match value {
             serde_json::Value::String(leaf)
                 if MODEL_NAMES
                     .iter()
                     .any(|name| leaf.contains(&format!("{{{name}}}"))) =>
             {
-                slots.push(path.clone());
+                slots.push((path.clone(), leaf.clone()));
             }
             serde_json::Value::Array(items) => {
                 for (index, item) in items.iter().enumerate() {
@@ -1835,6 +1905,22 @@ fn slot_at<'a>(mut value: &'a serde_json::Value, path: &[String]) -> Option<&'a 
         })?;
     }
     Some(value)
+}
+
+/// The session id a session call's result binds — the same extraction
+/// the lane applies to its open or resume answer: `sessionId`,
+/// `session_id` or `id`, one object level deep included.
+fn response_binding(result: &serde_json::Value) -> Option<String> {
+    fn id_in(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+        ["sessionId", "session_id", "id"]
+            .iter()
+            .find_map(|key| map.get(*key)?.as_str().map(str::to_owned))
+    }
+    let map = result.as_object()?;
+    id_in(map).or_else(|| {
+        map.values()
+            .find_map(|value| value.as_object().and_then(id_in))
+    })
 }
 
 /// Walk a dotted path into a JSON value.
@@ -1939,11 +2025,25 @@ enum LeafClass {
     Literal,
 }
 
-fn leaf_class(name: &str, vars: &ProbeVars) -> LeafClass {
+fn leaf_class(
+    name: &str,
+    vars: &ProbeVars,
+    secrets: &std::collections::BTreeMap<String, bool>,
+) -> LeafClass {
     if vars.absent.contains(name) {
         LeafClass::Absent
-    } else if vars.flexible.contains(name) || name.starts_with("secret:") {
+    } else if vars.flexible.contains(name) {
         LeafClass::Flexible
+    } else if name.starts_with("secret:") {
+        // A secret resolves through the adapter's own resolver — the
+        // journaled presence is the answer the substitution used. A
+        // resolved secret is present but unreadable; an unresolved one
+        // is absent; before any resolution it is merely possible.
+        match secrets.get(name) {
+            Some(true) => LeafClass::Wild,
+            Some(false) => LeafClass::Absent,
+            None => LeafClass::Flexible,
+        }
     } else if vars.wild.contains(name) {
         LeafClass::Wild
     } else if vars.known.contains_key(name) {
@@ -1966,9 +2066,15 @@ fn whole_placeholder(leaf: &serde_json::Value) -> Option<&str> {
 
 /// The string a template leaf resolves to under `vars`, or `None` when
 /// a placeholder's value is unknowable — the lane's own
-/// `substitute_text` tokenization: unmatched braces stay literal,
-/// undeclared names stay literal, absent selectors contribute `""`.
-fn expected_leaf(leaf: &str, vars: &ProbeVars) -> Option<String> {
+/// `substitute_text` tokenization: unmatched braces stay literal and
+/// any name the resolved selector table does not hold stays literal,
+/// `sessionId`/`turnId`/secret included — absent values never enter the
+/// adapter's `values`, so embedded tokens keep their braces.
+fn expected_leaf(
+    leaf: &str,
+    vars: &ProbeVars,
+    secrets: &std::collections::BTreeMap<String, bool>,
+) -> Option<String> {
     let mut output = String::new();
     let mut rest = leaf;
     while let Some(open) = rest.find('{') {
@@ -1976,14 +2082,21 @@ fn expected_leaf(leaf: &str, vars: &ProbeVars) -> Option<String> {
         let tail = &rest[open + 1..];
         match tail.find(['{', '}']) {
             Some(end) if tail.as_bytes()[end] == b'}' => {
-                match leaf_class(&tail[..end], vars) {
-                    LeafClass::Known => output.push_str(&vars.known[&tail[..end]]),
-                    LeafClass::Absent => {}
-                    LeafClass::Literal => {
-                        output.push('{');
-                        output.push_str(&tail[..=end]);
-                    }
-                    _ => return None,
+                let name = &tail[..end];
+                match leaf_class(name, vars, secrets) {
+                    LeafClass::Wild | LeafClass::Flexible => return None,
+                    _ => match vars.known.get(name) {
+                        // A value the lane put in `values` — an empty
+                        // string included — contributes exactly it.
+                        Some(value) => output.push_str(value),
+                        // A name the lane never put in `values` — an
+                        // absent optional id or an unresolved secret —
+                        // stays literal where it sits.
+                        None => {
+                            output.push('{');
+                            output.push_str(&tail[..=end]);
+                        }
+                    },
                 }
                 rest = &tail[end + 1..];
             }
@@ -2001,10 +2114,14 @@ fn expected_leaf(leaf: &str, vars: &ProbeVars) -> Option<String> {
 /// — a whole-leaf placeholder that is provably absent, or a flexible
 /// leaf whose presence was never certain. A member whose placeholder
 /// is known present cannot be missing from its call's frame.
-fn droppable(leaf: &serde_json::Value, vars: &ProbeVars) -> bool {
+fn droppable(
+    leaf: &serde_json::Value,
+    vars: &ProbeVars,
+    secrets: &std::collections::BTreeMap<String, bool>,
+) -> bool {
     whole_placeholder(leaf).is_some_and(|name| {
         matches!(
-            leaf_class(name, vars),
+            leaf_class(name, vars, secrets),
             LeafClass::Absent | LeafClass::Flexible
         )
     })
@@ -2024,34 +2141,36 @@ fn resolved_call_consistent(
     template: &serde_json::Value,
     params: &serde_json::Value,
     vars: &ProbeVars,
+    secrets: &std::collections::BTreeMap<String, bool>,
 ) -> bool {
     fn produces(
         template: &serde_json::Value,
         params: &serde_json::Value,
         vars: &ProbeVars,
+        secrets: &std::collections::BTreeMap<String, bool>,
     ) -> bool {
         match (template, params) {
             (serde_json::Value::Object(tmap), serde_json::Value::Object(pmap)) => {
                 pmap.keys().all(|key| tmap.contains_key(key))
                     && tmap.iter().all(|(key, leaf)| match pmap.get(key) {
-                        Some(value) => produces(leaf, value, vars),
-                        None => droppable(leaf, vars),
+                        Some(value) => produces(leaf, value, vars, secrets),
+                        None => droppable(leaf, vars, secrets),
                     })
             }
             (serde_json::Value::String(leaf), serde_json::Value::String(value)) => {
-                expected_leaf(leaf, vars).is_none_or(|expected| expected == *value)
+                expected_leaf(leaf, vars, secrets).is_none_or(|expected| expected == *value)
             }
             (serde_json::Value::Array(titems), serde_json::Value::Array(pitems)) => {
                 titems.len() == pitems.len()
                     && titems
                         .iter()
                         .zip(pitems.iter())
-                        .all(|(template, params)| produces(template, params, vars))
+                        .all(|(template, params)| produces(template, params, vars, secrets))
             }
             _ => template == params,
         }
     }
-    produces(template, params, vars)
+    produces(template, params, vars, secrets)
 }
 
 /// Whether a pre-turn call resolves to the empty params object the lane
@@ -2060,14 +2179,18 @@ fn resolved_call_consistent(
 /// maybe-present flexible member keeps the call claimable: the lane
 /// may have emitted it after all. Setup calls are never skipped — the
 /// lane issues whatever the template resolved to, `{}` included.
-fn turn_call_skipped(template: &serde_json::Value, vars: &ProbeVars) -> bool {
+fn turn_call_skipped(
+    template: &serde_json::Value,
+    vars: &ProbeVars,
+    secrets: &std::collections::BTreeMap<String, bool>,
+) -> bool {
     let serde_json::Value::Object(map) = template else {
         return false;
     };
     !map.is_empty()
         && map.values().all(|leaf| {
             whole_placeholder(leaf)
-                .is_some_and(|name| matches!(leaf_class(name, vars), LeafClass::Absent))
+                .is_some_and(|name| matches!(leaf_class(name, vars, secrets), LeafClass::Absent))
         })
 }
 
@@ -2195,6 +2318,29 @@ fn record_progress(record: &serde_json::Value) -> bool {
     .any(claim)
 }
 
+/// The adapter's secret resolver, wrapped to journal each name's
+/// presence for the probe's call matching: `substitute_resolved`
+/// resolves a call's `{secret:NAME}` leaves immediately before that
+/// call's frame is written, so the journaled answer is the presence the
+/// emitting — or skipping — substitution used. Only presence is
+/// recorded, never the secret value itself.
+struct ProbeSecrets {
+    inner: Arc<dyn SecretResolver>,
+    journal: Arc<std::sync::Mutex<std::collections::BTreeMap<String, bool>>>,
+}
+
+#[async_trait::async_trait]
+impl SecretResolver for ProbeSecrets {
+    async fn resolve(&self, reference: &str) -> Option<String> {
+        let resolved = self.inner.resolve(reference).await;
+        self.journal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(format!("secret:{reference}"), resolved.is_some());
+        resolved
+    }
+}
+
 impl Observer for DispatchProbe {
     fn record(&self, source: &'static str, direction: Direction, bytes: &[u8]) {
         if let Some(inner) = &self.inner {
@@ -2219,19 +2365,22 @@ impl Observer for DispatchProbe {
                 self.last_sent_was_prompt.store(prompt, Ordering::Release);
                 if prompt {
                     self.dispatched.store(true, Ordering::Release);
-                    // A populated surviving model slot marks the frame
-                    // model-carrying — the request's selector reached the
-                    // wire below the prompt's own dispatch.
-                    let model_sent = frame.as_ref().is_some_and(|frame| {
-                        let params = if self.prompt_at_root {
-                            frame
-                        } else {
-                            frame.get("params").unwrap_or(&serde_json::Value::Null)
-                        };
+                    // A surviving model slot marks the frame
+                    // model-carrying only when a `{model}`-family token
+                    // in its leaf resolved to a value under the
+                    // attempt's vars — `provider:{modelProvider}` still
+                    // emits `provider:` for an unqualified candidate, and
+                    // that scaffolding carried no model the peer could
+                    // have bound.
+                    let model_sent = {
+                        let journal = self
+                            .setup_journal
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
                         self.prompt_model_slots
                             .iter()
-                            .any(|slot| slot_at(params, slot).is_some_and(|value| !value.is_null()))
-                    });
+                            .any(|(_, leaf)| leaf_carries_model(leaf, &journal.turn_vars))
+                    };
                     if model_sent {
                         self.prompt_model_sent.store(true, Ordering::Release);
                     }
@@ -2282,6 +2431,10 @@ impl Observer for DispatchProbe {
                                 } else {
                                     (&self.turn_calls, &mut journal.turn_claimed)
                                 };
+                                let secrets = self
+                                    .secrets
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
                                 // A request claims the first unclaimed
                                 // call whose resolved shape the frame
                                 // actually is — the adapter's own issue
@@ -2325,22 +2478,37 @@ impl Observer for DispatchProbe {
                                         } else {
                                             call.template.clone()
                                         };
-                                        ((setup_phase || !turn_call_skipped(&call.template, vars))
-                                            && resolved_call_consistent(&template, &params, vars))
+                                        ((setup_phase
+                                            || !turn_call_skipped(&call.template, vars, &secrets))
+                                            && resolved_call_consistent(
+                                                &template, &params, vars, &secrets,
+                                            ))
                                         .then_some(index)
                                     })
                                 {
                                     flags[index] = true;
                                     let call = &calls[index];
-                                    let params = if call.params_at_root {
-                                        frame
+                                    let vars = if setup_phase {
+                                        &self.setup_vars[index]
                                     } else {
-                                        frame.get("params").unwrap_or(&serde_json::Value::Null)
+                                        &journal.turn_vars
                                     };
-                                    let carries_model = call.model_slots.iter().any(|slot| {
-                                        slot_at(params, slot).is_some_and(|value| !value.is_null())
+                                    // A claimed call carried the model
+                                    // only where a `{model}`-family
+                                    // token in one of its slot leaves
+                                    // resolved to a value — a populated
+                                    // field whose model token came back
+                                    // empty is scaffolding, not a model
+                                    // the peer could have bound.
+                                    let carries_model = call
+                                        .model_slots
+                                        .iter()
+                                        .any(|(_, leaf)| leaf_carries_model(leaf, vars));
+                                    journal.sent.push(SentSetup {
+                                        id,
+                                        carries_model,
+                                        binds_session: Some(index) == self.session_call,
                                     });
-                                    journal.sent.push(SentSetup { id, carries_model });
                                     Some(carries_model)
                                 } else {
                                     None
@@ -2412,6 +2580,25 @@ impl Observer for DispatchProbe {
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner()) =
                                     Some(sent.carries_model);
+                            } else if sent.binds_session {
+                                // The session call's answer settles the
+                                // session id's presence — the presence
+                                // the adapter substitutes into every
+                                // later call. A peer that assigns no id
+                                // leaves `{sessionId}` absent, not
+                                // flexible.
+                                let binding = frame
+                                    .get(self.result_field.as_deref().unwrap_or("result"))
+                                    .and_then(response_binding);
+                                let mut session_id = self
+                                    .session_id
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if matches!(*session_id, SessionIdVar::Flexible) {
+                                    *session_id = binding
+                                        .map(SessionIdVar::Known)
+                                        .unwrap_or(SessionIdVar::Absent);
+                                }
                             }
                         } else if self
                             .prompt_id
@@ -2721,7 +2908,7 @@ fn rpc_call_binds_model(rpc: &a4aa::RpcLaneSpec, call: &a4aa::RpcCallSpec) -> bo
             let overwritten = inline_overwritten(envelope);
             slots
                 .iter()
-                .any(|path| !overwritten.contains(path[0].as_str()))
+                .any(|(path, _)| !overwritten.contains(path[0].as_str()))
         }
         _ => true,
     }
@@ -3059,6 +3246,14 @@ impl VirtualSession {
             // candidate the peer may have received stays sent no matter
             // how fresh the next lane's probe is.
             let mut pending_sent = false;
+            // Carry evidence from the lane actually serving this turn —
+            // the send record belonging to the session that now holds
+            // the work. `pending_sent` folds every lane the candidate
+            // rode, including ones that already died: their sends make
+            // the candidate spent for requeue, but only the serving
+            // lane's own carry can publish it — a send on a dead lane
+            // proves nothing about the session that answered.
+            let mut serving_sent = false;
             // The chain candidate scheduled on this turn — on a per-turn
             // surface or carried across a lane switch — waiting for the
             // lane's acceptance evidence. It publishes as the session's
@@ -3236,7 +3431,9 @@ impl VirtualSession {
                     // request's model reached the wire — the same "sent
                     // stays spent" rule the replacement opens apply.
                     if request.model.is_some() && request.model == driver_model {
-                        pending_sent |= probe.prompt_model_sent() || probe.turn_model_sent();
+                        let sent = probe.prompt_model_sent() || probe.turn_model_sent();
+                        pending_sent |= sent;
+                        serving_sent |= sent;
                     }
                     // A cancel that landed while the prompt sat in
                     // admission ends the turn: the lane was idle when
@@ -3291,8 +3488,11 @@ impl VirtualSession {
                     // absent — an unqualified `{modelProvider}` — reaches
                     // the peer with the selector omitted, and whatever
                     // the peer then serves is its own default, never
-                    // proof it bound the candidate.
-                    let carried = !probe.has_dispatch_point() || pending_sent;
+                    // proof it bound the candidate. The evidence is the
+                    // serving lane's own send record — a send on a lane
+                    // that already died belongs to `pending_sent`'s
+                    // requeue history, not to this session.
+                    let carried = !probe.has_dispatch_point() || serving_sent;
                     if let Some(accepted) = pending_model.take() {
                         let confirmed = carried
                             && match &outcome {
@@ -3316,7 +3516,7 @@ impl VirtualSession {
                                     // attempt's prompt and pre-turn record.
                                     !model_failure(error)
                                         && (billed
-                                            || pending_sent && probe.dispatch_confirmed(error))
+                                            || serving_sent && probe.dispatch_confirmed(error))
                                 }
                             };
                         if confirmed {
@@ -3453,6 +3653,7 @@ impl VirtualSession {
                     // chain entry leaves `remaining` only while no wire
                     // carried it, so its history starts empty.
                     pending_sent = false;
+                    serving_sent = false;
                     prior = Some(outcome);
                 };
                 relay.flush().await;
@@ -3695,8 +3896,15 @@ impl VirtualSession {
                     // setup send of *this* candidate counts — an open
                     // that carried the still-active model says nothing
                     // about a candidate that rode the request instead.
-                    pending_sent |=
+                    let setup_carried =
                         probe.model_setup_sent() && new_open.config.model == pending_candidate;
+                    pending_sent |= setup_carried;
+                    // The serving record is this candidate lane's own —
+                    // assigned, not folded: an open that failed leaves a
+                    // dead lane's send in `pending_sent` for the requeue
+                    // question while the next lane's open restarts the
+                    // carry evidence its publication must show.
+                    serving_sent = setup_carried;
                     // Whether the reopen carried a scheduled-but-unaccepted
                     // chain candidate — its turn default commits only when
                     // the replay's acceptance evidence lands.
@@ -4778,5 +4986,209 @@ mod tests {
             false,
             &probe,
         ));
+    }
+
+    /// An absent `sessionId` inside a larger string stays literal on the
+    /// wire — the adapter never puts an absent id into `values`, so
+    /// `open-{sessionId}` emits verbatim. The journaled frame must
+    /// match the literal shape or the open's refusal loses its model
+    /// attribution entirely.
+    #[test]
+    fn embedded_absent_session_id_stays_literal_in_setup_matching() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                session_open: Some(a4aa::RpcCallSpec {
+                    method: "session/open".to_owned(),
+                    params: serde_json::json!({"marker": "open-{sessionId}", "model": "{model}"}),
+                }),
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/open","id":1,"params":{"marker":"open-{sessionId}","model":"prime"}}"#,
+        );
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_setup_binds_model());
+    }
+
+    /// The same literal rule holds in the turn phase: `{turnId}` is
+    /// never supplied, so a marker embedding it emits verbatim and the
+    /// frame still claims the call that produced it.
+    #[test]
+    fn embedded_absent_turn_id_stays_literal_in_turn_matching() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                pre_turn: vec![a4aa::RpcCallSpec {
+                    method: "session/select".to_owned(),
+                    params: serde_json::json!({"marker": "turn-{turnId}", "model": "{model}"}),
+                }],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        probe.reset("work", None, None);
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/select","id":1,"params":{"marker":"turn-{turnId}","model":"prime"}}"#,
+        );
+        assert!(probe.turn_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_turn_binds_model());
+    }
+
+    /// A peer that answers the open with no session id leaves
+    /// `{sessionId}` absent — not flexible: the id-only pre-turn call
+    /// resolves `{}` and the lane skips it, so the lone select frame on
+    /// the wire is the model call's and its refusal binds the model.
+    #[test]
+    fn sessionless_answer_skips_the_id_only_call() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                session_open: Some(a4aa::RpcCallSpec {
+                    method: "session/open".to_owned(),
+                    params: serde_json::json!({}),
+                }),
+                pre_turn: vec![
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"session": "{sessionId}"}),
+                    },
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"session": "{model}"}),
+                    },
+                ],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        // The session call's result carries no id — the presence the
+        // adapter substitutes into every later call settles to absent.
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/open","id":0,"params":{}}"#,
+        );
+        probe.record("rpc", Direction::Received, br#"{"id":0,"result":{}}"#);
+        probe.reset("work", None, None);
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/select","id":1,"params":{"session":"prime"}}"#,
+        );
+        assert!(probe.turn_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_turn_binds_model());
+    }
+
+    /// An unresolved `{secret:NAME}` drops its leaf like any absent
+    /// optional selector — presence the probe learns from the adapter's
+    /// own resolution journal. The secret-only call resolves `{}` and
+    /// the lane skips it; the select frame on the wire is the model
+    /// call's and its refusal binds.
+    #[test]
+    fn unresolved_secret_skips_the_secret_only_call() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                pre_turn: vec![
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"choice": "{secret:AWP_TOKEN}"}),
+                    },
+                    a4aa::RpcCallSpec {
+                        method: "session/select".to_owned(),
+                        params: serde_json::json!({"choice": "{model}"}),
+                    },
+                ],
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}"}),
+                },
+                ..Default::default()
+            },
+            Some("prime"),
+        );
+        // The adapter's resolver journaled the name absent — the
+        // presence record `wrap_secrets` produces at substitution time.
+        probe
+            .secrets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert("secret:AWP_TOKEN".to_owned(), false);
+        probe.reset("work", None, None);
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/select","id":1,"params":{"choice":"prime"}}"#,
+        );
+        assert!(probe.turn_model_sent());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_turn_binds_model());
+    }
+
+    /// A slot that stays populated is not automatically model-carrying:
+    /// `v:{modelProvider}` still emits `v:` for an unqualified
+    /// candidate — the model token resolved to nothing, so the frame
+    /// carried no selector the peer could have bound. A qualified
+    /// candidate resolves the token and does carry.
+    #[test]
+    fn populated_scaffold_slot_never_counts_as_model_carry() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"vendor": "v:{modelProvider}", "text": "{prompt}"}),
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        probe.reset("work", Some("fallback"), None);
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/prompt","id":7,"params":{"vendor":"v:","text":"work"}}"#,
+        );
+        assert!(!probe.prompt_model_sent());
+
+        probe.reset("work", Some("vnd/prime"), None);
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/prompt","id":9,"params":{"vendor":"v:vnd","text":"work"}}"#,
+        );
+        assert!(probe.prompt_model_sent());
     }
 }

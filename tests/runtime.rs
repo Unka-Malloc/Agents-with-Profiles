@@ -9047,3 +9047,661 @@ async fn rpc_inline_overwritten_turn_slot_never_retries_the_exchange() {
     );
     session.close().await.unwrap();
 }
+
+/// An rpc peer that logs the open's marker verbatim: a fresh session's
+/// `open-{sessionId}` has no id to substitute, so the literal token
+/// reaches the wire — and `prime` draws a quota refusal.
+#[cfg(unix)]
+const RPC_MARKER_OPEN_REFUSES_PRIME: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        session_model = params.get("model")
+        log.write("session/open|{}|{}\n".format(
+            params.get("marker"), session_model))
+        log.flush()
+        if session_model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+            continue
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("session/prompt|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  params.get("model") or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_embedded_absent_id_keeps_the_open_refusal_attributed() {
+    // The open embeds `{sessionId}` inside a larger marker: a fresh
+    // session has no id to substitute, so the pinned adapter emits the
+    // literal token `open-{sessionId}`. If the probe substitutes `""`
+    // instead, the journaled frame claims no declared call — the quota
+    // refusal loses its model attribution, the walk treats it as the
+    // lane's answer, and the fallback model never runs.
+    let dir = TestDirectory::new("rpc-embedded-id");
+    let script = dir.path().join("rpc_marker_open.py");
+    std::fs::write(&script, RPC_MARKER_OPEN_REFUSES_PRIME).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "embeddedid",
+        &script,
+        json!({"marker": "open-{sessionId}", "model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("embeddedid".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open|open-{sessionId}|prime",
+            "session/open|open-{sessionId}|fallback",
+            "session/prompt|fallback",
+        ],
+        "the literal embedded id must still claim the open call: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer whose `session/open` answers with no session id and
+/// whose `session/select` refuses `prime` under one shared `session`
+/// key.
+#[cfg(unix)]
+const RPC_SESSIONLESS_SELECT_REFUSES_PRIME: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/select":
+        selected = params.get("session")
+        log.write("session/select|{}\n".format(selected or "unset"))
+        log.flush()
+        if selected == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_sessionless_open_keeps_the_refusal_on_the_model() {
+    // The peer assigns no session id, so the id-only `session/select`
+    // call resolves `{}` and the lane skips it — the lone select frame
+    // on the wire is the model call's. If the journaled presence stays
+    // "maybe present", the skipped template claims the frame and the
+    // quota refusal reads as the lane's answer: the turn fails with
+    // quota while `fallback` was still available.
+    let dir = TestDirectory::new("rpc-sessionless-open");
+    let script = dir.path().join("rpc_sessionless.py");
+    std::fs::write(&script, RPC_SESSIONLESS_SELECT_REFUSES_PRIME).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "sessionless",
+        &script,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.pre_turn = vec![
+            RpcCallSpec {
+                method: "session/select".to_owned(),
+                params: json!({"session": "{sessionId}"}),
+            },
+            RpcCallSpec {
+                method: "session/select".to_owned(),
+                params: json!({"session": "{model}"}),
+            },
+        ];
+    }
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with(
+        primary,
+        ProfilePatch {
+            agent: Some("sessionless".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open",
+            "session/select|prime",
+            "session/select|fallback",
+            "session/prompt|fallback",
+        ],
+        "the skipped id call cannot claim the model frame: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer whose `session/select` refuses `prime` under a shared
+/// `choice` key — the secret-only call ahead of it resolves to nothing
+/// when the referenced secret is unset.
+#[cfg(unix)]
+const RPC_SECRET_SELECT_REFUSES_PRIME: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/select":
+        choice = params.get("choice")
+        log.write("session/select|{}\n".format(choice or "unset"))
+        log.flush()
+        if choice == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_unresolved_secret_keeps_the_refusal_on_the_model() {
+    // The first `session/select` template carries only a `{secret:...}`
+    // leaf the resolver cannot produce: the call resolves `{}` and the
+    // lane skips it. If the probe guesses at presence instead of
+    // reading the adapter's own resolution, the skipped call claims the
+    // model frame and the quota refusal reads as the lane's answer.
+    let dir = TestDirectory::new("rpc-secret-skip");
+    let script = dir.path().join("rpc_secret_select.py");
+    std::fs::write(&script, RPC_SECRET_SELECT_REFUSES_PRIME).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "secretskip",
+        &script,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.pre_turn = vec![
+            RpcCallSpec {
+                method: "session/select".to_owned(),
+                params: json!({"choice": "{secret:AWP_TEST_UNSET_SELECTOR_SECRET}"}),
+            },
+            RpcCallSpec {
+                method: "session/select".to_owned(),
+                params: json!({"choice": "{model}"}),
+            },
+        ];
+    }
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with(
+        primary,
+        ProfilePatch {
+            agent: Some("secretskip".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open",
+            "session/select|prime",
+            "session/select|fallback",
+            "session/prompt|fallback",
+        ],
+        "the skipped secret call cannot claim the model frame: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that refuses a `vnd:`-tagged prompt and serves the
+/// scaffolded `v:` prompt with its own default model.
+#[cfg(unix)]
+const RPC_VENDOR_TAG_REFUSES_CARRIED: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        vendor = params.get("vendor")
+        log.write("session/prompt|{}\n".format(vendor or "unset"))
+        log.flush()
+        if vendor == "v:vnd":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|peerdefault|{}".format(
+                      params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_scaffolded_slot_never_counts_as_model_carry() {
+    // The prompt's vendor field is `v:{modelProvider}`: the qualified
+    // `vnd/prime` resolves the token and the refusal it draws advances
+    // the chain, but the unqualified `fallback` still emits a populated
+    // `v:` — scaffolding, not a selector the peer could have bound. The
+    // peer serves its own default; nothing on the wire carried
+    // `fallback`, so it must not publish as the active model.
+    let dir = TestDirectory::new("rpc-scaffolded-slot");
+    let script = dir.path().join("rpc_vendor_tag.py");
+    std::fs::write(&script, RPC_VENDOR_TAG_REFUSES_CARRIED).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "scaffolded",
+        &script,
+        json!({}),
+        json!({"vendor": "v:{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("scaffolded".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|peerdefault|work");
+    assert_eq!(
+        session.active_model().as_deref(),
+        Some("vnd/prime"),
+        "a populated scaffolding field is not carry evidence"
+    );
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open", "session/prompt|v:vnd", "session/prompt|v:"],
+        "the fallback attempt emitted only the literal scaffold: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that serves its process's first open, refuses every
+/// prompt with quota, and exits mid-handshake on a *reopened* session —
+/// the marker file survives across spawns, so the candidate's setup
+/// send is journaled before the lane dies.
+#[cfg(unix)]
+const RPC_DIES_ON_REOPEN: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+marker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "opened")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        if os.path.exists(marker):
+            sys.exit(0)
+        open(marker, "w").close()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("session/prompt\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message":
+                        "resource_exhausted: quota exceeded for this model"}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer on the second lane: a model-free open and a prompt whose
+/// vendor field emits only scaffolding for an unqualified candidate.
+#[cfg(unix)]
+const RPC_VENDOR_TAG_ALWAYS_SERVES: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        vendor = params.get("vendor")
+        log.write("session/prompt|{}\n".format(vendor or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|peerdefault|{}".format(
+                  params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_dead_lane_send_never_publishes_the_candidate() {
+    // The primary lane binds its model at session establishment only:
+    // the prompt refusal advances the chain into a session-bound retry,
+    // and the reopen puts `fallback` on the wire — then the lane dies
+    // mid-handshake. The alternate's turn surface is `v:{modelProvider}`
+    // only: the unqualified candidate emits scaffolding, the peer
+    // serves its own default, and the dead lane's send must not satisfy
+    // the publication guard — a send on a lane that never served proves
+    // nothing about this session.
+    let dir = TestDirectory::new("rpc-dead-lane-send");
+    let dead_script = dir.path().join("rpc_dead_open.py");
+    std::fs::write(&dead_script, RPC_DIES_ON_REOPEN).unwrap();
+    let serve_script = dir.path().join("rpc_serving.py");
+    std::fs::write(&serve_script, RPC_VENDOR_TAG_ALWAYS_SERVES).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "bindlane",
+        &dead_script,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let mut alternate = rpc_spec(
+        "omitlane",
+        &serve_script,
+        json!({"session": "new"}),
+        json!({"vendor": "v:{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("bindlane".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = match session.prompt("work".to_owned()).await {
+        Ok(outcome) => outcome,
+        Err(error) => panic!(
+            "prompt failed: {error:?}\ncalls: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        ),
+    };
+    assert_eq!(outcome.text.trim_end(), "served|peerdefault|work");
+    assert_eq!(
+        session.active_model().as_deref(),
+        Some("prime"),
+        "the serving lane never carried `fallback` — the dead lane's \
+         send is requeue history, not publication evidence"
+    );
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open|prime",
+            "session/prompt",
+            "session/open|fallback",
+            "session/open",
+            "session/prompt|v:",
+        ],
+        "the dead lane's send stays spent; the serving lane emitted \
+         only scaffolding: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that refuses a `vnd` provider at open and opens its own
+/// default when the provider member is omitted.
+#[cfg(unix)]
+const RPC_PROVIDER_OPEN_REFUSES_VENDOR: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        provider = params.get("provider")
+        log.write("session/open|{}\n".format(provider or "unset"))
+        log.flush()
+        if provider == "vnd":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+            continue
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("session/prompt\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|peerdefault|{}".format(
+                  params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_omitted_open_fallback_never_publishes() {
+    // The open's only model surface is a whole `{modelProvider}` member:
+    // the qualified `vnd/prime` resolves it, the refusal advances the
+    // chain, and the unqualified `fallback` drops the member entirely —
+    // the peer opens with its own default. The requested fallback was
+    // never on the wire: it must neither publish as active nor leave
+    // the chain — the refused qualified entry stays the served reading.
+    let dir = TestDirectory::new("rpc-omitted-open");
+    let script = dir.path().join("rpc_provider_open.py");
+    std::fs::write(&script, RPC_PROVIDER_OPEN_REFUSES_VENDOR).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "omittedopen",
+        &script,
+        json!({"provider": "{modelProvider}"}),
+        json!({"text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with(
+        primary,
+        ProfilePatch {
+            agent: Some("omittedopen".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|peerdefault|work");
+    assert_eq!(
+        session.active_model().as_deref(),
+        Some("vnd/prime"),
+        "the fallback's provider member never reached the wire — it \
+         cannot publish as the session's model"
+    );
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open|vnd", "session/open|unset", "session/prompt"],
+        "the unqualified open omitted the provider member: {calls_log}"
+    );
+    session.close().await.unwrap();
+}

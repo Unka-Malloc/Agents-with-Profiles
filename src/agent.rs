@@ -1462,12 +1462,16 @@ fn model_failure(error: &a4aa::AdapterError) -> bool {
 /// on the wire — an actual open-time binding — as opposed to storing the
 /// open request's model as the default every later turn inherits. Rpc
 /// mirrors the adapter's own discovery: a `model`, `modelProvider` or
-/// `modelId` placeholder inside `initialize`, `session_open` or
-/// `session_resume` — a process-scoped lane has no session calls at all.
+/// `modelId` placeholder inside `initialize` or inside the session setup
+/// call this request actually selects — a process-scoped lane has no
+/// session calls at all. Resuming selects `session_resume` with
+/// `session_open` as fallback; a fresh session only ever calls
+/// `session_open`, so a `session_resume`-only placeholder must not read
+/// as an open-time binding for a fresh session.
 /// Acp negotiates the model in its session handshake and serve applies
 /// it through the server's model endpoint; cli substitutes it into every
 /// spawn's argv, so its open model is always a stored default.
-fn model_binds_at_open(spec: &AgentSpec) -> bool {
+fn model_binds_at_open(spec: &AgentSpec, resuming: bool) -> bool {
     match &spec.lane {
         LaneSpec::Cli(_) => false,
         LaneSpec::Rpc(rpc) => {
@@ -1476,10 +1480,14 @@ fn model_binds_at_open(spec: &AgentSpec) -> bool {
                     .iter()
                     .any(|name| contains_placeholder(&call.params, name))
             };
-            rpc.initialize.as_ref().is_some_and(&uses)
-                || (rpc.session_scope != a4aa::SessionScope::Process
-                    && (rpc.session_open.as_ref().is_some_and(&uses)
-                        || rpc.session_resume.as_ref().is_some_and(&uses)))
+            let setup = if rpc.session_scope == a4aa::SessionScope::Process {
+                None
+            } else if resuming {
+                rpc.session_resume.as_ref().or(rpc.session_open.as_ref())
+            } else {
+                rpc.session_open.as_ref()
+            };
+            rpc.initialize.as_ref().is_some_and(&uses) || setup.is_some_and(&uses)
         }
         _ => spec.selector_support(SelectorPhase::Session).model != SelectorSupport::Unsupported,
     }
@@ -1721,6 +1729,12 @@ impl VirtualSession {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(turn_reservation.clone());
             }
+            // The most recent completed attempt's result, carried across
+            // lane and model retries: a cancellation observed while the
+            // driver arranges the next attempt ends the turn with the
+            // lane's real answer — never an empty synthesized
+            // cancellation that erases it.
+            let mut prior: Option<a4aa::Result<TurnOutcome>> = None;
             let outcome = 'lanes: loop {
                 // This attempt's dispatch probe and event relay: settle
                 // whatever the lane queued outside a turn — session-open
@@ -1806,7 +1820,7 @@ impl VirtualSession {
                         ));
                     }
                     if cancellation.load(Ordering::Acquire) != cancel_mark {
-                        break 'lanes Ok(cancelled_outcome());
+                        break 'lanes prior.take().unwrap_or_else(|| Ok(cancelled_outcome()));
                     }
                     // One iteration is one physical prompt attempt: reset
                     // the wire journal so an earlier attempt's dispatch
@@ -1934,6 +1948,7 @@ impl VirtualSession {
                     driver_model = Some(next.clone());
                     pending_model = Some(next.clone());
                     request.model = Some(next);
+                    prior = Some(outcome);
                 };
                 relay.flush().await;
                 let (emitted_output, emitted_billable) = relay.disarm();
@@ -2073,7 +2088,7 @@ impl VirtualSession {
                         if new_open.config.model.as_deref() == Some(candidate.as_str())
                             && spec.selector_support(SelectorPhase::Turn).model
                                 != SelectorSupport::Unsupported
-                            && !model_binds_at_open(&spec)
+                            && !model_binds_at_open(&spec, new_open.resume.is_some())
                         {
                             new_open.config.model = model_state
                                 .lock()
@@ -2097,8 +2112,12 @@ impl VirtualSession {
                     if closing.load(Ordering::Acquire) {
                         break 'lanes outcome;
                     }
+                    // The cancellation mark moved before this candidate's
+                    // open even began — the completed attempt's result is
+                    // the turn's real answer; replaying nothing is the
+                    // point, not rewriting that result as cancelled.
                     if cancellation.load(Ordering::Acquire) != cancel_mark {
-                        break 'lanes Ok(cancelled_outcome());
+                        break 'lanes outcome;
                     }
                     // The replacement session opens while the installed
                     // one stays in place: a refused open leaves the live
@@ -2106,6 +2125,13 @@ impl VirtualSession {
                     // untouched — all three commit together only when the
                     // replacement actually opens.
                     let result = tokio::select! {
+                        // A completed open wins over a coincident
+                        // lifecycle signal: the installation guards below
+                        // make the same ordered decision under the write
+                        // lock — preferring the resolved arm keeps the
+                        // outcome deterministic instead of racing which
+                        // branch polled first.
+                        biased;
                         result = adapter.open_session(new_open.clone(), tap_tx) => result,
                         _ = notified.as_mut() => {
                             if closing.load(Ordering::Acquire) {
@@ -2135,12 +2161,19 @@ impl VirtualSession {
                                 // install it or let it serve the replay.
                                 if closing.load(Ordering::Acquire) {
                                     drop(guard);
-                                    let _ = new_session.close().await;
+                                    // Discarding the opened session is the
+                                    // same peer-independent teardown the
+                                    // retired lane gets below — its Drop
+                                    // kills the process tree. Awaiting its
+                                    // `session/close` would pin the turn
+                                    // driver and the caller's event stream
+                                    // on a peer that may never answer.
+                                    drop(new_session);
                                     break 'lanes outcome;
                                 }
                                 if cancellation.load(Ordering::Acquire) != cancel_mark {
                                     drop(guard);
-                                    let _ = new_session.close().await;
+                                    drop(new_session);
                                     break 'lanes Ok(cancelled_outcome());
                                 }
                                 // The lifecycle check stands immediately
@@ -2173,21 +2206,36 @@ impl VirtualSession {
                             // counted against the reopened lane.
                             lane.relay = EventRelay::spawn(next_tap_rx, lane.events.clone(), probe);
                             match pending_bind.take().or_else(|| driver_model.clone()) {
-                                // A candidate the lane switch carried:
-                                // it stays pending until the replay
-                                // proves the lane took it — bound in the
-                                // open request's session model or
-                                // deliverable on the lane's per-turn
-                                // surface, which carries it on the
-                                // replayed request. A lane with no model
-                                // selector never carries the candidate;
-                                // its replay proves nothing about it, so
-                                // it must not publish.
+                                // A candidate the lane switch carried and
+                                // bound into the open request is already
+                                // the replacement's session model — the
+                                // installed lane holds it whether or not
+                                // the replay ever confirms it. Publish it
+                                // now so a refused or cancelled replay
+                                // cannot leave `active_model` disagreeing
+                                // with the binding the session keeps.
                                 Some(carried_model)
                                     if lane.open.config.model.as_deref()
-                                        == Some(carried_model.as_str())
-                                        || spec.selector_support(SelectorPhase::Turn).model
-                                            != SelectorSupport::Unsupported =>
+                                        == Some(carried_model.as_str()) =>
+                                {
+                                    model_state
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .active = Some(carried_model.clone());
+                                    driver_model = Some(carried_model.clone());
+                                    pending_model = Some(carried_model);
+                                    carried = true;
+                                }
+                                // A candidate deliverable on the lane's
+                                // per-turn surface stays pending until the
+                                // replay proves the lane took it — it rides
+                                // the replayed request. A lane with no
+                                // model selector never carries the
+                                // candidate; its replay proves nothing
+                                // about it, so it must not publish.
+                                Some(carried_model)
+                                    if spec.selector_support(SelectorPhase::Turn).model
+                                        != SelectorSupport::Unsupported =>
                                 {
                                     driver_model = Some(carried_model.clone());
                                     pending_model = Some(carried_model);
@@ -2206,30 +2254,28 @@ impl VirtualSession {
                             }
                         }
                         Err(open_error) if model_failure(&open_error) => {
-                            // A session-bound retry refused at
-                            // establishment still owns its chain: the
-                            // next entry binds the model slot and this
-                            // same lane re-opens — a per-turn surface
-                            // would have kept walking the chain the
-                            // same way. The candidate stays pending:
-                            // the installed session and the accepted
-                            // binding carry no sign of it.
-                            if same_lane {
-                                let next = {
-                                    let mut chain = model_state
-                                        .lock()
-                                        .unwrap_or_else(|error| error.into_inner());
-                                    let next = chain.remaining.first().cloned();
-                                    if next.is_some() {
-                                        chain.remaining.remove(0);
-                                    }
-                                    next
-                                };
-                                if let Some(next) = next {
-                                    pending_bind = Some(next);
-                                    retry_same_lane = true;
-                                    continue;
+                            // A verified model refusal at establishment —
+                            // the lane's own setup answered about the
+                            // model, not about the lane — walks the chain
+                            // on this same lane whether the reopen is a
+                            // session-bound retry or a fallback's fresh
+                            // alternate. The candidate stays pending: the
+                            // installed session and the accepted binding
+                            // carry no sign of it.
+                            let next = {
+                                let mut chain = model_state
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                let next = chain.remaining.first().cloned();
+                                if next.is_some() {
+                                    chain.remaining.remove(0);
                                 }
+                                next
+                            };
+                            if let Some(next) = next {
+                                pending_bind = Some(next);
+                                retry_same_lane = true;
+                                continue;
                             }
                             break 'lanes Err(open_error);
                         }
@@ -2258,6 +2304,7 @@ impl VirtualSession {
                             compose_prompt(profile.instructions.as_deref(), &request.text);
                         instructions_included = true;
                     }
+                    prior = Some(outcome);
                     continue 'lanes;
                 }
             };

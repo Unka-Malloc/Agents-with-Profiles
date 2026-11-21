@@ -341,6 +341,12 @@ async fn run() -> i32 {
             if let Err(e) = close {
                 return failure(&e.to_string());
             }
+            // A turn the agent ended in error keeps its partial output on
+            // stdout but must not report success; the lane's own exit
+            // status is the honest code where the process produced one.
+            if outcome.stop_reason == "error" {
+                return outcome.exit_code.filter(|code| *code != 0).unwrap_or(1);
+            }
             0
         }
         Err(e) => failure(&e.to_string()),

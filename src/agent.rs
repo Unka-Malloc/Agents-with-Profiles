@@ -725,10 +725,12 @@ impl VirtualSession {
                     // error channel — cli's nonzero exit surfaces as
                     // `stop_reason: "error"` — could not serve this turn
                     // only when it also produced no output and reported no
-                    // usage. Output or usage proves the paid turn ran.
+                    // usage. Output — even when the retained cap dropped
+                    // the text entirely — or usage proves the paid turn ran.
                     Ok(result) => {
                         result.stop_reason == "error"
                             && result.text.trim().is_empty()
+                            && !result.truncated
                             && result.usage.is_none()
                     }
                 };

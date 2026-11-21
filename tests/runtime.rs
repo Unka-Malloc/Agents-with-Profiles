@@ -864,6 +864,41 @@ async fn cli_error_outcome_with_output_does_not_replay_on_alternate_lane() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cli_truncated_error_outcome_does_not_replay_on_alternate_lane() {
+    // The retained cap drops the entire turn text, yet truncation itself
+    // proves the primary produced output: replaying the prompt on the
+    // alternate would duplicate a turn that already ran.
+    let mut primary = cli_spec(
+        "paid",
+        "sh",
+        &["-c", "exec 0<&-; echo paid-output; exit 1"],
+        PromptChannel::Stdin,
+    );
+    primary.max_output_bytes = Some(0);
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("paid".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert!(outcome.truncated, "dropped output is still marked");
+    assert!(!outcome.text.contains("alt|"), "alternate did not replay");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn uncertain_prompt_failure_does_not_replay_on_alternate_lane() {
     // The primary prints a chunk and then reports a usage limit. The
     // refusal is uncertain-effect: replaying it on the alternate would

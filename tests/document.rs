@@ -646,3 +646,60 @@ fn file_secret_preserves_a_hash_inside_a_quoted_value() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A line shaped like a table header inside a TOML string is data, not
+/// document structure: only the parsed document may satisfy a key lookup.
+#[test]
+fn toml_file_secret_never_resolves_inside_a_string() {
+    let dir = secret_case("secret-toml-string");
+
+    let toml_path = dir.join("string.toml");
+    std::fs::write(
+        &toml_path,
+        concat!(
+            "blob = \"\"\"\n",
+            "[credentials]\n",
+            "token = \"masquerade\"\n",
+            "\"\"\"\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "credentials.token").resolve(),
+        None
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// YAML resolves by parsed structure: a flow mapping still answers its
+/// dotted path, and an apostrophe inside a plain scalar does not drag the
+/// trailing comment into the value.
+#[test]
+fn yaml_file_secret_resolves_flow_and_plain_scalar_forms() {
+    let dir = secret_case("secret-yaml-flow");
+
+    let flow_path = dir.join("flow.yaml");
+    std::fs::write(&flow_path, "credentials: {token: flow-value}\n").unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &flow_path, "credentials.token")
+            .resolve()
+            .as_deref(),
+        Some("flow-value")
+    );
+
+    let apostrophe_path = dir.join("apostrophe.yaml");
+    std::fs::write(
+        &apostrophe_path,
+        "credentials:\n  token: user's key # trailing comment\n",
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &apostrophe_path, "credentials.token")
+            .resolve()
+            .as_deref(),
+        Some("user's key")
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}

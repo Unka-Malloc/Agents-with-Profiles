@@ -151,103 +151,6 @@ fn expand_home(raw: &str) -> String {
     raw.replace("{home}", &home)
 }
 
-/// Remove an inline comment without treating a `#` inside a quoted scalar
-/// as the start of one. TOML starts a comment at any unquoted `#`; YAML
-/// requires the `#` to be separated from the preceding character.
-fn strip_inline_comment(line: &str, yaml: bool) -> &str {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match quote {
-            Some('"') => {
-                if character == '\\' {
-                    escaped = true;
-                } else if character == '"' {
-                    quote = None;
-                }
-            }
-            Some('\'') => {
-                if character == '\'' {
-                    // YAML doubles a single quote to escape it; TOML literal
-                    // strings have no escape and close at the first quote.
-                    if yaml && line[index + 1..].starts_with('\'') {
-                        escaped = true;
-                    } else {
-                        quote = None;
-                    }
-                }
-            }
-            Some(_) => {}
-            None => match character {
-                '"' => quote = Some('"'),
-                '\'' => quote = Some('\''),
-                '#' => {
-                    let separated = index == 0
-                        || line[..index]
-                            .chars()
-                            .next_back()
-                            .is_some_and(char::is_whitespace);
-                    if !yaml || separated {
-                        return line[..index].trim_end();
-                    }
-                }
-                _ => {}
-            },
-        }
-    }
-    line.trim_end()
-}
-
-/// Find `separator` outside quoted keys and values. For YAML a `:` only
-/// separates a mapping key when whitespace or the end of the line follows.
-fn find_separator(line: &str, separator: char, yaml: bool) -> Option<usize> {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match quote {
-            Some('"') => {
-                if character == '\\' {
-                    escaped = true;
-                } else if character == '"' {
-                    quote = None;
-                }
-            }
-            Some('\'') => {
-                if character == '\'' {
-                    if yaml && line[index + 1..].starts_with('\'') {
-                        escaped = true;
-                    } else {
-                        quote = None;
-                    }
-                }
-            }
-            Some(_) => {}
-            None => {
-                if character == '"' || character == '\'' {
-                    quote = Some(character);
-                } else if character == separator {
-                    let rests_empty_or_spaced = line[index + 1..]
-                        .chars()
-                        .next()
-                        .is_none_or(char::is_whitespace);
-                    if !yaml || rests_empty_or_spaced {
-                        return Some(index);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Split a dotted path into segments, honoring quoted segments that may
 /// contain a dot themselves.
 fn dotted_path(raw: &str) -> Vec<String> {
@@ -340,48 +243,6 @@ fn parse_double_quoted(raw: &str) -> Option<String> {
     None
 }
 
-fn parse_toml_value(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let value = if raw.starts_with('"') {
-        parse_double_quoted(raw)?
-    } else if let Some(literal) = raw.strip_prefix('\'') {
-        let end = literal.find('\'')?;
-        literal[..end].to_owned()
-    } else {
-        raw.to_owned()
-    };
-    (!value.trim().is_empty()).then_some(value)
-}
-
-fn parse_yaml_value(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let value = if raw.starts_with('"') {
-        parse_double_quoted(raw)?
-    } else if raw.starts_with('\'') {
-        let mut value = String::new();
-        let mut characters = raw.strip_prefix('\'')?.chars();
-        loop {
-            match characters.next()? {
-                '\'' if characters.as_str().starts_with('\'') => {
-                    characters.next();
-                    value.push('\'');
-                }
-                '\'' => break value,
-                character => value.push(character),
-            }
-        }
-    } else {
-        raw.to_owned()
-    };
-    (!value.trim().is_empty()).then_some(value)
-}
-
 fn extract_json_key(text: &str, key: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let mut current = &value;
@@ -403,95 +264,51 @@ fn extract_json_key(text: &str, key: &str) -> Option<String> {
     }
 }
 
+/// Resolve `key` against the parsed TOML document. Only a real document
+/// position can satisfy a lookup — table-shaped lines inside a string are
+/// data, never a match.
 fn extract_toml_key(text: &str, key: &str) -> Option<String> {
     let target = dotted_path(key);
     if target.is_empty() {
         return None;
     }
-    let mut table: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let line = strip_inline_comment(raw, false).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            let name = line.trim_start_matches('[').trim_end_matches(']').trim();
-            table = dotted_path(name);
-            continue;
-        }
-        let Some(equals) = find_separator(line, '=', false) else {
-            continue;
-        };
-        let mut path = table.clone();
-        path.extend(dotted_path(&line[..equals]));
-        if path == target {
-            return parse_toml_value(&line[equals + 1..]);
-        }
+    let document = toml::from_str::<toml::Value>(text).ok()?;
+    let mut current = &document;
+    for segment in &target {
+        current = current.as_table()?.get(segment)?;
     }
-    None
+    match current {
+        toml::Value::String(value) => (!value.trim().is_empty()).then(|| value.clone()),
+        toml::Value::Integer(value) => Some(value.to_string()),
+        toml::Value::Float(value) => Some(value.to_string()),
+        toml::Value::Boolean(value) => Some(value.to_string()),
+        toml::Value::Datetime(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
+/// Resolve `key` against the first document of the parsed YAML stream.
+/// Flow mappings, comments and scalars that merely look like mappings
+/// resolve by document structure alone.
 fn extract_yaml_key(text: &str, key: &str) -> Option<String> {
     let target = dotted_path(key);
     if target.is_empty() {
         return None;
     }
-    let mut stack: Vec<(usize, String)> = Vec::new();
-    // Indentation of the block sequence currently being scanned. A sequence
-    // index cannot be named by the dotted mapping path this contract
-    // supports, so nothing inside an item may be assembled into that path.
-    let mut sequence_indent: Option<usize> = None;
-    for raw in text.lines() {
-        let line = strip_inline_comment(raw, true);
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed == "---" || trimmed == "..." {
-            continue;
-        }
-        let indent = line.len() - line.trim_start().len();
-        if let Some(sequence) = sequence_indent {
-            if indent > sequence {
-                // A descendant of a sequence item, not of the mapping key
-                // that owns the sequence.
-                continue;
-            }
-            sequence_indent = None;
-        }
-        if trimmed == "-" || trimmed.starts_with("- ") {
-            while stack
-                .last()
-                .is_some_and(|(parent_indent, _)| *parent_indent >= indent)
-            {
-                stack.pop();
-            }
-            sequence_indent = Some(indent);
-            continue;
-        }
-        while stack
-            .last()
-            .is_some_and(|(parent_indent, _)| *parent_indent >= indent)
-        {
-            stack.pop();
-        }
-        let Some(colon) = find_separator(trimmed, ':', true) else {
-            continue;
-        };
-        let segment = unquote_path_segment(&trimmed[..colon]);
-        if segment.is_empty() {
-            continue;
-        }
-        let value = &trimmed[colon + 1..];
-        let mut path: Vec<String> = stack.iter().map(|(_, key)| key.clone()).collect();
-        path.push(segment.clone());
-        if path == target {
-            if let Some(value) = parse_yaml_value(value) {
-                return Some(value);
-            }
-        }
-        if value.trim().is_empty() {
-            stack.push((indent, segment));
-        }
+    let documents = yaml_rust2::YamlLoader::load_from_str(text).ok()?;
+    let mut current = documents.first()?;
+    for segment in &target {
+        current = current
+            .as_hash()?
+            .get(&yaml_rust2::Yaml::String(segment.clone()))?;
     }
-    None
+    match current {
+        yaml_rust2::Yaml::String(value) => (!value.trim().is_empty()).then(|| value.clone()),
+        yaml_rust2::Yaml::Integer(value) => Some(value.to_string()),
+        yaml_rust2::Yaml::Real(value) => Some(value.clone()),
+        yaml_rust2::Yaml::Boolean(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 /// One agent entry: the primary spec plus ordered protocol alternates for

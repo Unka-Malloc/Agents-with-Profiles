@@ -757,3 +757,66 @@ fn yaml_file_secret_resolves_flow_and_plain_scalar_forms() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A malformed dotted selector must fail closed rather than resolving a
+/// nearby real key: a quote that does not end its segment, an unclosed
+/// quote, an empty segment or a quote inside a bare segment never becomes
+/// a valid lookup.
+#[test]
+fn malformed_dotted_secret_selectors_fail_closed() {
+    let dir = secret_case("secret-malformed-path");
+
+    let toml_path = dir.join("malformed.toml");
+    std::fs::write(
+        &toml_path,
+        "\"a.b\" = \"literal-dotted\"\na.b = \"nested-b\"\n",
+    )
+    .unwrap();
+    // Valid forms still resolve: a fully quoted segment and a plain path.
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "\"a.b\"")
+            .resolve()
+            .as_deref(),
+        Some("literal-dotted")
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &toml_path, "a.b")
+            .resolve()
+            .as_deref(),
+        Some("nested-b")
+    );
+    for malformed in [
+        "\"a\"junk.b",
+        "a.\"unclosed",
+        "'a'junk.b",
+        "a.'unclosed",
+        "a..b",
+        "a.b.",
+        ".a.b",
+        "\"a\".b\"c\"",
+    ] {
+        assert_eq!(
+            file_recipe(FixtureFormat::Toml, &toml_path, malformed).resolve(),
+            None,
+            "malformed selector resolved: {malformed}"
+        );
+    }
+
+    let yaml_path = dir.join("malformed.yaml");
+    std::fs::write(&yaml_path, "a:\n  b: yaml-b\n").unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &yaml_path, "a.b")
+            .resolve()
+            .as_deref(),
+        Some("yaml-b")
+    );
+    for malformed in ["\"a\"junk.b", "a.\"unclosed", "a..b"] {
+        assert_eq!(
+            file_recipe(FixtureFormat::Yaml, &yaml_path, malformed).resolve(),
+            None,
+            "malformed selector resolved: {malformed}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}

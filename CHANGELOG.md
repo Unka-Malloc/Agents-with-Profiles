@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Reservation state is now scoped to the logical turn instead of an
+  agent-wide flag: each `VirtualSession` owns a reservation slot the turn
+  driver swaps per turn, so concurrent sessions can no longer overwrite
+  one another's `BeforeTurn` verdict. The hook runs at most once per turn —
+  a granted reservation carries across a pre-dispatch lane or model
+  fallback without re-booking, and a refusal of any effect class
+  propagates before either fallback decision can invoke the hook again.
+- Dispatch evidence is now transport-backed rather than `Sent`-record
+  intent: the wire journal tracks which frame the rpc writer attempted
+  last, so a `writer_failed` report on the prompt's own write is a
+  confirmed undelivered dispatch that may fall back, while a `Sent` frame
+  whose write never failed stays uncertain. Inbound notifications are
+  attributed to the turn at wire receipt — before the lane's delivery task
+  can lag behind a racing generic error — with envelope `method_field`,
+  `data_field` and response discrimination honored; stream text at the
+  lane's `text_path` and usage at its configured `usage_path` count as
+  billable evidence alongside the conventional usage carriers.
+- Malformed dotted secret selectors now fail closed: `"a"junk.b`, an
+  unclosed quote, an empty segment or a quote inside a bare segment no
+  longer resolve a nearby real key — every segment must parse completely.
 - The lane-fallback dispatch check no longer probes the failed rpc session
   with a real prompt: an empty probe bypassed the `BeforeTurn` reservation
   hook and could dispatch a paid turn on a healthy peer. Dispatch is now

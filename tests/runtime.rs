@@ -1520,3 +1520,261 @@ async fn rpc_error_after_streamed_text_does_not_replay_on_alternate() {
     assert_eq!(error.code, "agent_remote_error");
     session.close().await.unwrap();
 }
+
+/// An rpc peer that answers `session/open`, closes its own stdin and then
+/// sleeps with stdout still open: the prompt's write fails on the
+/// transport while the reader stays alive, so the failure is
+/// deterministically `writer_failed` rather than a racing `peer_closed`.
+#[cfg(unix)]
+const RPC_CLOSES_STDIN: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+request = json.loads(sys.stdin.readline())
+send({"jsonrpc": "2.0", "id": request["id"],
+      "result": {"sessionId": "awp-rpc-session"}})
+os.close(0)
+time.sleep(30)
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_prompt_write_failure_falls_back_to_alternate() {
+    // The transport reports `writer_failed` and the wire journal shows the
+    // prompt was the last frame the writer attempted — a confirmed
+    // undelivered dispatch the alternate lane may replay.
+    let dir = TestDirectory::new("rpc-write-failed");
+    let script = dir.path().join("rpc_close_stdin.py");
+    std::fs::write(&script, RPC_CLOSES_STDIN).unwrap();
+    let registry = registry_with_lanes(
+        rpc_spec(
+            "broken-pipe",
+            &script,
+            json!({}),
+            json!({"text": "{prompt}"}),
+        ),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("broken-pipe".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    session.close().await.unwrap();
+}
+
+/// A `BeforeTurn` hook that counts its invocations and returns a fixed
+/// verdict — the count proves the reservation runs once per logical turn.
+#[cfg(unix)]
+struct CountingHook {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    error: Option<awp::AdapterError>,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl awp::BeforeTurn for CountingHook {
+    async fn run(&self) -> awp::Result<()> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn before_turn_permanent_refusal_never_reprobes_or_replays() {
+    // A permanent refusal is still the reservation's verdict: it must
+    // propagate before the next lane invokes the hook for the same turn.
+    let dir = TestDirectory::new("reservation-permanent");
+    let script = dir.path().join("rpc_log.py");
+    std::fs::write(&script, RPC_LOG_METHODS).unwrap();
+    let log = dir.path().join("calls.log");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registry = registry_with_lanes(
+        rpc_logging_spec("reserved", &script, &log),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("reserved".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry
+        .resolve("p")
+        .unwrap()
+        .before_turn(std::sync::Arc::new(CountingHook {
+            calls: calls.clone(),
+            error: Some(awp::AdapterError::permanent(
+                "reservation_denied",
+                "session/prompt",
+            )),
+        }));
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "reservation_denied");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls_log.lines().any(|method| method == "session/prompt"),
+        "no prompt reached the wire: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn before_turn_quota_refusal_does_not_retry_the_model_chain() {
+    // A refusal the classifier would read as provider-side quota is still
+    // the reservation's verdict — it propagates before the chain advances
+    // and the hook runs for the same turn a second time.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registry = registry_with_lanes(
+        quota_fixture_spec("prime,fallback", ""),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("fixture".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry
+        .resolve("p")
+        .unwrap()
+        .before_turn(std::sync::Arc::new(CountingHook {
+            calls: calls.clone(),
+            error: Some(awp::AdapterError::retryable(
+                "agent_quota_exhausted",
+                "session/prompt",
+            )),
+        }));
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn granted_reservation_is_reused_across_lane_fallback() {
+    // The hook grants once; the first lane dies during its pre-turn call,
+    // before the prompt is dispatched. The replayed turn on the alternate
+    // reuses that grant — invoking the hook again could double-book the
+    // reservation for one turn.
+    let dir = TestDirectory::new("reservation-reuse");
+    let script = dir.path().join("rpc_kill.py");
+    std::fs::write(&script, RPC_DIES_ON_METHOD).unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registry = registry_with_lanes(
+        rpc_kill_spec("fragile", &script, "session/select"),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("fragile".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry
+        .resolve("p")
+        .unwrap()
+        .before_turn(std::sync::Arc::new(CountingHook {
+            calls: calls.clone(),
+            error: None,
+        }));
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    session.close().await.unwrap();
+}
+
+/// An rpc agent that reports usage at a configured carrier and then
+/// answers the prompt with a generic remote error — the usage proves the
+/// paid turn ran, so the failure must propagate.
+#[cfg(unix)]
+const RPC_USAGE_PATH_THEN_REFUSES: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "method": "meter",
+              "params": {"bill": {"tokens": {"output_tokens": 7}}}})
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message": "boom"}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_usage_at_configured_path_does_not_replay_on_alternate() {
+    // Usage at the lane's declared `usage_path` is billable evidence; a
+    // generic error after it cannot replay the turn on the alternate.
+    let dir = TestDirectory::new("usage-path");
+    let script = dir.path().join("rpc_meter.py");
+    std::fs::write(&script, RPC_USAGE_PATH_THEN_REFUSES).unwrap();
+    let mut primary = rpc_spec("metered", &script, json!({}), json!({"text": "{prompt}"}));
+    let LaneSpec::Rpc(lane) = &mut primary.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.usage_path = Some("bill.tokens".to_owned());
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("metered".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_remote_error");
+    session.close().await.unwrap();
+}

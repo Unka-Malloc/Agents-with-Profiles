@@ -152,10 +152,13 @@ fn expand_home(raw: &str) -> String {
 }
 
 /// Split a dotted path into segments, honoring quoted segments that may
-/// contain a dot themselves.
-fn dotted_path(raw: &str) -> Vec<String> {
+/// contain a dot themselves. Every segment must parse completely — a
+/// quoted segment has no text after its closing quote, a bare segment
+/// carries no quote characters — or the whole path is malformed and the
+/// lookup must fail rather than resolve a different key.
+fn dotted_path(raw: &str) -> Option<Vec<String>> {
     if raw.trim().is_empty() {
-        return Vec::new();
+        return None;
     }
     let mut segments = Vec::new();
     let mut start = 0;
@@ -183,39 +186,44 @@ fn dotted_path(raw: &str) -> Vec<String> {
             None => match character {
                 '"' | '\'' => quote = Some(character),
                 '.' => {
-                    segments.push(unquote_path_segment(&raw[start..index]));
+                    segments.push(unquote_path_segment(&raw[start..index])?);
                     start = index + 1;
                 }
                 _ => {}
             },
         }
     }
-    segments.push(unquote_path_segment(&raw[start..]));
-    segments
+    segments.push(unquote_path_segment(&raw[start..])?);
+    Some(segments)
 }
 
-fn unquote_path_segment(raw: &str) -> String {
+/// Decode one path segment completely. A quoted segment ends at its
+/// closing quote — trailing text is malformed, and a missing closing
+/// quote never collapses into an empty key. A bare segment is literal
+/// text without quote characters; an empty bare segment is malformed.
+fn unquote_path_segment(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.starts_with('"') {
-        parse_double_quoted(trimmed).unwrap_or_default()
+        parse_double_quoted(trimmed)
     } else if let Some(literal) = trimmed.strip_prefix('\'') {
-        literal
-            .find('\'')
-            .map(|end| literal[..end].to_owned())
-            .unwrap_or_default()
+        let end = literal.find('\'')?;
+        (end == literal.len() - 1).then(|| literal[..end].to_owned())
+    } else if trimmed.is_empty() || trimmed.contains('"') || trimmed.contains('\'') {
+        None
     } else {
-        trimmed.to_owned()
+        Some(trimmed.to_owned())
     }
 }
 
-/// Decode a double-quoted string with its common escapes. The closing
-/// quote ends the scalar; anything after it is syntax the caller ignores.
+/// Decode a double-quoted string with its common escapes, requiring the
+/// closing quote to end the segment — trailing text is malformed.
 fn parse_double_quoted(raw: &str) -> Option<String> {
     let mut value = String::new();
-    let mut characters = raw.strip_prefix('"')?.chars();
+    let mut characters = raw.strip_prefix('"')?.chars().peekable();
     while let Some(character) = characters.next() {
         match character {
-            '"' => return Some(value),
+            '"' if characters.peek().is_none() => return Some(value),
+            '"' => return None,
             '\\' => match characters.next()? {
                 'b' => value.push('\u{0008}'),
                 't' => value.push('\t'),
@@ -268,10 +276,7 @@ fn extract_json_key(text: &str, key: &str) -> Option<String> {
 /// position can satisfy a lookup — table-shaped lines inside a string are
 /// data, never a match.
 fn extract_toml_key(text: &str, key: &str) -> Option<String> {
-    let target = dotted_path(key);
-    if target.is_empty() {
-        return None;
-    }
+    let target = dotted_path(key)?;
     let document = toml::from_str::<toml::Value>(text).ok()?;
     let mut current = &document;
     for segment in &target {
@@ -291,10 +296,7 @@ fn extract_toml_key(text: &str, key: &str) -> Option<String> {
 /// Flow mappings, comments and scalars that merely look like mappings
 /// resolve by document structure alone.
 fn extract_yaml_key(text: &str, key: &str) -> Option<String> {
-    let target = dotted_path(key);
-    if target.is_empty() {
-        return None;
-    }
+    let target = dotted_path(key)?;
     let documents = yaml_rust2::YamlLoader::load_from_str(text).ok()?;
     let mut current = documents.first()?;
     for segment in &target {

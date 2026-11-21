@@ -49,12 +49,6 @@ pub struct VirtualAgent {
     observer: SharedObserver,
     permission: Option<Arc<dyn PermissionHandler>>,
     before_turn: Option<Arc<dyn BeforeTurn>>,
-    /// Shared flag every adapter's `ReservationProbe` maintains: set when
-    /// the `before_turn` hook's latest run refused the turn, so the turn
-    /// driver can tell a reservation refusal — the prompt never reached
-    /// the lane — from a lane failure behind the same uncertain-effect
-    /// surface.
-    reservation_refused: Arc<AtomicBool>,
 }
 
 /// The sealing recipe for one agent's command line: the flags that close
@@ -201,7 +195,6 @@ impl VirtualAgent {
             observer: a4aa::observe::none(),
             permission: None,
             before_turn: None,
-            reservation_refused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -267,10 +260,11 @@ impl VirtualAgent {
 
     /// Negotiated-static capability picture, straight from the adapter.
     pub fn capabilities(&self) -> Capabilities {
-        self.adapter(&self.specs[0]).capabilities()
+        self.adapter(&self.specs[0], &ReservationSlot::default())
+            .capabilities()
     }
 
-    fn adapter(&self, spec: &AgentSpec) -> Adapter {
+    fn adapter(&self, spec: &AgentSpec, reservations: &ReservationSlot) -> Adapter {
         let mut adapter = Adapter::new(spec.clone())
             .secrets(self.secrets.clone())
             .observer(self.observer.clone());
@@ -280,7 +274,7 @@ impl VirtualAgent {
         if let Some(hook) = &self.before_turn {
             adapter = adapter.before_turn(Arc::new(ReservationProbe {
                 hook: hook.clone(),
-                refused: self.reservation_refused.clone(),
+                slot: reservations.clone(),
             }));
         }
         adapter
@@ -308,6 +302,9 @@ impl VirtualAgent {
             request.cwd = self.profile.cwd.clone();
         }
         let chain = self.profile.effective_chain(&jiff::Zoned::now());
+        // The session's reservation slot: every adapter this session runs
+        // reads the current turn's verdict cell through it.
+        let reservations = ReservationSlot::default();
         let mut lane_error = None;
         for (lane_index, spec) in self.specs.iter().enumerate() {
             let (mut lane_request, turn_model_default, turn_effort_default) =
@@ -326,7 +323,7 @@ impl VirtualAgent {
                 let probe = DispatchProbe::new(self.observer.clone(), spec);
                 let observer: SharedObserver = Some(probe.clone());
                 let result = self
-                    .adapter(spec)
+                    .adapter(spec, &reservations)
                     .observer(observer)
                     .open_session(lane_request.clone(), tap_tx)
                     .await;
@@ -378,7 +375,7 @@ impl VirtualAgent {
                     permission: self.permission.clone(),
                     before_turn: self.before_turn.clone(),
                     probe,
-                    reservation_refused: self.reservation_refused.clone(),
+                    reservations,
                 })),
                 stateless_lane: Arc::new(AtomicBool::new(matches!(spec.lane, LaneSpec::Cli(_)))),
                 instructions_sent: Arc::new(AtomicBool::new(false)),
@@ -413,10 +410,10 @@ struct LaneState {
     /// The active lane's dispatch probe: installed as the adapter's
     /// observer wrapper and replaced on every lane switch.
     probe: Arc<DispatchProbe>,
-    /// The agent-wide reservation flag — the `before_turn` hook is
-    /// agent-level, so every lane's `ReservationProbe` reports into the
-    /// same cell.
-    reservation_refused: Arc<AtomicBool>,
+    /// The session's reservation slot: the turn driver installs a fresh
+    /// [`TurnReservation`] cell per logical turn, and every lane adapter
+    /// this session runs reads the current cell through the slot.
+    reservations: ReservationSlot,
 }
 
 impl LaneState {
@@ -433,7 +430,7 @@ impl LaneState {
         if let Some(hook) = &self.before_turn {
             adapter = adapter.before_turn(Arc::new(ReservationProbe {
                 hook: hook.clone(),
-                refused: self.reservation_refused.clone(),
+                slot: self.reservations.clone(),
             }));
         }
         adapter
@@ -505,37 +502,82 @@ fn uncertain_turn(error: &a4aa::AdapterError) -> bool {
         )
 }
 
-/// Wraps the host's `BeforeTurn` reservation so the turn driver can tell
-/// a refusal raised by the reservation itself — the prompt never reached
-/// the lane — from a lane failure carrying the same uncertain-effect
-/// surface. `refused` mirrors the hook's latest run outcome; turns are
-/// serialized, so the flag always describes the in-flight attempt.
+/// The reservation verdict for one logical turn. The `before_turn` hook
+/// runs at most once per turn: its outcome is recorded here and reused by
+/// every lane and model attempt of the same turn — a reservation is never
+/// booked twice for one turn, and the driver reads the recorded verdict
+/// to propagate a refusal before either fallback decision can re-invoke
+/// the hook.
+#[derive(Default)]
+struct TurnReservation {
+    /// `None` until the hook first runs this turn.
+    outcome: std::sync::Mutex<Option<a4aa::Result<()>>>,
+}
+
+impl TurnReservation {
+    /// Whether the reservation refused this turn.
+    fn refused(&self) -> bool {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|result| result.is_err())
+    }
+}
+
+/// The per-session slot the turn driver swaps each logical turn: every
+/// adapter built for the session reads the current turn's cell through
+/// it, so a hook verdict never crosses turns — and never crosses
+/// sessions, since each `VirtualSession` owns its own slot.
+type ReservationSlot = Arc<std::sync::Mutex<Option<Arc<TurnReservation>>>>;
+
+/// Wraps the host's `BeforeTurn` reservation so each verdict binds to the
+/// logical turn that produced it: the probe reads the session's current
+/// turn cell and reuses a verdict already recorded for this turn — a
+/// granted reservation carries across a pre-dispatch lane fallback and a
+/// model retry without invoking the hook again.
 struct ReservationProbe {
     hook: Arc<dyn BeforeTurn>,
-    refused: Arc<AtomicBool>,
+    slot: ReservationSlot,
 }
 
 #[async_trait::async_trait]
 impl BeforeTurn for ReservationProbe {
     async fn run(&self) -> a4aa::Result<()> {
-        match self.hook.run().await {
-            Ok(()) => {
-                self.refused.store(false, Ordering::Release);
-                Ok(())
-            }
-            Err(error) => {
-                self.refused.store(true, Ordering::Release);
-                Err(error)
-            }
+        let turn = self
+            .slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(outcome) = turn.as_ref().and_then(|turn| {
+            turn.outcome
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }) {
+            return outcome;
         }
+        let outcome = self.hook.run().await;
+        if let Some(turn) = turn {
+            *turn
+                .outcome
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(outcome.clone());
+        }
+        outcome
     }
 }
 
-/// Side-effect-free dispatch evidence for an rpc lane. The transport
-/// observer sees every outbound frame before it is written, so a `Sent`
-/// frame carrying the lane's prompt method proves the turn reached the
-/// wire — no probe prompt is ever needed, and nothing extra is sent.
-/// Every record forwards to the host's own observer.
+/// Side-effect-free wire evidence for an rpc lane. The transport observer
+/// sees every outbound frame before it is written and every inbound frame
+/// before it reaches the lane's notification queue — both strictly before
+/// the corresponding call resolves — so the journal the probe keeps is
+/// evidence the lane's own delivery task cannot outrun: a `Sent` frame
+/// carrying the lane's prompt method marks dispatch intent, the *last*
+/// `Sent` frame names the write the transport failed on a `writer_failed`
+/// error, and an inbound notification is attributed to the turn at wire
+/// receipt rather than at tap dequeue. Every record forwards to the
+/// host's own observer.
 struct DispatchProbe {
     inner: SharedObserver,
     /// The lane's prompt method — `None` for lanes whose dispatch is not
@@ -544,29 +586,87 @@ struct DispatchProbe {
     /// The frame field the method name occupies: `method` for stock
     /// JSON-RPC, the envelope's `method_field` for non-stock envelopes.
     method_field: String,
+    /// A non-stock envelope is declared: inbound responses are
+    /// discriminated by marker rather than the stock `id`/result shape.
+    enveloped: bool,
+    /// The envelope's `response_method` marker value and the field the
+    /// marker occupies (`discriminant_field`, falling back to
+    /// `method_field`) — the same response discrimination the peer's
+    /// dispatch applies.
+    response_method: Option<String>,
+    discriminant_field: Option<String>,
+    /// A declared notification payload field — the envelope's
+    /// `data_field`. When declared but absent on a frame, the frame
+    /// itself is the payload document (flat envelopes).
+    data_field: Option<String>,
+    /// The lane's stream-text notification method (`text_event_method`)
+    /// and the dotted path to its payload (`text_path`), mirroring how
+    /// the lane normalizes stream text.
+    text_event_method: Option<String>,
+    text_path: Option<String>,
+    /// The lane's configured usage carrier (`usage_path`); when unset the
+    /// conventional `params.usage` / `params.message.usage` carriers are
+    /// read instead — the same precedence the lane's own ingest applies.
+    usage_path: Option<String>,
     /// Set once this attempt's prompt frame was observed on the wire. The
     /// turn driver resets it per attempt — a stale flag from an earlier
     /// turn or lane would misreport a pre-dispatch failure as dispatched.
     dispatched: AtomicBool,
+    /// Whether the most recent `Sent` frame was the prompt. The transport
+    /// writer stops at the failed write, so on a `writer_failed` report
+    /// the last observed `Sent` names the failed write.
+    last_sent_was_prompt: AtomicBool,
+    /// An in-turn notification reached the wire: every id-less inbound
+    /// frame after dispatch becomes a lane event, so receipt is output
+    /// evidence even when the lane's delivery task has not forwarded it
+    /// to the tap yet.
+    turn_event: AtomicBool,
+    /// An in-turn notification carried billable evidence — stream text at
+    /// the lane's text carrier or a normalized usage record with a
+    /// nonzero counter.
+    turn_billable: AtomicBool,
 }
 
 impl DispatchProbe {
     fn new(inner: SharedObserver, spec: &AgentSpec) -> Arc<Self> {
-        let (method, method_field) = match &spec.lane {
-            LaneSpec::Rpc(rpc) if !rpc.prompt.method.is_empty() => (
-                Some(rpc.prompt.method.clone()),
-                rpc.envelope
-                    .as_ref()
-                    .map_or_else(|| "method".to_owned(), |e| e.method_field.clone()),
-            ),
-            _ => (None, "method".to_owned()),
-        };
-        Arc::new(Self {
+        let mut probe = Self {
             inner,
-            method,
-            method_field,
+            method: None,
+            method_field: "method".to_owned(),
+            enveloped: false,
+            response_method: None,
+            discriminant_field: None,
+            data_field: None,
+            text_event_method: None,
+            text_path: None,
+            usage_path: None,
             dispatched: AtomicBool::new(false),
-        })
+            last_sent_was_prompt: AtomicBool::new(false),
+            turn_event: AtomicBool::new(false),
+            turn_billable: AtomicBool::new(false),
+        };
+        if let LaneSpec::Rpc(rpc) = &spec.lane {
+            if !rpc.prompt.method.is_empty() {
+                probe.method = Some(rpc.prompt.method.clone());
+            }
+            if let Some(envelope) = &rpc.envelope {
+                probe.method_field = envelope.method_field.clone();
+                probe.enveloped = true;
+                probe.response_method = envelope.response_method.clone();
+                probe.discriminant_field = envelope.discriminant_field.clone();
+                probe.data_field = envelope.data_field.clone();
+            }
+            probe.text_event_method = rpc.text_event_method.clone();
+            probe.text_path = rpc.text_path.clone();
+            probe.usage_path = rpc.usage_path.clone();
+        }
+        Arc::new(probe)
+    }
+
+    /// Whether this lane's dispatch is a wire frame the journal can
+    /// observe — rpc lanes with a declared prompt method.
+    fn observes_wire(&self) -> bool {
+        self.method.is_some()
     }
 
     /// Whether this attempt's prompt frame reached the wire. `true` for
@@ -576,18 +676,148 @@ impl DispatchProbe {
         self.method.is_none() || self.dispatched.load(Ordering::Acquire)
     }
 
-    /// Whether the lane's turn can be considered active for event
-    /// evidence: always on lanes without a dispatch frame, and on rpc
-    /// lanes once the prompt frame reached the wire. Notifications the
-    /// lane queued earlier — session-open markers, pre-turn bookkeeping —
-    /// are not the active turn's output.
-    fn turn_started(&self) -> bool {
-        self.dispatched()
+    /// Whether the last frame the transport writer attempted was this
+    /// attempt's prompt — on a `writer_failed` report, the write the
+    /// transport confirmed failed.
+    fn last_write_was_prompt(&self) -> bool {
+        self.last_sent_was_prompt.load(Ordering::Acquire)
+    }
+
+    /// In-turn output evidence attributed at wire receipt.
+    fn wire_event(&self) -> bool {
+        self.turn_event.load(Ordering::Acquire)
+    }
+
+    /// In-turn billable evidence attributed at wire receipt.
+    fn wire_billable(&self) -> bool {
+        self.turn_billable.load(Ordering::Acquire)
     }
 
     fn reset(&self) {
         self.dispatched.store(false, Ordering::Release);
+        self.last_sent_was_prompt.store(false, Ordering::Release);
+        self.turn_event.store(false, Ordering::Release);
+        self.turn_billable.store(false, Ordering::Release);
     }
+
+    /// Mirror of the lane's own evidence normalization: an id-less frame
+    /// is billable when its method carries stream text at the declared
+    /// carrier, or a usage record at the configured `usage_path` — the
+    /// conventional carriers when unset — has a nonzero counter.
+    fn billable_frame(&self, frame: &serde_json::Value) -> bool {
+        let method = frame
+            .get(self.method_field.as_str())
+            .and_then(serde_json::Value::as_str);
+        let params = match &self.data_field {
+            Some(field) => frame.get(field).unwrap_or(frame),
+            None => frame.get("params").unwrap_or(&serde_json::Value::Null),
+        };
+        if method.is_some()
+            && method == self.text_event_method.as_deref()
+            && notification_text(params, self.text_path.as_deref()).is_some()
+        {
+            return true;
+        }
+        self.usage_path
+            .as_deref()
+            .and_then(|path| extract_path(params, path))
+            .or_else(|| params.get("usage"))
+            .or_else(|| extract_path(params, "message.usage"))
+            .is_some_and(normalized_billable)
+    }
+}
+
+/// Walk a dotted path into a JSON value.
+fn extract_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut cursor = value;
+    for segment in path.split('.') {
+        cursor = cursor.get(segment)?;
+    }
+    Some(cursor)
+}
+
+/// Mirror of the lane's notification text extraction, reduced to a
+/// presence check: a declared `text_path` resolves a string leaf or an
+/// array whose `{type:"text",text}` blocks concatenate to text; otherwise
+/// the conventional fields (`text`, `content`, `delta`, `item.text`) or a
+/// bare string.
+fn notification_text(params: &serde_json::Value, text_path: Option<&str>) -> Option<()> {
+    if let Some(path) = text_path {
+        return match extract_path(params, path) {
+            Some(serde_json::Value::String(_)) => Some(()),
+            Some(serde_json::Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|block| {
+                    block
+                        .get("type")
+                        .is_none_or(|kind| kind.as_str() == Some("text"))
+                })
+                .any(|block| {
+                    block
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                })
+                .then_some(()),
+            _ => None,
+        };
+    }
+    params
+        .get("text")
+        .or_else(|| params.get("content"))
+        .or_else(|| params.get("delta"))
+        .and_then(serde_json::Value::as_str)
+        .map(|_| ())
+        .or_else(|| extract_path(params, "item.text")?.as_str().map(|_| ()))
+        .or_else(|| params.as_str().map(|_| ()))
+}
+
+/// Mirror of the lane's billable-usage normalization: the aliased
+/// counters folded into `TokenUsage` — input, cached input, cached write,
+/// output, thought — decide the served question; a record carrying only
+/// unknown keys is bookkeeping, not billed work.
+fn normalized_billable(usage: &serde_json::Value) -> bool {
+    const COUNTERS: &[&[&str]] = &[
+        &[
+            "input",
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+        ],
+        &[
+            "cacheRead",
+            "cached_input_tokens",
+            "cachedInputTokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cache_read_tokens",
+        ],
+        &[
+            "cacheWrite",
+            "cached_write_tokens",
+            "cachedWriteTokens",
+            "cache_write_tokens",
+        ],
+        &[
+            "output",
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ],
+        &["thought_tokens", "thoughtTokens", "reasoning_tokens"],
+    ];
+    usage.as_object().is_some_and(|usage| {
+        COUNTERS.iter().any(|aliases| {
+            aliases.iter().any(|name| {
+                usage
+                    .get(*name)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|tokens| tokens > 0)
+            })
+        })
+    })
 }
 
 impl Observer for DispatchProbe {
@@ -595,19 +825,71 @@ impl Observer for DispatchProbe {
         if let Some(inner) = &self.inner {
             inner.record(source, direction, bytes);
         }
-        if source != "rpc" || direction != Direction::Sent || self.dispatched() {
+        if source != "rpc" || self.method.is_none() {
             return;
         }
-        let method = serde_json::from_slice::<serde_json::Value>(bytes)
-            .ok()
-            .and_then(|frame| {
-                frame
-                    .get(self.method_field.as_str())
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            });
-        if method.as_deref() == self.method.as_deref() {
-            self.dispatched.store(true, Ordering::Release);
+        match direction {
+            // Every `Sent` refreshes which frame the writer is on: the
+            // record precedes the write, so the last observed `Sent`
+            // names the write a `writer_failed` report refers to.
+            Direction::Sent => {
+                let prompt = serde_json::from_slice::<serde_json::Value>(bytes)
+                    .ok()
+                    .and_then(|frame| {
+                        frame
+                            .get(self.method_field.as_str())
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    });
+                let prompt = prompt.as_deref() == self.method.as_deref();
+                self.last_sent_was_prompt.store(prompt, Ordering::Release);
+                if prompt {
+                    self.dispatched.store(true, Ordering::Release);
+                }
+            }
+            // Inbound frames: a response settles a pending call, a request
+            // (id + method) or a notification (id-less) is agent activity.
+            // Either is the turn's output only once the prompt reached the
+            // wire — receipt cannot precede the `Sent` record, so
+            // dispatch-gated attribution is exact even when the lane's
+            // delivery task has not forwarded the frame to the tap yet.
+            Direction::Received => {
+                if !self.dispatched.load(Ordering::Acquire) {
+                    return;
+                }
+                let Ok(frame) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                    return;
+                };
+                let id = frame.get("id");
+                let is_response = if self.enveloped {
+                    id.is_some()
+                        && self.response_method.as_deref().is_some_and(|marker| {
+                            frame
+                                .get(
+                                    self.discriminant_field
+                                        .as_deref()
+                                        .unwrap_or(self.method_field.as_str()),
+                                )
+                                .and_then(serde_json::Value::as_str)
+                                == Some(marker)
+                        })
+                } else {
+                    id.is_some()
+                        && frame.get("method").is_none()
+                        && (frame.get("result").is_some() || frame.get("error").is_some())
+                };
+                if is_response {
+                    return;
+                }
+                self.turn_event.store(true, Ordering::Release);
+                // Only id-less notifications flow through the lane's
+                // text/usage normalization; an inbound request is turn
+                // activity but carries no billable payload of its own.
+                if id.is_none() && self.billable_frame(&frame) {
+                    self.turn_billable.store(true, Ordering::Release);
+                }
+            }
+            Direction::Stderr => {}
         }
     }
 }
@@ -616,13 +898,29 @@ impl Observer for DispatchProbe {
 /// dispatched the turn. A4AA reports `rpc/call` with uncertain effect for
 /// a transport failure both before and after prompt dispatch, so the flag
 /// alone cannot tell a safe fallback from a duplicated billed turn. The
-/// dispatch probe answers the question exactly — it flips only when the
-/// prompt frame was written — with no probe call and no reservation hook
-/// re-entry. A `agent_session_recovery_required` failure is already the
-/// verified pre-dispatch verdict: the lane rejected the prompt at its own
-/// gate before anything could be dispatched.
+/// wire journal answers the question exactly — dispatch intent flips only
+/// when the prompt frame was written — with no probe call and no
+/// reservation hook re-entry. A `agent_session_recovery_required` failure
+/// is already the verified pre-dispatch verdict: the lane rejected the
+/// prompt at its own gate before anything could be dispatched. A
+/// transport-confirmed write failure is the other exact answer: the
+/// writer stops at the failed line, so when the prompt is the last
+/// `Sent` frame the journal recorded, the prompt's own write is the one
+/// that failed — a confirmed undelivered frame the next lane may replay.
+/// A frame the peer demonstrably answered — any in-turn activity on the
+/// wire — stays uncertain: the write may have delivered despite the
+/// reported failure. A `Sent` record whose write was never reported
+/// failed keeps the uncertain reading for the same reason: the frame may
+/// have reached the agent whole or in part.
 fn dispatched_uncertain(error: &a4aa::AdapterError, probe: &DispatchProbe) -> bool {
     if error.code == "agent_session_recovery_required" {
+        return false;
+    }
+    if error.code == "agent_transport_failed"
+        && error.detail.as_deref() == Some("writer_failed")
+        && probe.last_write_was_prompt()
+        && !probe.wire_event()
+    {
         return false;
     }
     probe.dispatched()
@@ -889,29 +1187,43 @@ impl VirtualSession {
             // `TurnOutcome` alone can lose, since a structured stream may
             // end on an empty result record that hides its earlier
             // records.
+            // One logical turn, one reservation cell: the `before_turn`
+            // hook runs at most once for the whole turn, however many lane
+            // or model attempts the turn makes.
+            let turn_reservation = Arc::new(TurnReservation::default());
             let (events_out, mut tap_rx) = {
                 let mut lane = lane.lock().await;
+                *lane
+                    .reservations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(turn_reservation.clone());
                 (lane.events.clone(), lane.tap_rx.take())
             };
             let outcome = 'lanes: loop {
                 // Output evidence is per lane attempt: leftovers a dead
                 // lane left queued relay to the caller at reopen below,
                 // but they say nothing about whether this lane's turn
-                // produced output — only this attempt's own tap may set
-                // the flags.
+                // produced output — only this attempt's own evidence may
+                // set the flags.
                 let mut emitted_output = false;
                 let mut emitted_billable = false;
-                // This attempt's dispatch probe and reservation flag:
-                // reset the probe so an earlier attempt's frame cannot
-                // misreport dispatch, then relay everything the lane
-                // queued outside the turn — session-open markers on a
-                // fresh lane, leftovers on a reused one — without
-                // counting it as the active turn's output.
-                let (probe, reservation_refused) = {
+                // This attempt's dispatch probe: reset the wire journal so
+                // an earlier attempt's frames cannot misreport dispatch,
+                // then relay everything the lane queued outside the turn —
+                // session-open markers on a fresh lane, leftovers on a
+                // reused one — without counting it as the active turn's
+                // output.
+                let probe = {
                     let lane = lane.lock().await;
                     lane.probe.reset();
-                    (lane.probe.clone(), lane.reservation_refused.clone())
+                    lane.probe.clone()
                 };
+                // Lanes with an observable dispatch point keep their
+                // evidence in the wire journal, attributed at receipt —
+                // immune to the delivery lag a generic lane error races.
+                // Lanes without one rely on tap events, gated to the
+                // active turn the same way.
+                let wire_lane = probe.observes_wire();
                 if let Some(rx) = &mut tap_rx {
                     while let Ok(event) = rx.try_recv() {
                         let _ = events_out.send(event);
@@ -942,7 +1254,7 @@ impl VirtualSession {
                                 outcome = &mut prompt => {
                                     if let Some(rx) = &mut tap_rx {
                                         while let Ok(event) = rx.try_recv() {
-                                            if probe.turn_started() {
+                                            if !wire_lane {
                                                 emitted_output = true;
                                                 emitted_billable |= turn_output(&event);
                                             }
@@ -953,7 +1265,7 @@ impl VirtualSession {
                                 }
                                 event = next_event => match event {
                                     Some(event) => {
-                                        if probe.turn_started() {
+                                        if !wire_lane {
                                             emitted_output = true;
                                             emitted_billable |= turn_output(&event);
                                         }
@@ -965,6 +1277,11 @@ impl VirtualSession {
                         }
                     };
                     let next = match &outcome {
+                        // The reservation refused this turn: its verdict is
+                        // already the answer — propagate it before a model
+                        // retry or the next lane invokes the reservation
+                        // again for the same turn.
+                        Err(_) if turn_reservation.refused() => break 'lanes outcome,
                         // The prompt may already have produced billed output.
                         // Advancing the model and resubmitting would duplicate
                         // that turn, so the uncertain failure is propagated.
@@ -1003,14 +1320,7 @@ impl VirtualSession {
                     // record answers the dispatch question before this lane
                     // is condemned.
                     Err(error) if uncertain_turn(error) => {
-                        // A reservation refusal never reached the lane:
-                        // its verdict is already the dispatch answer, and
-                        // re-running the hook on another lane could reserve
-                        // the same turn twice — propagate before another
-                        // lane is invoked.
-                        if reservation_refused.load(Ordering::Acquire)
-                            || dispatched_uncertain(error, &probe)
-                        {
+                        if dispatched_uncertain(error, &probe) {
                             break 'lanes outcome;
                         }
                         true
@@ -1021,10 +1331,13 @@ impl VirtualSession {
                     Err(error) if model_failure(error) => break 'lanes outcome,
                     // A lane failure after streamed text or billable usage
                     // may already have produced paid output — replaying it
-                    // on the next lane would duplicate the turn.
-                    // Bookkeeping-only notifications are not output
-                    // evidence: fallback still applies.
-                    Err(_) => !emitted_billable,
+                    // on the next lane would duplicate the turn. Evidence
+                    // is whatever this attempt produced: the wire journal
+                    // on lanes with a dispatch frame (attributed at
+                    // receipt, so a generic error cannot outrun it), tap
+                    // events elsewhere. Bookkeeping-only notifications are
+                    // not output evidence: fallback still applies.
+                    Err(_) => !(emitted_billable || probe.wire_billable()),
                     // A lane that reports the turn as failed without an
                     // error channel — cli's nonzero exit surfaces as
                     // `stop_reason: "error"` — could not serve this turn
@@ -1037,7 +1350,7 @@ impl VirtualSession {
                             && result.text.is_empty()
                             && !result.truncated
                             && result.usage.is_none()
-                            && !emitted_output
+                            && !(emitted_output || probe.wire_event())
                     }
                 };
                 if !lane_failed {

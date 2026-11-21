@@ -1778,3 +1778,317 @@ async fn rpc_usage_at_configured_path_does_not_replay_on_alternate() {
     assert_eq!(error.code, "agent_remote_error");
     session.close().await.unwrap();
 }
+
+/// An rpc peer that answers `session/open`, closes its own stdout and
+/// keeps reading stdin — a peer that stopped answering yet still consumes
+/// whatever the lane's writer sends.
+#[cfg(unix)]
+const RPC_CLOSES_STDOUT: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+request = json.loads(sys.stdin.readline())
+if request.get("method"):
+    log.write(request["method"] + "\n")
+    log.flush()
+send({"jsonrpc": "2.0", "id": request["id"],
+      "result": {"sessionId": "awp-rpc-session"}})
+os.close(1)
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    if request.get("method"):
+        log.write(request["method"] + "\n")
+        log.flush()
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_queued_prompt_peer_closed_confirms_before_replay() {
+    // The peer closes its answer stream while the pre-turn call is in
+    // flight but keeps reading stdin: `peer_closed` reaches the turn
+    // while the lane's independent writer may still hold queued frames —
+    // a peer that stopped answering could still receive a late write.
+    // The turn must stop the transport and confirm the prompt never left
+    // before the alternate replays it.
+    let dir = TestDirectory::new("rpc-queued-prompt");
+    let script = dir.path().join("rpc_closes_stdout.py");
+    std::fs::write(&script, RPC_CLOSES_STDOUT).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec("closing", &script, json!({}), json!({"text": "{prompt}"}));
+    let LaneSpec::Rpc(lane) = &mut primary.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.pre_turn = vec![RpcCallSpec {
+        method: "session/select".to_owned(),
+        params: json!({"model": "selected"}),
+    }];
+    primary.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [(
+            "AWP_CALL_LOG".to_owned(),
+            EnvValue::Literal(log.display().to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("closing".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls_log.lines().any(|method| method == "session/prompt"),
+        "queued prompt reached the closed lane: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that refuses prompts for the `prime` model with a quota
+/// error and serves every other model — the refusal must advance the
+/// session's model chain instead of jumping lanes or giving up.
+#[cfg(unix)]
+const RPC_QUOTA_ON_PRIME: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+session_model = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        session_model = params.get("model")
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model") or session_model
+        if model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_quota_refusal_advances_the_model_chain() {
+    // A4AA reports the rpc prompt's explicit quota response as
+    // `agent_quota_exhausted` at `rpc/call` — a prompt-admission refusal
+    // that must advance the model chain on the same session, not skip to
+    // the alternate lane or give up.
+    let dir = TestDirectory::new("rpc-quota-chain");
+    let script = dir.path().join("rpc_quota.py");
+    std::fs::write(&script, RPC_QUOTA_ON_PRIME).unwrap();
+    let registry = registry_with_lanes(
+        rpc_spec(
+            "quota-rpc",
+            &script,
+            json!({}),
+            json!({"text": "{prompt}", "model": "{model}"}),
+        ),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("quota-rpc".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that reports nonzero usage, replaces it with an all-zero
+/// record, then answers the prompt with a quota refusal: the lane's own
+/// latest usage says nothing was served, yet the wire journal holds the
+/// earlier billable evidence.
+#[cfg(unix)]
+const RPC_ZEROED_USAGE_THEN_QUOTA: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "method": "meter",
+              "params": {"usage": {"output_tokens": 7}}})
+        send({"jsonrpc": "2.0", "method": "meter",
+              "params": {"usage": {"output_tokens": 0}}})
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message":
+                        "resource_exhausted: quota exceeded"}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_zeroed_usage_does_not_advance_the_model_chain() {
+    // The lane's final usage record reads zero, so a4aa classifies the
+    // quota refusal as retryable — but the wire journal already recorded
+    // the earlier nonzero usage. The chain must not resubmit a possibly
+    // billed turn; the refusal propagates with `prime` still active.
+    let dir = TestDirectory::new("rpc-zeroed-usage");
+    let script = dir.path().join("rpc_meter.py");
+    std::fs::write(&script, RPC_ZEROED_USAGE_THEN_QUOTA).unwrap();
+    let registry = registry_with_lanes(
+        rpc_spec(
+            "metered",
+            &script,
+            json!({}),
+            json!({"text": "{prompt}", "model": "{model}"}),
+        ),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("metered".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that emits a notification outside prompt execution — one
+/// right after `session/open` and one right after each prompt's result.
+#[cfg(unix)]
+const RPC_EVENTS_BETWEEN_TURNS: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+        send({"jsonrpc": "2.0", "method": "session/ready",
+              "params": {"note": "opened"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "done|{}".format(
+                  (request.get("params") or {}).get("text", ""))}})
+        send({"jsonrpc": "2.0", "method": "turn/idle",
+              "params": {"note": "settled"}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_events_between_turns_reach_the_caller() {
+    // Events must flow for the session's whole lifetime, not only while a
+    // prompt is in flight: the session-ready notification arrives before
+    // the first prompt, and the idle notification lands after the turn's
+    // outcome without a following prompt to drain it.
+    let dir = TestDirectory::new("rpc-between-turns");
+    let script = dir.path().join("rpc_events.py");
+    std::fs::write(&script, RPC_EVENTS_BETWEEN_TURNS).unwrap();
+    let registry = registry_with(
+        rpc_spec("chatty", &script, json!({}), json!({"text": "{prompt}"})),
+        ProfilePatch {
+            agent: Some("chatty".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, mut rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // Before any prompt: the ready notification is already delivered.
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("session/ready stalled outside prompt execution")
+        .expect("event stream closed");
+    assert!(
+        matches!(ready, AgentEvent::Raw { ref raw } if raw.get("method") == Some(&json!("session/ready"))),
+        "unexpected first event: {ready:?}"
+    );
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "done|work");
+
+    // After the outcome resolves — and without another prompt — the idle
+    // notification is still delivered.
+    let idle = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("turn/idle stalled outside prompt execution")
+        .expect("event stream closed");
+    assert!(
+        matches!(idle, AgentEvent::Raw { ref raw } if raw.get("method") == Some(&json!("turn/idle"))),
+        "unexpected post-turn event: {idle:?}"
+    );
+    session.close().await.unwrap();
+}

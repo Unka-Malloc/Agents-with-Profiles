@@ -769,10 +769,11 @@ fn malformed_dotted_secret_selectors_fail_closed() {
     let toml_path = dir.join("malformed.toml");
     std::fs::write(
         &toml_path,
-        "\"a.b\" = \"literal-dotted\"\na.b = \"nested-b\"\n",
+        "\"a.b\" = \"literal-dotted\"\na.b = \"nested-b\"\nA = \"unicode-a\"\n",
     )
     .unwrap();
-    // Valid forms still resolve: a fully quoted segment and a plain path.
+    // Valid forms still resolve: a fully quoted segment, a plain path and
+    // a Unicode escape spelling a real key.
     assert_eq!(
         file_recipe(FixtureFormat::Toml, &toml_path, "\"a.b\"")
             .resolve()
@@ -785,6 +786,15 @@ fn malformed_dotted_secret_selectors_fail_closed() {
             .as_deref(),
         Some("nested-b")
     );
+    for escaped in ["\"\\u0041\"", "\"\\U00000041\""] {
+        assert_eq!(
+            file_recipe(FixtureFormat::Toml, &toml_path, escaped)
+                .resolve()
+                .as_deref(),
+            Some("unicode-a"),
+            "valid escape did not resolve: {escaped}"
+        );
+    }
     for malformed in [
         "\"a\"junk.b",
         "a.\"unclosed",
@@ -794,6 +804,14 @@ fn malformed_dotted_secret_selectors_fail_closed() {
         "a.b.",
         ".a.b",
         "\"a\".b\"c\"",
+        // A signed escape (`u32::from_str_radix` accepts a leading `+`)
+        // would decode to the real key `A` — a malformed escape must
+        // never resolve a different key.
+        "\"\\u+041\"",
+        "\"\\U+0000041\"",
+        "\"\\u004G\"",
+        "\"\\u04G1\"",
+        "\"\\U0000004G\"",
     ] {
         assert_eq!(
             file_recipe(FixtureFormat::Toml, &toml_path, malformed).resolve(),
@@ -803,14 +821,27 @@ fn malformed_dotted_secret_selectors_fail_closed() {
     }
 
     let yaml_path = dir.join("malformed.yaml");
-    std::fs::write(&yaml_path, "a:\n  b: yaml-b\n").unwrap();
+    std::fs::write(&yaml_path, "a:\n  b: yaml-b\nA: yaml-a\n").unwrap();
     assert_eq!(
         file_recipe(FixtureFormat::Yaml, &yaml_path, "a.b")
             .resolve()
             .as_deref(),
         Some("yaml-b")
     );
-    for malformed in ["\"a\"junk.b", "a.\"unclosed", "a..b"] {
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &yaml_path, "\"\\u0041\"")
+            .resolve()
+            .as_deref(),
+        Some("yaml-a")
+    );
+    for malformed in [
+        "\"a\"junk.b",
+        "a.\"unclosed",
+        "a..b",
+        "\"\\u+041\"",
+        "\"\\U+0000041\"",
+        "\"\\u004G\"",
+    ] {
         assert_eq!(
             file_recipe(FixtureFormat::Yaml, &yaml_path, malformed).resolve(),
             None,

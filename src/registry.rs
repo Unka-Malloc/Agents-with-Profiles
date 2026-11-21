@@ -235,6 +235,15 @@ fn parse_double_quoted(raw: &str) -> Option<String> {
                 escape @ ('u' | 'U') => {
                     let width = if escape == 'u' { 4 } else { 8 };
                     let digits: String = characters.by_ref().take(width).collect();
+                    // Decode only an exact-width run of ASCII hex digits:
+                    // `u32::from_str_radix` also accepts a leading `+`,
+                    // and a short escape must fail the selector rather
+                    // than decode a nearby real key.
+                    if digits.len() != width
+                        || !digits.chars().all(|digit| digit.is_ascii_hexdigit())
+                    {
+                        return None;
+                    }
                     let decoded = u32::from_str_radix(&digits, 16)
                         .ok()
                         .and_then(char::from_u32)?;

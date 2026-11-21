@@ -312,10 +312,10 @@ impl VirtualAgent {
             // A requested model the lane cannot express at establishment
             // advances the chain before the first turn is even attempted.
             let session = loop {
-                // Every open attempt gets its own event tap: the turn
-                // driver relays lane events to the caller's stream while a
-                // prompt runs and counts them as produced-output evidence
-                // for the fallback decision.
+                // Every open attempt gets its own event tap: the session's
+                // relay drains it into the caller's stream for the whole
+                // lifetime and counts each armed attempt's produced-output
+                // evidence for the fallback decision.
                 let (tap_tx, tap_rx) = mpsc::unbounded_channel();
                 // Every open attempt also gets a dispatch probe: the wire
                 // tap the turn driver later reads to learn whether an
@@ -369,7 +369,7 @@ impl VirtualAgent {
                     requested: request.clone(),
                     open: effective_request,
                     events: events.clone(),
-                    tap_rx: Some(tap_rx),
+                    relay: EventRelay::spawn(tap_rx, events.clone()),
                     secrets: self.secrets.clone(),
                     observer: self.observer.clone(),
                     permission: self.permission.clone(),
@@ -399,10 +399,12 @@ struct LaneState {
     /// The request the active lane opened with — replayed on the next lane.
     open: SessionRequest,
     events: mpsc::UnboundedSender<AgentEvent>,
-    /// The receiving end of the active lane's event tap. The turn driver
-    /// takes it while a prompt runs and returns it when the turn ends;
-    /// `None` only while a driver holds it.
-    tap_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    /// The active lane's event path: a forwarder task drains the lane's
+    /// tap into the caller's stream for the session's whole lifetime —
+    /// events between turns are delivered instead of stalling until the
+    /// next prompt — and marks each armed attempt's output evidence.
+    /// Replaced on every lane switch.
+    relay: EventRelay,
     secrets: Arc<dyn SecretResolver>,
     observer: SharedObserver,
     permission: Option<Arc<dyn PermissionHandler>>,
@@ -568,6 +570,144 @@ impl BeforeTurn for ReservationProbe {
     }
 }
 
+/// One lane's event path for the session's whole lifetime. The lane's tap
+/// is a private channel its adapter fills; the relay task drains it as
+/// events arrive — a notification between turns reaches the caller
+/// immediately rather than stalling until the next prompt, and nothing
+/// queues unclaimed when the lane closes. While a turn attempt is *armed*
+/// the relay also marks that attempt's output evidence; events outside
+/// the window are delivered but never counted as the turn's.
+#[derive(Clone)]
+struct EventRelay {
+    /// The armed-window flags the forwarder updates and the driver reads.
+    /// Held separately so the forwarder task carries no reference back
+    /// through the relay's own barrier channel.
+    evidence: Arc<RelayEvidence>,
+    /// Barrier requests: the driver asks the forwarder to finish relaying
+    /// whatever the lane has queued so far, then reads settled evidence.
+    flush: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// The armed-window flags one lane attempt produces.
+struct RelayEvidence {
+    /// Open only while a turn attempt is in flight on this lane.
+    armed: AtomicBool,
+    /// Any event relayed while armed — the attempt produced output.
+    output: AtomicBool,
+    /// A billable event relayed while armed — the output was paid work.
+    billable: AtomicBool,
+}
+
+impl EventRelay {
+    /// Start draining `tap` into `events` on the session runtime. The
+    /// forwarder keeps running until the lane's tap closes *and* the last
+    /// relay handle drops — a dead lane's queued leftovers still reach
+    /// the caller.
+    fn spawn(
+        mut tap: mpsc::UnboundedReceiver<AgentEvent>,
+        events: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Self {
+        let (flush, mut barriers) = mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
+        let evidence = Arc::new(RelayEvidence {
+            armed: AtomicBool::new(false),
+            output: AtomicBool::new(false),
+            billable: AtomicBool::new(false),
+        });
+        let forwarding = evidence.clone();
+        tokio::spawn(async move {
+            let mut tap = Some(&mut tap);
+            let mut barriers_open = true;
+            loop {
+                let event = async {
+                    match &mut tap {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let barrier = async {
+                    if barriers_open {
+                        barriers.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    barrier = barrier => match barrier {
+                        // Settle the queue before the driver reads
+                        // evidence: relay everything already received.
+                        Some(ack) => {
+                            if let Some(rx) = &mut tap {
+                                while let Ok(event) = rx.try_recv() {
+                                    Self::forward(&forwarding, &events, event);
+                                }
+                            }
+                            let _ = ack.send(());
+                        }
+                        None => barriers_open = false,
+                    },
+                    event = event => match event {
+                        Some(event) => Self::forward(&forwarding, &events, event),
+                        None => tap = None,
+                    },
+                }
+                if tap.is_none() && !barriers_open {
+                    break;
+                }
+            }
+        });
+        Self { evidence, flush }
+    }
+
+    /// Relay one event to the caller; count it as the armed attempt's
+    /// evidence only inside the attempt window.
+    fn forward(
+        evidence: &RelayEvidence,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        event: AgentEvent,
+    ) {
+        if evidence.armed.load(Ordering::Acquire) {
+            evidence.output.store(true, Ordering::Release);
+            if turn_output(&event) {
+                evidence.billable.store(true, Ordering::Release);
+            }
+        }
+        let _ = events.send(event);
+    }
+
+    /// Open the next attempt's evidence window.
+    fn arm(&self) {
+        self.evidence.output.store(false, Ordering::Release);
+        self.evidence.billable.store(false, Ordering::Release);
+        self.evidence.armed.store(true, Ordering::Release);
+    }
+
+    /// Wait until everything the lane queued so far has been relayed, so
+    /// evidence read afterwards reflects the complete attempt.
+    async fn flush(&self) {
+        let (settled, wait) = tokio::sync::oneshot::channel();
+        if self.flush.send(settled).is_ok() {
+            let _ = wait.await;
+        }
+    }
+
+    /// The armed window's billable flag — read after `flush` settled the
+    /// queue so a just-arrived event cannot be missed.
+    fn billable(&self) -> bool {
+        self.evidence.billable.load(Ordering::Acquire)
+    }
+
+    /// Close the window and read the attempt's `(output, billable)`
+    /// evidence.
+    fn disarm(&self) -> (bool, bool) {
+        self.evidence.armed.store(false, Ordering::Release);
+        (
+            self.evidence.output.load(Ordering::Acquire),
+            self.evidence.billable.load(Ordering::Acquire),
+        )
+    }
+}
+
 /// Side-effect-free wire evidence for an rpc lane. The transport observer
 /// sees every outbound frame before it is written and every inbound frame
 /// before it reaches the lane's notification queue — both strictly before
@@ -661,12 +801,6 @@ impl DispatchProbe {
             probe.usage_path = rpc.usage_path.clone();
         }
         Arc::new(probe)
-    }
-
-    /// Whether this lane's dispatch is a wire frame the journal can
-    /// observe — rpc lanes with a declared prompt method.
-    fn observes_wire(&self) -> bool {
-        self.method.is_some()
     }
 
     /// Whether this attempt's prompt frame reached the wire. `true` for
@@ -989,11 +1123,17 @@ fn model_failure(error: &a4aa::AdapterError) -> bool {
     }
     // A4AA normalizes explicit provider quota/capacity refusals across
     // lanes into this code — a certain-effect retryable refusal, treated
-    // exactly like a matched exhaustion signature.
+    // exactly like a matched exhaustion signature. `rpc/call` covers the
+    // generic rpc lane's prompt admission: the refusal arrived in place
+    // of a result, before the provider could serve the turn.
     if error.code == "agent_quota_exhausted" {
         return matches!(
             error.stage,
-            "session/open" | "session/prompt" | "session/set_model" | "session/set_config_option"
+            "session/open"
+                | "session/prompt"
+                | "session/set_model"
+                | "session/set_config_option"
+                | "rpc/call"
         );
     }
     error.code == "agent_protocol_failed"
@@ -1181,101 +1321,54 @@ impl VirtualSession {
             let _turn = turn;
             let mut request = request;
             let mut instructions_included = instructions_included;
-            // Lane events travel through the tap channel this driver owns:
-            // each one relays to the caller's stream as it arrives and also
-            // marks the turn as having produced output — evidence
-            // `TurnOutcome` alone can lose, since a structured stream may
-            // end on an empty result record that hides its earlier
-            // records.
+            // Lane events travel through the relay on the lane state: a
+            // forwarder task drains the lane's tap into the caller's
+            // stream for the session's whole lifetime — a notification
+            // between turns is delivered instead of stalling until the
+            // next prompt — and marks each armed attempt's output
+            // evidence, since `TurnOutcome` alone can lose it: a
+            // structured stream may end on an empty result record that
+            // hides its earlier records.
             // One logical turn, one reservation cell: the `before_turn`
             // hook runs at most once for the whole turn, however many lane
             // or model attempts the turn makes.
             let turn_reservation = Arc::new(TurnReservation::default());
-            let (events_out, mut tap_rx) = {
-                let mut lane = lane.lock().await;
+            {
+                let lane = lane.lock().await;
                 *lane
                     .reservations
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(turn_reservation.clone());
-                (lane.events.clone(), lane.tap_rx.take())
-            };
+            }
             let outcome = 'lanes: loop {
-                // Output evidence is per lane attempt: leftovers a dead
-                // lane left queued relay to the caller at reopen below,
-                // but they say nothing about whether this lane's turn
-                // produced output — only this attempt's own evidence may
-                // set the flags.
-                let mut emitted_output = false;
-                let mut emitted_billable = false;
-                // This attempt's dispatch probe: reset the wire journal so
-                // an earlier attempt's frames cannot misreport dispatch,
-                // then relay everything the lane queued outside the turn —
-                // session-open markers on a fresh lane, leftovers on a
-                // reused one — without counting it as the active turn's
-                // output.
-                let probe = {
+                // This attempt's dispatch probe and event relay: reset the
+                // wire journal so an earlier attempt's frames cannot
+                // misreport dispatch, then settle whatever the lane queued
+                // outside a turn — session-open markers on a fresh lane,
+                // stragglers on a reused one — before opening this
+                // attempt's evidence window, so only output produced
+                // inside it counts toward the fallback decisions.
+                let (probe, relay) = {
                     let lane = lane.lock().await;
                     lane.probe.reset();
-                    lane.probe.clone()
+                    (lane.probe.clone(), lane.relay.clone())
                 };
-                // Lanes with an observable dispatch point keep their
-                // evidence in the wire journal, attributed at receipt —
-                // immune to the delivery lag a generic lane error races.
-                // Lanes without one rely on tap events, gated to the
-                // active turn the same way.
-                let wire_lane = probe.observes_wire();
-                if let Some(rx) = &mut tap_rx {
-                    while let Ok(event) = rx.try_recv() {
-                        let _ = events_out.send(event);
-                    }
-                }
+                relay.flush().await;
+                relay.arm();
                 // The model loop on the current lane: provider-side model
                 // failures advance the chain and resubmit on the same
                 // session.
                 let outcome = loop {
                     let outcome = {
                         let guard = session.read().await;
-                        let prompt = guard.prompt(request.clone());
-                        tokio::pin!(prompt);
-                        // Drive the prompt while relaying lane events.
-                        // The lane sends every event before the outcome
-                        // resolves, so draining the queued tail here keeps
-                        // both delivery and the emitted-output evidence
-                        // complete before the fallback decision reads it.
-                        loop {
-                            let next_event = async {
-                                match &mut tap_rx {
-                                    Some(rx) => rx.recv().await,
-                                    None => std::future::pending().await,
-                                }
-                            };
-                            tokio::select! {
-                                biased;
-                                outcome = &mut prompt => {
-                                    if let Some(rx) = &mut tap_rx {
-                                        while let Ok(event) = rx.try_recv() {
-                                            if !wire_lane {
-                                                emitted_output = true;
-                                                emitted_billable |= turn_output(&event);
-                                            }
-                                            let _ = events_out.send(event);
-                                        }
-                                    }
-                                    break outcome;
-                                }
-                                event = next_event => match event {
-                                    Some(event) => {
-                                        if !wire_lane {
-                                            emitted_output = true;
-                                            emitted_billable |= turn_output(&event);
-                                        }
-                                        let _ = events_out.send(event);
-                                    }
-                                    None => tap_rx = None,
-                                },
-                            }
-                        }
+                        guard.prompt(request.clone()).await
                     };
+                    // The lane may still hold this attempt's tail events:
+                    // settle the queue so the chain and fallback decisions
+                    // read complete evidence rather than whatever happened
+                    // to be relayed already.
+                    relay.flush().await;
+                    let billed = relay.billable() || probe.wire_billable();
                     let next = match &outcome {
                         // The reservation refused this turn: its verdict is
                         // already the answer — propagate it before a model
@@ -1289,8 +1382,12 @@ impl VirtualSession {
                         // The model itself could not serve this turn:
                         // advance the chain and resubmit — the lane's own
                         // configuration surface applies the per-turn model
-                        // before dispatch.
-                        Err(error) if model_failure(error) => model_state
+                        // before dispatch. Billable evidence this attempt
+                        // already produced stays decisive even when the
+                        // agent's final usage record reads as zero: the
+                        // earlier stream is the billed work, so the chain
+                        // must not retry a possibly paid turn.
+                        Err(error) if model_failure(error) && !billed => model_state
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .remaining
@@ -1308,6 +1405,8 @@ impl VirtualSession {
                     }
                     request.model = Some(next);
                 };
+                relay.flush().await;
+                let (emitted_output, emitted_billable) = relay.disarm();
                 let lane_failed = match &outcome {
                     // A prompt-stage failure with uncertain effect may have
                     // produced billed output that is already in the event
@@ -1322,6 +1421,19 @@ impl VirtualSession {
                     Err(error) if uncertain_turn(error) => {
                         if dispatched_uncertain(error, &probe) {
                             break 'lanes outcome;
+                        }
+                        // No prompt frame reached the wire — but a frame
+                        // still queued on the lane's writer is invisible to
+                        // the journal, and its write could yet land on a
+                        // peer that stopped answering yet keeps reading.
+                        // Stop the transport first, then take the final
+                        // reading: only a prompt confirmed never written
+                        // may replay on the next lane.
+                        if !probe.dispatched() {
+                            let _ = session.read().await.close().await;
+                            if probe.dispatched() {
+                                break 'lanes outcome;
+                            }
                         }
                         true
                     }
@@ -1386,17 +1498,11 @@ impl VirtualSession {
                             Ok(new_session) => {
                                 *guard = new_session;
                                 lane.open = new_open;
-                                // The dead lane may still hold queued
-                                // events — deliver them before listening
-                                // on the reopened lane's tap. They are the
-                                // dead attempt's evidence, not this one's,
-                                // so they do not set `emitted_output`.
-                                if let Some(rx) = &mut tap_rx {
-                                    while let Ok(event) = rx.try_recv() {
-                                        let _ = events_out.send(event);
-                                    }
-                                }
-                                tap_rx = Some(next_tap_rx);
+                                // The dead lane's relay keeps draining its
+                                // tap to the caller on its own — leftovers
+                                // are the dead attempt's evidence, never
+                                // counted against the reopened lane.
+                                lane.relay = EventRelay::spawn(next_tap_rx, lane.events.clone());
                             }
                             Err(open_error) if model_failure(&open_error) => {
                                 break 'lanes Err(open_error);
@@ -1424,9 +1530,6 @@ impl VirtualSession {
                     continue 'lanes;
                 }
             };
-            // Return the active lane's tap so the next turn's driver can
-            // keep relaying this session's events.
-            lane.lock().await.tap_rx = tap_rx;
             // Preserve profile state and ordering even when only the caller's
             // waiter is dropped. A cancelled first attempt remains pending.
             if record_instructions

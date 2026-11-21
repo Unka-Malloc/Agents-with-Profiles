@@ -1283,3 +1283,240 @@ async fn lane_output_evidence_is_per_attempt() {
     assert_eq!(outcome.text.trim_end(), "alt|work");
     session.close().await.unwrap();
 }
+
+/// A `BeforeTurn` hook that refuses every turn with an uncertain error —
+/// the reservation may already stand, so the failure must propagate.
+#[cfg(unix)]
+struct RefusingHook;
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl awp::BeforeTurn for RefusingHook {
+    async fn run(&self) -> awp::Result<()> {
+        Err(awp::AdapterError::uncertain(
+            "reservation_unavailable",
+            "session/prompt",
+        ))
+    }
+}
+
+/// An rpc agent that logs every method it receives: the dispatch check
+/// must not send a probe prompt, so `session/prompt` may never appear in
+/// the log when the turn never reached the lane.
+#[cfg(unix)]
+const RPC_LOG_METHODS: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method:
+        log.write(method + "\n")
+        log.flush()
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "primary|{}".format(
+                  (request.get("params") or {}).get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+fn rpc_logging_spec(id: &str, script: &Path, log: &Path) -> AgentSpec {
+    let mut spec = rpc_spec(id, script, json!({}), json!({"text": "{prompt}"}));
+    spec.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [(
+            "AWP_CALL_LOG".to_owned(),
+            EnvValue::Literal(log.display().to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    spec
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn before_turn_refusal_never_probes_or_replays_the_lane() {
+    // The reservation hook refuses with an uncertain error while the rpc
+    // peer is healthy. Probing the failed session with a real prompt
+    // would bypass the hook and dispatch an empty paid turn; the refusal
+    // must propagate before any lane is invoked instead.
+    let dir = TestDirectory::new("reservation-refusal");
+    let script = dir.path().join("rpc_log.py");
+    std::fs::write(&script, RPC_LOG_METHODS).unwrap();
+    let log = dir.path().join("calls.log");
+    let registry = registry_with_lanes(
+        rpc_logging_spec("reserved", &script, &log),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("reserved".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry
+        .resolve("p")
+        .unwrap()
+        .before_turn(std::sync::Arc::new(RefusingHook));
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "reservation_unavailable");
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|method| method == "session/prompt"),
+        "no probe prompt reached the wire: {calls}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc lane that announces a session-open notification and then
+/// answers its prompt with a silent error — queued open traffic is not
+/// the turn's output, so the next lane must still be tried.
+#[cfg(unix)]
+const RPC_OPENS_THEN_FAILS: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+        send({"jsonrpc": "2.0", "method": "session/ready",
+              "params": {"ready": True}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"stopReason": "error", "text": ""}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_open_events_on_a_new_lane_do_not_suppress_fallback() {
+    // Lane two opens with a session-open notification queued on its tap,
+    // then returns a silent error. That notification is not the active
+    // turn's output — the healthy third lane must serve the prompt.
+    let dir = TestDirectory::new("open-events");
+    let script = dir.path().join("rpc_open.py");
+    std::fs::write(&script, RPC_OPENS_THEN_FAILS).unwrap();
+    let primary = cli_spec("dead", "false", &[], PromptChannel::ArgOnly);
+    let mut document = RegistryDocument::default();
+    document.agents.insert(
+        primary.id.clone(),
+        awp::AgentEntry {
+            spec: primary,
+            alternates: vec![
+                rpc_spec("opening", &script, json!({}), json!({"text": "{prompt}"})),
+                cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+            ],
+        },
+    );
+    document.profiles.insert(
+        "p".to_owned(),
+        ProfilePatch {
+            agent: Some("dead".to_owned()),
+            ..Default::default()
+        },
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    session.close().await.unwrap();
+}
+
+/// A primary that streams one text chunk and then answers the prompt
+/// with a generic remote error: the turn produced output already, so the
+/// failure must propagate instead of replaying on the alternate.
+#[cfg(unix)]
+const RPC_STREAMS_THEN_REFUSES: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "method": "delta",
+              "params": {"text": "paid-chunk"}})
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message": "boom"}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_error_after_streamed_text_does_not_replay_on_alternate() {
+    // A streamed chunk is evidence the paid turn ran; replaying the
+    // generic remote error on the alternate would duplicate it.
+    let dir = TestDirectory::new("streamed-refusal");
+    let script = dir.path().join("rpc_stream.py");
+    std::fs::write(&script, RPC_STREAMS_THEN_REFUSES).unwrap();
+    let mut primary = rpc_spec("streaming", &script, json!({}), json!({"text": "{prompt}"}));
+    let LaneSpec::Rpc(lane) = &mut primary.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.text_event_method = Some("delta".to_owned());
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("streaming".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_remote_error");
+    session.close().await.unwrap();
+}

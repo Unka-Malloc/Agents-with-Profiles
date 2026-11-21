@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The lane-fallback dispatch check no longer probes the failed rpc session
+  with a real prompt: an empty probe bypassed the `BeforeTurn` reservation
+  hook and could dispatch a paid turn on a healthy peer. Dispatch is now
+  read off the wire itself — the transport observer sees the prompt frame
+  go out — and a `BeforeTurn` refusal propagates before another lane is
+  invoked, so a reservation can never be booked twice for one turn. Events
+  a lane queued outside the active turn (session-open markers, dead-lane
+  leftovers) relay to the caller without suppressing the next lane, and a
+  generic lane error is replayed only when the turn produced no streamed
+  text or billable usage — bookkeeping-only notifications still allow
+  fallback.
 - `FileSecret` TOML/YAML resolution matches the exact dotted path inside its
   declared table; a missing path no longer borrows a same-named leaf from
   another entry. Inline comments are stripped quote-aware, so a quoted value

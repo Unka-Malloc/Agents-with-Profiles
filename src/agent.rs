@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use a4aa::{
     Adapter, AgentEvent, AgentSession, AgentSpec, BeforeTurn, Capabilities, EnvPolicy, LaneKind,
-    LaneSpec, PermissionHandler, SecretResolver, SelectorPhase, SelectorSupport, SessionRequest,
-    SharedObserver, TurnOutcome, TurnRequest,
+    LaneSession, LaneSpec, PermissionHandler, SecretResolver, SelectorPhase, SelectorSupport,
+    SessionRequest, SharedObserver, TurnOutcome, TurnRequest,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -474,6 +474,37 @@ fn uncertain_turn(error: &a4aa::AdapterError) -> bool {
         )
 }
 
+/// Whether an `uncertain_effect` prompt failure may already have
+/// dispatched the turn. A4AA reports `rpc/call` with uncertain effect for
+/// a transport failure both before and after prompt dispatch, so the flag
+/// alone cannot tell a safe fallback from a duplicated billed turn. The
+/// RPC session's recovery gate answers the dispatch question exactly: it
+/// opens only after a turn that dispatched and ended uncertain, so a probe
+/// prompt on the failed session is refused with
+/// `agent_session_recovery_required` exactly in the post-dispatch case —
+/// anything else verifies the failed turn never reached the wire and is
+/// safe to replay. The recovery refusal itself is already that verdict:
+/// the lane rejected the prompt at its own gate before anything could be
+/// dispatched. Lanes without a pre-dispatch phase — a cli child exists
+/// from spawn, acp and serve dispatch with the request itself — keep the
+/// conservative reading: an uncertain failure is a dispatched turn.
+async fn dispatched_uncertain(
+    session: &Arc<tokio::sync::RwLock<AgentSession>>,
+    error: &a4aa::AdapterError,
+) -> bool {
+    if error.code == "agent_session_recovery_required" {
+        return false;
+    }
+    let guard = session.read().await;
+    match guard.lane() {
+        LaneSession::Rpc(rpc) => matches!(
+            rpc.prompt("", None, None).await,
+            Err(probe) if probe.code == "agent_session_recovery_required"
+        ),
+        _ => true,
+    }
+}
+
 /// A requested model the agent cannot express (`agent_configuration_unavailable`
 /// names the rejected slot in its detail).
 fn model_rejected(error: &a4aa::AdapterError) -> bool {
@@ -704,8 +735,13 @@ impl VirtualSession {
                     let _ = events_out.send(event);
                 }
             }
-            let mut emitted_output = false;
             let outcome = 'lanes: loop {
+                // Output evidence is per lane attempt: leftovers a dead
+                // lane left queued relay to the caller at reopen below,
+                // but they say nothing about whether this lane's turn
+                // produced output — only this attempt's own tap may set
+                // the flag.
+                let mut emitted_output = false;
                 // The model loop on the current lane: provider-side model
                 // failures advance the chain and resubmit on the same
                 // session.
@@ -778,8 +814,19 @@ impl VirtualSession {
                     // A prompt-stage failure with uncertain effect may have
                     // produced billed output that is already in the event
                     // stream; replaying it on another lane would duplicate
-                    // the turn and discard the completed work.
-                    Err(error) if uncertain_turn(error) => break 'lanes outcome,
+                    // the turn and discard the completed work. A4AA cannot
+                    // mark which side of its dispatch boundary a transport
+                    // failure fell on — a dead peer during a pre-turn
+                    // selector call reports the same `rpc/call` as one
+                    // after the prompt left — so the session's own
+                    // recovery gate answers the dispatch question before
+                    // this lane is condemned.
+                    Err(error) if uncertain_turn(error) => {
+                        if dispatched_uncertain(&session, error).await {
+                            break 'lanes outcome;
+                        }
+                        true
+                    }
                     // The whole model chain exhausted on this lane — the
                     // failure is provider-side, so the caller's next
                     // profile is the right escalation, not another lane.
@@ -794,7 +841,7 @@ impl VirtualSession {
                     // earlier stream — or usage proves the paid turn ran.
                     Ok(result) => {
                         result.stop_reason == "error"
-                            && result.text.trim().is_empty()
+                            && result.text.is_empty()
                             && !result.truncated
                             && result.usage.is_none()
                             && !emitted_output
@@ -834,10 +881,11 @@ impl VirtualSession {
                                 lane.open = new_open;
                                 // The dead lane may still hold queued
                                 // events — deliver them before listening
-                                // on the reopened lane's tap.
+                                // on the reopened lane's tap. They are the
+                                // dead attempt's evidence, not this one's,
+                                // so they do not set `emitted_output`.
                                 if let Some(rx) = &mut tap_rx {
                                     while let Ok(event) = rx.try_recv() {
-                                        emitted_output = true;
                                         let _ = events_out.send(event);
                                     }
                                 }

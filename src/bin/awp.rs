@@ -247,11 +247,18 @@ async fn materialize() -> i32 {
     let dialect = match awp::dialects::dialect(name) {
         Some(dialect) => dialect,
         None => {
+            // The catalog knows the manifest feature for every adapter,
+            // even ones this build did not compile — report the feature
+            // the requested dialect actually needs.
+            if let Some(feature) = awp::dialects::feature(name) {
+                return failure(&format!(
+                    "dialect '{name}' is not compiled in; rebuild with --features {feature}"
+                ));
+            }
             let enabled: Vec<_> = awp::dialects::names().collect();
             if enabled.is_empty() {
                 return failure(
-                    "no dialect adapter is compiled in; rebuild with --features codex \
-                     (or another a4aa-<agent> feature)",
+                    "no dialect adapter is compiled in; rebuild with a dialect feature",
                 );
             }
             return usage_error(&format!(

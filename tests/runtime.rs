@@ -1056,3 +1056,230 @@ async fn all_lanes_dead_propagates_the_last_error() {
     session.prompt("work".to_owned()).await.unwrap_err();
     session.close().await.unwrap();
 }
+
+/// An agent that dies when the `AWP_KILL_METHOD` method arrives — the
+/// peer then reports a transport failure to whichever call was in flight,
+/// the same `rpc/call` surface before and after prompt dispatch.
+#[cfg(unix)]
+const RPC_DIES_ON_METHOD: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+kill = os.environ.get("AWP_KILL_METHOD", "")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == kill:
+        sys.stdout.flush()
+        os._exit(1)
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "primary|{}".format(
+                  (request.get("params") or {}).get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc lane whose `session/select` runs as a preTurn call and whose
+/// child exits when `kill_method` arrives.
+#[cfg(unix)]
+fn rpc_kill_spec(id: &str, script: &Path, kill_method: &str) -> AgentSpec {
+    let mut spec = rpc_spec(id, script, json!({}), json!({"text": "{prompt}"}));
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.pre_turn = vec![RpcCallSpec {
+        method: "session/select".to_owned(),
+        params: json!({"model": "selected"}),
+    }];
+    spec.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [(
+            "AWP_KILL_METHOD".to_owned(),
+            EnvValue::Literal(kill_method.to_owned()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    spec
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_pre_turn_disconnect_falls_back_to_alternate() {
+    // The peer dies while the preTurn selector call is in flight: the
+    // `rpc/call` error carries uncertain effect, yet the prompt itself was
+    // never dispatched — the alternate lane must serve it.
+    let dir = TestDirectory::new("rpc-pre-dispatch");
+    let script = dir.path().join("rpc_kill.py");
+    std::fs::write(&script, RPC_DIES_ON_METHOD).unwrap();
+    let registry = registry_with_lanes(
+        rpc_kill_spec("fragile", &script, "session/select"),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("fragile".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_post_dispatch_disconnect_never_replays_on_alternate() {
+    // The peer dies while the dispatched prompt is in flight: the same
+    // uncertain `rpc/call` surface now covers a possibly billed turn —
+    // the alternate must not replay it and the error must propagate.
+    let dir = TestDirectory::new("rpc-post-dispatch");
+    let script = dir.path().join("rpc_kill.py");
+    std::fs::write(&script, RPC_DIES_ON_METHOD).unwrap();
+    let registry = registry_with_lanes(
+        rpc_kill_spec("fragile", &script, "session/prompt"),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("fragile".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_transport_failed");
+    let _ = session.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_whitespace_error_outcome_does_not_replay_on_alternate_lane() {
+    // A json_lines lane drops non-record lines from the event stream, yet
+    // the retained text still carries them: whitespace output is evidence
+    // the paid turn ran — the alternate must not replay the prompt.
+    let mut primary = cli_spec(
+        "paid",
+        "sh",
+        &["-c", "exec 0<&-; printf ' \\n'; exit 1"],
+        PromptChannel::Stdin,
+    );
+    let LaneSpec::Cli(lane) = &mut primary.lane else {
+        panic!("cli_spec builds a cli lane")
+    };
+    lane.json_lines = true;
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("paid".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert!(
+        !outcome.text.contains("alt|"),
+        "alternate did not replay: {outcome:?}"
+    );
+    session.close().await.unwrap();
+}
+
+/// A primary that answers `session/prompt` with a notification followed by
+/// a remote error — emitted evidence plus a lane failure — so the next
+/// lane's replay decision must stand on its own attempt, not the dead
+/// lane's events.
+#[cfg(unix)]
+const RPC_EMITS_THEN_REFUSES: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "method": "progress",
+              "params": {"note": "ran"}})
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message": "boom"}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lane_output_evidence_is_per_attempt() {
+    // Lane one emits an event then fails its turn; lane two fails with no
+    // output of its own. The first lane's emitted evidence must not
+    // suppress the second lane's fallback — evidence is per attempt.
+    let dir = TestDirectory::new("per-attempt");
+    let script = dir.path().join("rpc_refuse.py");
+    std::fs::write(&script, RPC_EMITS_THEN_REFUSES).unwrap();
+    let primary = rpc_spec("emitting", &script, json!({}), json!({"text": "{prompt}"}));
+    let mut document = RegistryDocument::default();
+    document.agents.insert(
+        primary.id.clone(),
+        awp::AgentEntry {
+            spec: primary,
+            alternates: vec![
+                cli_spec("silent", "sh", &["-c", "exit 1"], PromptChannel::ArgOnly),
+                cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+            ],
+        },
+    );
+    document.profiles.insert(
+        "p".to_owned(),
+        ProfilePatch {
+            agent: Some("emitting".to_owned()),
+            ..Default::default()
+        },
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    session.close().await.unwrap();
+}

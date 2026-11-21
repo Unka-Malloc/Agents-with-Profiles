@@ -681,6 +681,40 @@ fn toml_file_secret_never_resolves_inside_a_string() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A multiline TOML scalar is a valid secret value: basic and literal
+/// forms resolve to their decoded contents through the parsed document.
+#[test]
+fn toml_file_secret_resolves_multiline_scalar_values() {
+    let dir = secret_case("secret-toml-multiline");
+
+    let multiline_path = dir.join("multiline.toml");
+    std::fs::write(
+        &multiline_path,
+        concat!(
+            "[credentials]\n",
+            "token = \"\"\"line-one\n",
+            "line-two\"\"\"\n",
+            "literal = '''line-three\n",
+            "line-four'''\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &multiline_path, "credentials.token")
+            .resolve()
+            .as_deref(),
+        Some("line-one\nline-two")
+    );
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &multiline_path, "credentials.literal")
+            .resolve()
+            .as_deref(),
+        Some("line-three\nline-four")
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// YAML resolves by parsed structure: a flow mapping still answers its
 /// dotted path, and an apostrophe inside a plain scalar does not drag the
 /// trailing comment into the value.

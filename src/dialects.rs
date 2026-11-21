@@ -68,6 +68,19 @@ macro_rules! catalog {
             cards.into_iter()
         }
 
+        /// The Cargo feature that compiles a catalog adapter — the name a
+        /// trimmed build must enable — whether or not this build enabled
+        /// it. Diagnostics report the real manifest feature; `generic`
+        /// and unknown names return `None`.
+        pub fn feature(name: &str) -> Option<&'static str> {
+            $(
+                if name == $name {
+                    return Some($feature);
+                }
+            )+
+            None
+        }
+
         /// Every compiled-in adapter id, in adapter order.
         #[allow(unused_mut)]
         pub fn names() -> impl Iterator<Item = &'static str> {
@@ -129,5 +142,17 @@ mod tests {
     fn unknown_names_stay_unknown() {
         assert!(dialect("no-such-agent").is_none());
         assert!(card("no-such-agent").is_none());
+    }
+
+    #[test]
+    fn feature_names_report_the_manifest_feature() {
+        // Missing-adapter diagnostics name the feature a build must
+        // enable — catalog ids double as feature names, so a trimmed
+        // build never invents an `a4aa-<agent>` feature.
+        for catalog in ["pi", "codex", "dsh"] {
+            assert_eq!(feature(catalog), Some(catalog));
+        }
+        assert_eq!(feature("generic"), None);
+        assert_eq!(feature("no-such-agent"), None);
     }
 }

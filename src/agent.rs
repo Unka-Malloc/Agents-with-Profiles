@@ -419,10 +419,13 @@ struct LaneState {
 }
 
 impl LaneState {
-    fn adapter(&mut self, index: usize) -> Adapter {
+    /// Build the adapter for lane `index` with its fresh dispatch probe.
+    /// The probe is returned alongside rather than installed: it becomes
+    /// this lane's probe only when the session it was built for opens —
+    /// a refused open leaves the installed session and probe untouched.
+    fn adapter(&self, index: usize) -> (Adapter, Arc<DispatchProbe>) {
         let probe = DispatchProbe::new(self.observer.clone(), &self.specs[index]);
-        self.probe = probe.clone();
-        let observer: SharedObserver = Some(probe);
+        let observer: SharedObserver = Some(probe.clone());
         let mut adapter = Adapter::new(self.specs[index].clone())
             .secrets(self.secrets.clone())
             .observer(observer);
@@ -435,7 +438,7 @@ impl LaneState {
                 slot: self.reservations.clone(),
             }));
         }
-        adapter
+        (adapter, probe)
     }
 }
 
@@ -929,8 +932,8 @@ fn notification_text(params: &serde_json::Value, text_path: Option<&str>) -> Opt
 
 /// Mirror of the lane's billable-usage normalization: the aliased
 /// counters folded into `TokenUsage` — input, cached input, cached write,
-/// output, thought — decide the served question; a record carrying only
-/// unknown keys is bookkeeping, not billed work.
+/// output, thought, total — decide the served question; a record carrying
+/// only unknown keys is bookkeeping, not billed work.
 fn normalized_billable(usage: &serde_json::Value) -> bool {
     const COUNTERS: &[&[&str]] = &[
         &[
@@ -962,6 +965,7 @@ fn normalized_billable(usage: &serde_json::Value) -> bool {
             "completionTokens",
         ],
         &["thought_tokens", "thoughtTokens", "reasoning_tokens"],
+        &["total_tokens", "totalTokens"],
     ];
     usage.as_object().is_some_and(|usage| {
         COUNTERS.iter().any(|aliases| {
@@ -1110,6 +1114,7 @@ fn billable_usage(usage: &TokenUsage) -> bool {
         usage.cached_write,
         usage.output,
         usage.thought,
+        usage.total,
     ]
     .into_iter()
     .flatten()
@@ -1301,26 +1306,14 @@ impl VirtualSession {
     }
 
     /// Submit one turn with explicit fields. Set model/effort override the
-    /// profile defaults; unset fields inherit them.
+    /// profile defaults; unset fields inherit them — per lane, inside the
+    /// turn, so a mid-turn lane switch re-projects the defaults against
+    /// the lane that actually serves the replay.
     pub async fn prompt_with(&self, mut request: TurnRequest) -> a4aa::Result<TurnOutcome> {
         let turn = self.turn_lock.clone().lock_owned().await;
         let instructions_included = self.instructions_due();
         if instructions_included {
             request.text = compose_prompt(self.profile.instructions.as_deref(), &request.text);
-        }
-        if request.model.is_none() {
-            request.model = self
-                .turn_model_default
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
-        }
-        if request.effort.is_none() {
-            request.effort = self
-                .turn_effort_default
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
         }
         self.run_owned_prompt(request, turn, true, instructions_included)
             .await
@@ -1353,6 +1346,21 @@ impl VirtualSession {
             let _turn = turn;
             let mut request = request;
             let mut instructions_included = instructions_included;
+            // The caller's selector values, captured before the driver
+            // manages them. An explicit value stays caller-owned through
+            // every lane attempt — the lane's own validation answers it —
+            // while everything else is driver state the lane's selector
+            // surface decides how to carry.
+            let caller_model = request.model.clone();
+            let caller_effort = request.effort.clone();
+            // The chain candidate a model retry scheduled on a per-turn
+            // surface this turn — kept so a lane switch replays it where
+            // the next lane carries a turn selector.
+            let mut driver_model: Option<String> = None;
+            // The chain candidate a session-bound retry is binding at the
+            // current reopen; it becomes the chain's active entry only
+            // when its session opens.
+            let mut pending_bind: Option<String> = None;
             // Lane events travel through the relay on the lane state: a
             // forwarder task drains the lane's tap into the caller's
             // stream for the session's whole lifetime — a notification
@@ -1389,12 +1397,52 @@ impl VirtualSession {
                     let lane = lane.lock().await;
                     (lane.probe.clone(), lane.relay.clone())
                 };
-                let (turn_model, session_model) = {
+                let (turn_selectors, session_model) = {
                     let guard = session.read().await;
                     (
-                        guard.selector_support(SelectorPhase::Turn).model,
+                        guard.selector_support(SelectorPhase::Turn),
                         guard.selector_support(SelectorPhase::Session).model,
                     )
+                };
+                let turn_model = turn_selectors.model;
+                // Re-project the turn's selectors onto the lane now serving
+                // it. A driver-managed value follows this lane's surface:
+                // the chain candidate a retry is carrying, the caller's
+                // explicit value, then the lane's per-turn default — and
+                // where the lane binds a selector at session establishment
+                // only the caller's own value may remain: anything else was
+                // consumed at open and a stale override is rejected before
+                // dispatch.
+                request.model = if turn_model == SelectorSupport::Unsupported {
+                    caller_model.clone()
+                } else {
+                    driver_model
+                        .clone()
+                        .or_else(|| caller_model.clone())
+                        .or_else(|| {
+                            record_instructions
+                                .then(|| {
+                                    turn_model_default
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .clone()
+                                })
+                                .flatten()
+                        })
+                };
+                request.effort = if turn_selectors.effort == SelectorSupport::Unsupported {
+                    caller_effort.clone()
+                } else {
+                    caller_effort.clone().or_else(|| {
+                        record_instructions
+                            .then(|| {
+                                turn_effort_default
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .clone()
+                            })
+                            .flatten()
+                    })
                 };
                 relay.flush().await;
                 relay.arm();
@@ -1402,6 +1450,11 @@ impl VirtualSession {
                 // re-establishing this lane's session — a model bound at
                 // session/open has no per-turn surface to carry it.
                 let mut session_retry = false;
+                // The chain candidate scheduled on this lane's per-turn
+                // surface — it becomes the session's default and the
+                // chain's active entry only once the lane accepts it, so
+                // a refused selector never publishes as the default.
+                let mut pending_model: Option<String> = None;
                 // The model loop on the current lane: provider-side model
                 // failures advance the chain and resubmit on the same
                 // session.
@@ -1421,6 +1474,27 @@ impl VirtualSession {
                     // to be relayed already.
                     relay.flush().await;
                     let billed = relay.billable() || probe.wire_billable();
+                    // A scheduled candidate the lane carried without a
+                    // model-level refusal is the accepted replacement:
+                    // publish it as the session's default and the chain's
+                    // active entry. A refused candidate never publishes —
+                    // the prior default stays in effect.
+                    if let Some(accepted) = pending_model.take() {
+                        if outcome
+                            .as_ref()
+                            .err()
+                            .is_none_or(|error| !model_failure(error))
+                        {
+                            *turn_model_default
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) =
+                                Some(accepted.clone());
+                            model_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .active = Some(accepted);
+                        }
+                    }
                     let next = match &outcome {
                         // The reservation refused this turn: its verdict is
                         // already the answer — propagate it before a model
@@ -1449,10 +1523,13 @@ impl VirtualSession {
                     };
                     let Some(next) = next else { break outcome };
                     // Decide which surface carries the next entry before
-                    // committing the chain position: a per-turn selector
-                    // takes it on the request, a session-bound selector
-                    // re-establishes the session, and a lane with no model
-                    // surface keeps the refused entry active.
+                    // spending it: a per-turn selector takes it on the
+                    // request, a session-bound selector re-establishes
+                    // the session, and a lane with no model surface keeps
+                    // the refused entry active. The entry leaves
+                    // `remaining` once scheduled — it is never retried —
+                    // but the chain's active entry and the session's
+                    // default publish only when the lane accepts it.
                     let session_bound = if turn_model != SelectorSupport::Unsupported {
                         false
                     } else if session_model != SelectorSupport::Unsupported {
@@ -1460,30 +1537,30 @@ impl VirtualSession {
                     } else {
                         break outcome;
                     };
-                    {
-                        let mut chain = model_state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        chain.remaining.remove(0);
-                        chain.active = Some(next.clone());
-                    }
+                    model_state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remaining
+                        .remove(0);
                     if session_bound {
                         // The lane binds its model at session
                         // establishment and has no per-turn surface — a
                         // request selector would be rejected before
                         // dispatch. The retry re-opens this lane's
-                        // session to move the session model forward.
+                        // session to move the session model forward; the
+                        // candidate binds when the replacement opens.
+                        pending_bind = Some(next);
                         session_retry = true;
                         break outcome;
                     }
                     // The lane applies the model per turn: the retry
-                    // carries the next entry, and the accepted entry
-                    // becomes the session's default so later turns
-                    // inherit the model that actually served — not
-                    // the entry the provider just exhausted.
-                    *turn_model_default
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = Some(next.clone());
+                    // carries the next entry, and once the lane accepts
+                    // it the entry becomes the session's default so
+                    // later turns inherit the model that actually
+                    // served — not the entry the provider just
+                    // exhausted.
+                    driver_model = Some(next.clone());
+                    pending_model = Some(next.clone());
                     request.model = Some(next);
                 };
                 relay.flush().await;
@@ -1575,67 +1652,85 @@ impl VirtualSession {
                     let Some(spec) = lane.specs.get(lane.index).cloned() else {
                         break 'lanes outcome;
                     };
+                    // The model this reopen binds: a session-bound retry
+                    // pursues the scheduled candidate; any other reopen
+                    // carries the last accepted chain entry forward.
+                    let head = pending_bind.clone().or_else(|| {
+                        model_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .active
+                            .clone()
+                    });
                     // Re-project the caller's request against this lane:
                     // selectors the previous lane applied at establishment
                     // may belong on turns here, and vice versa.
-                    let active = model_state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .active
-                        .clone();
                     let (mut new_open, turn_model, turn_effort) =
-                        lane_open(&spec, &lane.requested, &profile, active.clone());
+                        lane_open(&spec, &lane.requested, &profile, head.clone());
                     if same_lane {
                         // The refused model was bound at establishment, so
-                        // the retry re-opens this lane with the accepted
+                        // the retry re-opens this lane with the scheduled
                         // entry in the model slot — the selector phase
                         // this lane actually supports.
-                        new_open.config.model = active;
+                        new_open.config.model = head.clone();
                     }
                     let index = lane.index;
-                    let adapter = lane.adapter(index);
+                    let (adapter, probe) = lane.adapter(index);
                     let (tap_tx, next_tap_rx) = mpsc::unbounded_channel();
-                    let reopen = adapter.open_session(new_open.clone(), tap_tx);
-                    {
-                        let mut guard = session.write().await;
-                        let _ = guard.close().await;
-                        match reopen.await {
-                            Ok(new_session) => {
+                    // The replacement session opens while the installed
+                    // one stays in place: a refused open leaves the live
+                    // session, its probe and the accepted model binding
+                    // untouched — all three commit together only when the
+                    // replacement actually opens.
+                    match adapter.open_session(new_open.clone(), tap_tx).await {
+                        Ok(new_session) => {
+                            {
+                                let mut guard = session.write().await;
+                                let _ = guard.close().await;
                                 *guard = new_session;
-                                lane.open = new_open;
-                                // The dead lane's relay keeps draining its
-                                // tap to the caller on its own — leftovers
-                                // are the dead attempt's evidence, never
-                                // counted against the reopened lane.
-                                lane.relay = EventRelay::spawn(
-                                    next_tap_rx,
-                                    lane.events.clone(),
-                                    lane.probe.clone(),
-                                );
                             }
-                            Err(open_error) if model_failure(&open_error) => {
-                                // A session-bound retry refused at
-                                // establishment still owns its chain: the
-                                // next entry binds the model slot and this
-                                // same lane re-opens — a per-turn surface
-                                // would have kept walking the chain the
-                                // same way.
-                                if same_lane {
+                            lane.probe = probe.clone();
+                            lane.open = new_open;
+                            // The dead lane's relay keeps draining its
+                            // tap to the caller on its own — leftovers
+                            // are the dead attempt's evidence, never
+                            // counted against the reopened lane.
+                            lane.relay = EventRelay::spawn(next_tap_rx, lane.events.clone(), probe);
+                            model_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .active = head.clone();
+                            pending_bind = None;
+                        }
+                        Err(open_error) if model_failure(&open_error) => {
+                            // A session-bound retry refused at
+                            // establishment still owns its chain: the
+                            // next entry binds the model slot and this
+                            // same lane re-opens — a per-turn surface
+                            // would have kept walking the chain the
+                            // same way. The candidate stays pending:
+                            // the installed session and the accepted
+                            // binding carry no sign of it.
+                            if same_lane {
+                                let next = {
                                     let mut chain = model_state
                                         .lock()
                                         .unwrap_or_else(|error| error.into_inner());
-                                    if let Some(next) = chain.remaining.first().cloned() {
+                                    let next = chain.remaining.first().cloned();
+                                    if next.is_some() {
                                         chain.remaining.remove(0);
-                                        chain.active = Some(next);
-                                        drop(chain);
-                                        retry_same_lane = true;
-                                        continue;
                                     }
+                                    next
+                                };
+                                if let Some(next) = next {
+                                    pending_bind = Some(next);
+                                    retry_same_lane = true;
+                                    continue;
                                 }
-                                break 'lanes Err(open_error);
                             }
-                            Err(_) => continue,
+                            break 'lanes Err(open_error);
                         }
+                        Err(_) => continue,
                     }
                     *turn_model_default
                         .lock()

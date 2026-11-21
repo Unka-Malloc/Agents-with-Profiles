@@ -6679,3 +6679,832 @@ async fn rpc_empty_signals_turn_never_publishes_or_blocks_the_walk() {
     );
     session.close().await.unwrap();
 }
+
+/// An inline-params envelope whose `session/open` and `session/prompt`
+/// params are scalars — the model and the prompt text travel as the bare
+/// `params` value, so neither params document offers object positions.
+#[cfg(unix)]
+const RPC_INLINE_SCALAR_SETUP: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+session_model = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("cmd")
+    request_id = request.get("id")
+    params = request.get("params")
+    if method == "session/open":
+        session_model = params if isinstance(params, str) else None
+        send({"cmd": "response", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        text = params if isinstance(params, str) else ""
+        send({"cmd": "response", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  session_model or "unset", text)}})
+    elif request_id is not None:
+        send({"cmd": "response", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer that shares `negotiate` between a fixed-model
+/// `initialize` handshake and the model-bound `session/open`: the
+/// handshake is quota-refused while the open call would serve.
+#[cfg(unix)]
+const RPC_FIXED_MODEL_INIT_SHARED_METHOD: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_model = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "negotiate":
+        model = params.get("model")
+        if model == "handshake":
+            log.write("negotiate|handshake\n")
+            log.flush()
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            session_model = model
+            log.write("negotiate|{}\n".format(model or "unset"))
+            log.flush()
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model") or session_model
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer on a discriminated command envelope whose replies echo
+/// the answered command: it parks a `prime` `negotiate` open, issues its
+/// own `negotiate` callback, and once the host's reply — a response
+/// frame that echoes `negotiate` — arrives, refuses the parked call.
+#[cfg(unix)]
+const RPC_ENVELOPE_CALLBACK_REPLY: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_model = None
+parked_open = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    if request.get("type") == "response":
+        # The host's reply to our callback releases the parked open's
+        # refusal.
+        if parked_open is not None and request.get("id") == "cb-1":
+            send({"type": "response", "id": parked_open,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+            parked_open = None
+        continue
+    method = request.get("cmd")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "negotiate":
+        model = params.get("model")
+        session_model = model
+        log.write("negotiate|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "prime":
+            parked_open = request_id
+            send({"type": "request", "cmd": "negotiate",
+                  "id": "cb-1", "params": {}})
+        else:
+            send({"type": "response", "id": request_id,
+                  "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model") or session_model
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"type": "response", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"type": "response", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer whose `session/prompt` settles an `error` result whose
+/// only billable evidence is the usage record inside the synchronous
+/// reply payload — no notification ever carries it.
+#[cfg(unix)]
+const RPC_RESULT_ONLY_USAGE: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("session/prompt\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "", "status": "error",
+                         "usage": {"inputTokens": 3, "outputTokens": 7}}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer that dies on every `initialize` after the first: the
+/// model-free handshake is answered once, then each replacement open's
+/// process exits before its `session/open` ever reaches the wire.
+#[cfg(unix)]
+const RPC_DIE_ON_REOPEN_QUOTA: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+log_path = os.environ["AWP_CALL_LOG"]
+session_model = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "initialize":
+        # A replacement open is a fresh process, so the count lives in
+        # the log itself: only the lane's first handshake is answered.
+        seen = sum(
+            1 for entry in open(log_path) if entry.startswith("initialize")
+        )
+        if seen >= 1:
+            sys.stdout.flush()
+            os._exit(0)
+        log.write("initialize\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/open":
+        session_model = params.get("model")
+        log.write("session/open|{}\n".format(session_model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = session_model
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer whose model-carrying `initialize` dies when it carries
+/// `fallback`: the candidate's setup call reaches the wire, then the
+/// process exits before `session/open` can follow.
+#[cfg(unix)]
+const RPC_DIE_ON_FALLBACK_QUOTA: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_model = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "initialize":
+        session_model = params.get("model")
+        log.write("initialize|{}\n".format(session_model or "unset"))
+        log.flush()
+        if session_model == "fallback":
+            sys.stdout.flush()
+            os._exit(0)
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = session_model
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer whose `session/open` stalls — long enough for a cancel to
+/// land mid-open — then logs the model each prompt carried.
+#[cfg(unix)]
+const RPC_SLOW_OPEN_PROMPT_LOG: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open\n")
+        log.flush()
+        time.sleep(0.8)
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_inline_envelope_scalar_setup_params_open_serves() {
+    // `paramsInline` merges object params into the frame root; scalar
+    // params stay under `params` untouched, so the control-field filter
+    // must apply only where the merge happened — a scalar document has
+    // no root positions to strip, and the wire's `params` value remains
+    // the model slot's verifiable position.
+    let dir = TestDirectory::new("rpc-inline-scalar-setup");
+    let script = dir.path().join("rpc_inline_scalar.py");
+    std::fs::write(&script, RPC_INLINE_SCALAR_SETUP).unwrap();
+    let mut spec = rpc_spec("scalar", &script, json!("{model}"), json!("{prompt}"));
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.envelope = Some(a4aa::RpcEnvelopeSpec {
+        method_field: "cmd".to_owned(),
+        params_inline: true,
+        response_method: Some("response".to_owned()),
+        ..Default::default()
+    });
+    let mut document = RegistryDocument::default();
+    document.agents.insert(
+        spec.id.clone(),
+        awp::AgentEntry {
+            spec,
+            alternates: vec![],
+        },
+    );
+    document.profiles.insert(
+        "p".to_owned(),
+        ProfilePatch {
+            agent: Some("scalar".to_owned()),
+            model: Some("prime".to_owned()),
+            ..Default::default()
+        },
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|prime|work");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_fixed_model_handshake_quota_is_not_the_model_bound_open() {
+    // `initialize` and `session/open` ride one wire method, and the
+    // handshake's params even populate the field the open binds the
+    // model through — a fixed `"handshake"` value, never the chain's
+    // `{model}` slot. Matching populated positions instead of the
+    // selected call would read its quota refusal as a model rejection
+    // and burn every chain entry on identical handshakes. Each request
+    // attaches to the call the adapter actually selected, so the
+    // refusal stays a lane refusal and the walk reaches the next lane
+    // with the chain untouched.
+    let dir = TestDirectory::new("rpc-fixed-model-init");
+    let refusing = dir.path().join("rpc_fixed_init.py");
+    std::fs::write(&refusing, RPC_FIXED_MODEL_INIT_SHARED_METHOD).unwrap();
+    let refusing_log = dir.path().join("refusing.log");
+    let mut primary = rpc_spec(
+        "fixedinit",
+        &refusing,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.initialize = Some(RpcCallSpec {
+            method: "negotiate".to_owned(),
+            params: json!({"model": "handshake"}),
+        });
+        lane.session_open = Some(RpcCallSpec {
+            method: "negotiate".to_owned(),
+            params: json!({"model": "{model}"}),
+        });
+    }
+    attach_call_log(&mut primary, &refusing_log);
+    let serving = dir.path().join("rpc_serving.py");
+    std::fs::write(&serving, RPC_SESSION_MODEL_LOG).unwrap();
+    let serving_log = dir.path().join("serving.log");
+    let alternate = rpc_session_bound_spec("serving", &serving, &serving_log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("fixedinit".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned(), "tertiary".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|prime|work");
+    assert_eq!(
+        session.active_model().as_deref(),
+        Some("prime"),
+        "a fixed-model handshake's refusal is not a model rejection"
+    );
+    let calls_log = std::fs::read_to_string(&refusing_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["negotiate|handshake"],
+        "the handshake refusal must not burn chain entries on retries: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_callback_reply_never_claims_the_setup_call() {
+    // The peer parks the `prime` open, issues its own `negotiate`
+    // callback, and refuses the parked call once the host's reply
+    // arrives. That reply is a response frame that echoes the answered
+    // command — under a method-name reading it is indistinguishable
+    // from a setup request — so a journal that claimed slots for it
+    // would leave the real open unattributed and call its quota refusal
+    // model-free. Responses are never setup requests: the journaled id
+    // still names the model-bound call, the chain advances, and the
+    // retry binds `fallback`.
+    let dir = TestDirectory::new("rpc-callback-echo");
+    let script = dir.path().join("rpc_envelope_callback.py");
+    std::fs::write(&script, RPC_ENVELOPE_CALLBACK_REPLY).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "callback",
+        &script,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.session_open = Some(RpcCallSpec {
+            method: "negotiate".to_owned(),
+            params: json!({"model": "{model}"}),
+        });
+        lane.envelope = Some(a4aa::RpcEnvelopeSpec {
+            method_field: "cmd".to_owned(),
+            string_ids: true,
+            discriminant_field: Some("type".to_owned()),
+            request_marker: Some("request".to_owned()),
+            response_method: Some("response".to_owned()),
+            command_field: Some("cmd".to_owned()),
+            ..Default::default()
+        });
+    }
+    attach_call_log(&mut primary, &log);
+    let mut document = RegistryDocument::default();
+    document.agents.insert(
+        primary.id.clone(),
+        awp::AgentEntry {
+            spec: primary,
+            alternates: vec![],
+        },
+    );
+    document.profiles.insert(
+        "p".to_owned(),
+        ProfilePatch {
+            agent: Some("callback".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "negotiate|prime",
+            "negotiate|fallback",
+            "session/prompt|fallback"
+        ],
+        "the refused call was the model-bound open: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_result_only_usage_marks_the_error_served() {
+    // The turn's only billable evidence is the usage record inside the
+    // prompt's synchronous reply — no notification ever carries one, so
+    // the outcome's usage is empty and its text is too. The wire probe
+    // correlates the reply to the prompt's request id: a nonzero record
+    // there still proves the paid turn ran, so the `error` outcome
+    // stands instead of replaying on the alternate lane.
+    let dir = TestDirectory::new("rpc-result-only-usage");
+    let script = dir.path().join("rpc_result_usage.py");
+    std::fs::write(&script, RPC_RESULT_ONLY_USAGE).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec("resultuse", &script, json!({}), json!({"text": "{prompt}"}));
+    attach_call_log(&mut primary, &log);
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("resultuse".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert!(
+        !outcome.text.contains("alt|"),
+        "result-only usage still proves the turn ran: {outcome:?}"
+    );
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open", "session/prompt"],
+        "the served error must not replay the prompt: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_zero_usage_records_never_block_the_walk() {
+    // A json_lines lane that emits only an empty result with an all-zero
+    // usage record did no billable work: the record is bookkeeping, not
+    // output evidence, so the `error` outcome cannot hold the walk —
+    // the alternate lane runs the turn.
+    let mut primary = cli_spec(
+        "zerouse",
+        "sh",
+        &[
+            "-c",
+            "exec 0<&-; \
+             echo '{\"type\":\"result\",\"result\":\"\",\"usage\":{\"inputTokens\":0,\"outputTokens\":0}}'; \
+             exit 1",
+        ],
+        PromptChannel::Stdin,
+    );
+    let LaneSpec::Cli(lane) = &mut primary.lane else {
+        panic!("cli_spec builds a cli lane")
+    };
+    lane.json_lines = true;
+    lane.result_selector = Some("result".to_owned());
+    lane.result_path = Some("result".to_owned());
+    lane.usage_path = Some("usage".to_owned());
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("zerouse".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(
+        outcome.text.trim_end(),
+        "alt|work",
+        "zero-usage bookkeeping is not served work: {outcome:?}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_during_model_free_replacement_restores_the_unsent_candidate() {
+    // `prime` is quota-refused at the prompt; the session-bound retry
+    // removes `fallback` and re-opens — but the replacement's
+    // model-free `initialize` dies mid-handshake, so no setup call ever
+    // carried the candidate. The cancel lands while the next lane's
+    // model-free `session/open` still stalls: with no wire evidence the
+    // candidate returns to the chain, and the next turn retries it.
+    let dir = TestDirectory::new("rpc-cancel-unsent-reopen");
+    let first = dir.path().join("rpc_die_reopen.py");
+    std::fs::write(&first, RPC_DIE_ON_REOPEN_QUOTA).unwrap();
+    let first_log = dir.path().join("first.log");
+    let mut primary = rpc_spec(
+        "diereopen",
+        &first,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.initialize = Some(RpcCallSpec {
+            method: "initialize".to_owned(),
+            params: json!({}),
+        });
+    }
+    attach_call_log(&mut primary, &first_log);
+    let second = dir.path().join("rpc_slow_open.py");
+    std::fs::write(&second, RPC_SLOW_OPEN_PROMPT_LOG).unwrap();
+    let second_log = dir.path().join("second.log");
+    let mut alternate = rpc_spec(
+        "slowopen",
+        &second,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &second_log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("diereopen".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("work".to_owned()).await })
+    };
+    // Wait until the next lane's open is on the wire and stalled — the
+    // earlier attempt died at its model-free `initialize`, so the
+    // candidate never rode a setup frame anywhere.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let contents = std::fs::read_to_string(&second_log).unwrap_or_default();
+        if contents.contains("session/open") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the next lane's open never ran: {contents} | first: {}",
+            std::fs::read_to_string(&first_log).unwrap_or_default()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    session.cancel().await.unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+        .await
+        .expect("the turn outlived cancel during the next lane's open")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.stop_reason, "cancelled");
+
+    // No wire ever carried `fallback`: it went back to the chain, so the
+    // next turn's `prime` refusal retries it — the walk reaches the
+    // alternate, whose per-turn selector serves it.
+    let outcome = session.prompt("more".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|more");
+    let calls_log = std::fs::read_to_string(&first_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "initialize",
+            "session/open|prime",
+            "session/prompt|prime",
+            "session/prompt|prime",
+        ],
+        "the candidate was never sent, so no reopen binds it: {calls_log}"
+    );
+    let calls_log = std::fs::read_to_string(&second_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open", "session/open", "session/prompt|fallback"],
+        "the next turn's retry binds the restored candidate: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_after_candidate_sent_then_died_keeps_it_spent() {
+    // `prime` is refused at the prompt; the session-bound retry removes
+    // `fallback` and re-opens — this lane's model-carrying `initialize`
+    // puts the candidate on the wire, then the process dies before its
+    // model-free `session/open`. The cancel lands while the next lane's
+    // open still stalls: the folded send record keeps the candidate
+    // spent instead of restoring it on the fresh probe's empty record.
+    let dir = TestDirectory::new("rpc-cancel-sent-died");
+    let first = dir.path().join("rpc_die_fallback.py");
+    std::fs::write(&first, RPC_DIE_ON_FALLBACK_QUOTA).unwrap();
+    let first_log = dir.path().join("first.log");
+    let mut primary = rpc_spec(
+        "diefallback",
+        &first,
+        json!({}),
+        json!({"text": "{prompt}"}),
+    );
+    {
+        let LaneSpec::Rpc(lane) = &mut primary.lane else {
+            panic!("rpc_spec builds an rpc lane")
+        };
+        lane.initialize = Some(RpcCallSpec {
+            method: "initialize".to_owned(),
+            params: json!({"model": "{model}"}),
+        });
+    }
+    attach_call_log(&mut primary, &first_log);
+    let second = dir.path().join("rpc_slow_open.py");
+    std::fs::write(&second, RPC_SLOW_OPEN_PROMPT_LOG).unwrap();
+    let second_log = dir.path().join("second.log");
+    let mut alternate = rpc_spec(
+        "slowopen",
+        &second,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &second_log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("diefallback".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("work".to_owned()).await })
+    };
+    // Wait until the next lane's open is on the wire and stalled — the
+    // earlier attempt's `initialize|fallback` send is behind it, so a
+    // restore at this point could only come from the fresh probe's
+    // empty record, never from evidence that the wire carried the model.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let contents = std::fs::read_to_string(&second_log).unwrap_or_default();
+        if contents.contains("session/open") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the next lane's open never ran: {contents} | first: {}",
+            std::fs::read_to_string(&first_log).unwrap_or_default()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    session.cancel().await.unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+        .await
+        .expect("the turn outlived cancel during the next lane's open")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.stop_reason, "cancelled");
+
+    // The candidate already reached the wire: it stays spent, so the
+    // next turn's `prime` refusal has no chain entry left to resend it.
+    let error = session.prompt("more".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    let calls_log = std::fs::read_to_string(&first_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "initialize|prime",
+            "session/open",
+            "session/prompt|prime",
+            "initialize|fallback",
+            "session/prompt|prime",
+        ],
+        "a candidate sent then abandoned must not be restored and resent: {calls_log}"
+    );
+    session.close().await.unwrap();
+}

@@ -321,7 +321,8 @@ impl VirtualAgent {
                 // Every open attempt also gets a dispatch probe: the wire
                 // tap the turn driver later reads to learn whether an
                 // uncertain failure's prompt frame ever left the machine.
-                let probe = DispatchProbe::new(self.observer.clone(), spec);
+                let probe =
+                    DispatchProbe::new(self.observer.clone(), spec, resuming(&lane_request));
                 let observer: SharedObserver = Some(probe.clone());
                 let result = self
                     .adapter(spec, &reservations)
@@ -440,7 +441,11 @@ impl LaneState {
     /// this lane's probe only when the session it was built for opens —
     /// a refused open leaves the installed session and probe untouched.
     fn adapter(&self, index: usize) -> (Adapter, Arc<DispatchProbe>) {
-        let probe = DispatchProbe::new(self.observer.clone(), &self.specs[index]);
+        let probe = DispatchProbe::new(
+            self.observer.clone(),
+            &self.specs[index],
+            resuming(&self.open),
+        );
         let observer: SharedObserver = Some(probe.clone());
         let mut adapter = Adapter::new(self.specs[index].clone())
             .secrets(self.secrets.clone())
@@ -660,7 +665,9 @@ struct EventRelay {
 struct RelayEvidence {
     /// Open only while a turn attempt is in flight on this lane.
     armed: AtomicBool,
-    /// Any event relayed while armed — the attempt produced output.
+    /// Output evidence relayed while armed — genuine turn output or
+    /// progress, never bookkeeping-only signals like an empty chunk or
+    /// a usage record with no other content.
     output: AtomicBool,
     /// A billable event relayed while armed — the output was paid work.
     billable: AtomicBool,
@@ -744,7 +751,9 @@ impl EventRelay {
         event: AgentEvent,
     ) {
         if evidence.armed.load(Ordering::Acquire) && !probe.has_dispatch_point() {
-            evidence.output.store(true, Ordering::Release);
+            if turn_progress(&event, probe) {
+                evidence.output.store(true, Ordering::Release);
+            }
             if turn_output(&event, probe) {
                 evidence.billable.store(true, Ordering::Release);
             }
@@ -815,6 +824,19 @@ struct SentSetup {
     carries_model: bool,
 }
 
+/// Sent setup requests still awaiting a response, plus the call claims
+/// that matched them. The lane issues its setup calls in one fixed order
+/// — `initialize`, then the session call the request selects — so a
+/// request claims the first unclaimed call whose method it carries:
+/// two calls sharing a wire method attach to the call the adapter
+/// actually selected instead of matching every same-method template.
+struct SetupJournal {
+    /// One claim per entry in `setup_calls`, in adapter call order.
+    claimed: Vec<bool>,
+    /// The journaled requests in wire order.
+    sent: Vec<SentSetup>,
+}
+
 /// Side-effect-free wire evidence for an rpc lane. The transport observer
 /// sees every outbound frame before it is written and every inbound frame
 /// before it reaches the lane's notification queue — both strictly before
@@ -848,6 +870,10 @@ struct DispatchProbe {
     /// from an accepted one.
     error_field: Option<String>,
     success_field: Option<String>,
+    /// The envelope's response result member (`result_field`) — where
+    /// the prompt's synchronous reply carries its payload, usage
+    /// included, when `result` is not the field name.
+    result_field: Option<String>,
     /// A declared notification payload field — the envelope's
     /// `data_field`. When declared but absent on a frame, the frame
     /// itself is the payload document (flat envelopes). Inbound only:
@@ -894,19 +920,24 @@ struct DispatchProbe {
     /// writer stops at the failed write, so on a `writer_failed` report
     /// the last observed `Sent` names the failed write.
     last_sent_was_prompt: AtomicBool,
-    /// The declared setup calls — `initialize`, `session_open`,
-    /// `session_resume` — with the params-template positions a
-    /// `{model}`-family placeholder occupies. An rpc lane reports every
-    /// setup failure as `rpc/call`, so the wire journal must name the
-    /// refused call exactly: method names cannot distinguish calls a
-    /// lane shares, and an interleaved callback reply is not a setup
-    /// request.
+    /// The setup calls the adapter actually issues, in issue order —
+    /// `initialize`, then `session_open` or `session_resume` as the
+    /// open request's resume flag selects — with the params-template
+    /// positions a `{model}`-family placeholder occupies. An rpc lane
+    /// reports every setup failure as `rpc/call`, so the wire journal
+    /// must name the refused call exactly: method names cannot
+    /// distinguish calls a lane shares, and an interleaved callback
+    /// reply is not a setup request.
     setup_calls: Vec<SetupWire>,
     /// Sent setup requests still awaiting a response, in wire order:
     /// request id and whether the frame's params populated a declared
     /// model slot. The refusal's response id correlates the verdict to
     /// the exact call it answers.
-    setup_journal: std::sync::Mutex<Vec<SentSetup>>,
+    setup_journal: std::sync::Mutex<SetupJournal>,
+    /// The request id of this attempt's prompt frame — the key its
+    /// synchronous response correlates on, so usage that lives only
+    /// inside the reply payload still reaches the served check.
+    prompt_id: std::sync::Mutex<Option<String>>,
     /// The setup call a journaled error response answered, when one has
     /// been observed — `Some(carries_model)` for that request.
     setup_refusal: std::sync::Mutex<Option<bool>>,
@@ -926,7 +957,11 @@ struct DispatchProbe {
 }
 
 impl DispatchProbe {
-    fn new(inner: SharedObserver, spec: &AgentSpec) -> Arc<Self> {
+    /// `resuming` is the open request's own selection — the same flag
+    /// `rpc_setup_uses` and the adapter's `open_call` read — so the
+    /// probe's setup list is the calls this open actually issues, in
+    /// issue order, never every declared call.
+    fn new(inner: SharedObserver, spec: &AgentSpec, resuming: bool) -> Arc<Self> {
         let mut probe = Self {
             inner,
             method: None,
@@ -936,6 +971,7 @@ impl DispatchProbe {
             discriminant_field: None,
             error_field: None,
             success_field: None,
+            result_field: None,
             data_field: None,
             text_event_method: None,
             text_path: None,
@@ -947,7 +983,11 @@ impl DispatchProbe {
             dispatched: AtomicBool::new(false),
             last_sent_was_prompt: AtomicBool::new(false),
             setup_calls: Vec::new(),
-            setup_journal: std::sync::Mutex::new(Vec::new()),
+            setup_journal: std::sync::Mutex::new(SetupJournal {
+                claimed: Vec::new(),
+                sent: Vec::new(),
+            }),
+            prompt_id: std::sync::Mutex::new(None),
             setup_refusal: std::sync::Mutex::new(None),
             model_setup_sent: AtomicBool::new(false),
             turn_event: AtomicBool::new(false),
@@ -964,6 +1004,7 @@ impl DispatchProbe {
                 probe.discriminant_field = envelope.discriminant_field.clone();
                 probe.error_field = envelope.error_field.clone();
                 probe.success_field = envelope.success_field.clone();
+                probe.result_field = envelope.result_field.clone();
                 probe.data_field = envelope.data_field.clone();
             }
             probe.text_event_method = rpc.text_event_method.clone();
@@ -975,23 +1016,34 @@ impl DispatchProbe {
                 .as_ref()
                 .is_some_and(|envelope| envelope.params_inline)
                 && rpc.prompt.params.is_object();
-            probe.setup_calls = [
-                rpc.initialize.as_ref(),
-                rpc.session_open.as_ref(),
-                rpc.session_resume.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|call| SetupWire {
-                method: call.method.clone(),
-                params_at_root: rpc
-                    .envelope
-                    .as_ref()
-                    .is_some_and(|envelope| envelope.params_inline)
-                    && call.params.is_object(),
-                model_slots: model_slots(&call.params),
-            })
-            .collect();
+            // The session call this request selects — a process-scoped
+            // lane has none, a resume picks `session_resume` with
+            // `session_open` as fallback — mirroring `rpc_setup_uses`
+            // and the adapter's `open_call` so a shared wire method
+            // attaches each request to the call that produced it.
+            let session_call = match rpc.session_scope {
+                a4aa::SessionScope::Process => None,
+                _ if resuming => rpc.session_resume.as_ref().or(rpc.session_open.as_ref()),
+                _ => rpc.session_open.as_ref(),
+            };
+            probe.setup_calls = [rpc.initialize.as_ref(), session_call]
+                .into_iter()
+                .flatten()
+                .map(|call| SetupWire {
+                    method: call.method.clone(),
+                    params_at_root: rpc
+                        .envelope
+                        .as_ref()
+                        .is_some_and(|envelope| envelope.params_inline)
+                        && call.params.is_object(),
+                    model_slots: model_slots(&call.params),
+                })
+                .collect();
+            probe
+                .setup_journal
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .claimed = vec![false; probe.setup_calls.len()];
             if let Some(envelope) = rpc
                 .envelope
                 .as_ref()
@@ -1004,6 +1056,8 @@ impl DispatchProbe {
                 // leaf at one of those positions never reaches the wire:
                 // it is not a verifiable position, and demanding it would
                 // hide the evidence the surviving positions already prove.
+                // Non-object params sit under `params` untouched, so the
+                // filter applies only where the merge actually happened.
                 let mut overwritten: std::collections::BTreeSet<&str> =
                     envelope.const_fields.keys().map(String::as_str).collect();
                 overwritten.insert(envelope.method_field.as_str());
@@ -1013,12 +1067,16 @@ impl DispatchProbe {
                         overwritten.insert(field.as_str());
                     }
                 }
-                probe
-                    .prompt_slots
-                    .retain(|(path, _)| !overwritten.contains(path[0].as_str()));
+                if probe.prompt_at_root {
+                    probe
+                        .prompt_slots
+                        .retain(|(path, _)| !overwritten.contains(path[0].as_str()));
+                }
                 for call in &mut probe.setup_calls {
-                    call.model_slots
-                        .retain(|path| !overwritten.contains(path[0].as_str()));
+                    if call.params_at_root {
+                        call.model_slots
+                            .retain(|path| !overwritten.contains(path[0].as_str()));
+                    }
                 }
             }
             probe.prompt_carries_text = !probe.prompt_slots.is_empty();
@@ -1083,6 +1141,7 @@ impl DispatchProbe {
         self.setup_journal
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .sent
             .last()
             .is_some_and(|sent| sent.carries_model)
     }
@@ -1169,10 +1228,21 @@ impl DispatchProbe {
             .collect();
         self.dispatched.store(false, Ordering::Release);
         self.last_sent_was_prompt.store(false, Ordering::Release);
+        {
+            let mut journal = self
+                .setup_journal
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            journal.sent.clear();
+            journal
+                .claimed
+                .iter_mut()
+                .for_each(|claimed| *claimed = false);
+        }
         *self
-            .setup_journal
+            .prompt_id
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Vec::new();
+            .unwrap_or_else(|error| error.into_inner()) = None;
         *self
             .setup_refusal
             .lock()
@@ -1195,15 +1265,70 @@ impl DispatchProbe {
         self.billable_notification(method, params)
     }
 
-    /// The event-tap form of the same normalization: the lane rebuilds a
-    /// relayed notification as a `{method, params}` document already
-    /// decoded from the frame, so its carriers sit at their conventional
-    /// positions regardless of the wire envelope.
+    /// The event-tap form of the same normalization: an rpc lane
+    /// rebuilds a relayed notification as a `{method, params}` document
+    /// already decoded from the frame, while a cli lane's raw record is
+    /// the record itself — either way its carriers sit at their
+    /// conventional positions regardless of the wire envelope.
     fn billable_raw(&self, raw: &serde_json::Value) -> bool {
         self.billable_notification(
             raw.get("method").and_then(serde_json::Value::as_str),
-            raw.get("params").unwrap_or(&serde_json::Value::Null),
+            raw.get("params").unwrap_or(raw),
         )
+    }
+
+    /// Whether a raw record's only evidence claim is a usage document —
+    /// bookkeeping like a `usage` event or a result record whose payload
+    /// is the usage object — versus genuine turn progress. The declared
+    /// `usage_path` leads; the conventional `usage` / `message.usage`
+    /// positions follow, resolved where `billable_raw` reads the record.
+    fn bookkeeping_raw(&self, raw: &serde_json::Value) -> bool {
+        let root = raw.get("params").unwrap_or(raw);
+        self.usage_path
+            .as_deref()
+            .and_then(|path| extract_path(root, path))
+            .or_else(|| root.get("usage"))
+            .or_else(|| extract_path(root, "message.usage"))
+            .is_some_and(|usage| usage.is_object())
+    }
+
+    /// Whether a synchronous prompt response's payload proves billed
+    /// work: the result body or the error object may carry a usage
+    /// record at the declared or conventional carriers — nested under
+    /// `data` on an error payload — that never rode a notification.
+    fn usage_billable(&self, payload: &serde_json::Value) -> bool {
+        [Some(payload), payload.get("data")]
+            .into_iter()
+            .flatten()
+            .any(|doc| {
+                self.usage_path
+                    .as_deref()
+                    .and_then(|path| extract_path(doc, path))
+                    .or_else(|| doc.get("usage"))
+                    .or_else(|| extract_path(doc, "message.usage"))
+                    .is_some_and(normalized_billable)
+            })
+    }
+
+    /// Whether an outbound frame answers a peer-initiated request — the
+    /// same response discrimination the peer's inbound dispatch applies.
+    /// A response is never a setup request: an envelope that echoes the
+    /// answered command on replies would otherwise let a callback reply
+    /// steal a same-method setup call's journal claim.
+    fn outbound_response(&self, frame: &serde_json::Value) -> bool {
+        if !self.enveloped {
+            return false;
+        }
+        self.response_method.as_deref().is_some_and(|marker| {
+            frame
+                .get(
+                    self.discriminant_field
+                        .as_deref()
+                        .unwrap_or(self.method_field.as_str()),
+                )
+                .and_then(serde_json::Value::as_str)
+                == Some(marker)
+        })
     }
 
     /// Whether an inbound response frame reports a failure — the same
@@ -1482,46 +1607,74 @@ impl Observer for DispatchProbe {
             // names the write a `writer_failed` report refers to.
             Direction::Sent => {
                 let frame = serde_json::from_slice::<serde_json::Value>(bytes).ok();
-                let prompt = frame
+                let outbound_response = frame
                     .as_ref()
-                    .is_some_and(|frame| self.is_prompt_frame(frame));
+                    .is_some_and(|frame| self.outbound_response(frame));
+                let prompt = !outbound_response
+                    && frame
+                        .as_ref()
+                        .is_some_and(|frame| self.is_prompt_frame(frame));
                 self.last_sent_was_prompt.store(prompt, Ordering::Release);
                 if prompt {
                     self.dispatched.store(true, Ordering::Release);
+                    // The request id correlates the prompt's synchronous
+                    // response — usage that lives only inside that reply
+                    // still proves billed work happened.
+                    if let Some(id) = frame
+                        .as_ref()
+                        .and_then(|frame| frame.get("id"))
+                        .and_then(setup_id_key)
+                    {
+                        *self
+                            .prompt_id
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = Some(id);
+                    }
                 }
                 // A declared setup request is journaled by request id:
                 // the refusal's response then names the exact call it
-                // answers — method names cannot distinguish setup calls
-                // a lane shares, and an interleaved callback reply is a
-                // response frame, never a request. Whether the frame's
+                // answers. Outbound callback replies are response frames,
+                // never setup requests, and a request claims the first
+                // unclaimed call whose method it carries — the adapter's
+                // own issue order — so two setup calls sharing a wire
+                // method each name their own call. Whether the frame's
                 // params populate a declared model slot decides if a
                 // chain entry could change that call's answer.
                 if let Some(frame) = frame.as_ref() {
-                    let request = frame.get("id").and_then(setup_id_key).zip(
-                        frame
-                            .get(self.method_field.as_str())
-                            .and_then(serde_json::Value::as_str),
-                    );
-                    if let Some((id, method)) = request {
-                        let mut is_setup = false;
-                        let mut carries_model = false;
-                        for call in self.setup_calls.iter().filter(|call| call.method == method) {
-                            is_setup = true;
-                            let params = if call.params_at_root {
-                                frame
-                            } else {
-                                frame.get("params").unwrap_or(&serde_json::Value::Null)
+                    if !outbound_response {
+                        let request = frame.get("id").and_then(setup_id_key).zip(
+                            frame
+                                .get(self.method_field.as_str())
+                                .and_then(serde_json::Value::as_str),
+                        );
+                        if let Some((id, method)) = request {
+                            let claimed = {
+                                let mut journal = self
+                                    .setup_journal
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                let claim = self.setup_calls.iter().enumerate().find_map(
+                                    |(index, call)| {
+                                        (!journal.claimed[index] && call.method == method)
+                                            .then_some(index)
+                                    },
+                                );
+                                claim.map(|index| {
+                                    journal.claimed[index] = true;
+                                    let call = &self.setup_calls[index];
+                                    let params = if call.params_at_root {
+                                        frame
+                                    } else {
+                                        frame.get("params").unwrap_or(&serde_json::Value::Null)
+                                    };
+                                    let carries_model = call.model_slots.iter().any(|slot| {
+                                        slot_at(params, slot).is_some_and(|value| !value.is_null())
+                                    });
+                                    journal.sent.push(SentSetup { id, carries_model });
+                                    carries_model
+                                })
                             };
-                            carries_model |= call.model_slots.iter().any(|slot| {
-                                slot_at(params, slot).is_some_and(|value| !value.is_null())
-                            });
-                        }
-                        if is_setup {
-                            self.setup_journal
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .push(SentSetup { id, carries_model });
-                            if carries_model {
+                            if claimed == Some(true) {
                                 self.model_setup_sent.store(true, Ordering::Release);
                             }
                         }
@@ -1571,9 +1724,10 @@ impl Observer for DispatchProbe {
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
                             journal
+                                .sent
                                 .iter()
                                 .position(|sent| sent.id == key)
-                                .map(|position| journal.remove(position))
+                                .map(|position| journal.sent.remove(position))
                         };
                         if let Some(sent) = sent {
                             if self.response_is_error(&frame) {
@@ -1582,6 +1736,30 @@ impl Observer for DispatchProbe {
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner()) =
                                     Some(sent.carries_model);
+                            }
+                        } else if self
+                            .prompt_id
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .as_deref()
+                            == Some(key.as_str())
+                        {
+                            // The prompt's own reply is in-turn evidence
+                            // by correlation — A4AA surfaces
+                            // notification-carried usage in the outcome,
+                            // but usage that exists only inside this
+                            // response payload still proves the paid
+                            // turn ran and must reach the served check.
+                            self.turn_event.store(true, Ordering::Release);
+                            let result =
+                                frame.get(self.result_field.as_deref().unwrap_or("result"));
+                            let error = frame.get(self.error_field.as_deref().unwrap_or("error"));
+                            if [result, error]
+                                .into_iter()
+                                .flatten()
+                                .any(|payload| self.usage_billable(payload))
+                            {
+                                self.turn_billable.store(true, Ordering::Release);
                             }
                         }
                     }
@@ -1697,6 +1875,20 @@ fn turn_output(event: &AgentEvent, probe: &DispatchProbe) -> bool {
         AgentEvent::ToolCall { .. } | AgentEvent::Plan { .. } | AgentEvent::Truncated => true,
         AgentEvent::Usage { usage, .. } => billable_usage(usage),
         AgentEvent::Raw { raw } => probe.billable_raw(raw),
+    }
+}
+
+/// Whether one relayed lane event proves the attempt produced output
+/// the caller saw — the billable evidence of `turn_output`, or genuine
+/// turn progress a raw lane stream carries: any record that is not
+/// exclusively bookkeeping. An empty chunk, an all-zero usage record
+/// and a raw record whose only claim is a usage document never count —
+/// a lane that emitted nothing but zero-usage bookkeeping and then
+/// errored did no served work.
+fn turn_progress(event: &AgentEvent, probe: &DispatchProbe) -> bool {
+    match event {
+        AgentEvent::Raw { raw } => probe.billable_raw(raw) || !probe.bookkeeping_raw(raw),
+        _ => turn_output(event, probe),
     }
 }
 
@@ -2207,10 +2399,16 @@ impl VirtualSession {
                         ));
                     }
                     if cancellation.load(Ordering::Acquire) != cancel_mark {
-                        // A scheduled candidate the cancelled retry never
-                        // dispatched goes back to the chain: the next turn
-                        // can still try a model no request carried.
-                        restore_candidate(&model_state, pending_model.take());
+                        // A scheduled candidate goes back to the chain
+                        // only while no wire ever carried it — the same
+                        // restoration rule the replacement-open guards
+                        // apply: folded send history plus the installed
+                        // lane's own probe record. A candidate an earlier
+                        // lane's setup already sent stays spent — the
+                        // peer may have bound it.
+                        if !pending_sent && !probe.model_setup_sent() {
+                            restore_candidate(&model_state, pending_model.take());
+                        }
                         break 'lanes prior.take().unwrap_or_else(|| Ok(cancelled_outcome()));
                     }
                     // One iteration is one physical prompt attempt: reset
@@ -2234,6 +2432,13 @@ impl VirtualSession {
                     if cancellation.load(Ordering::Acquire) != cancel_mark
                         && matches!(&outcome, Err(error) if error.code == "agent_turn_cancelled")
                     {
+                        // The candidate whose attempt ended at admission
+                        // never dispatched — same restoration rule: it
+                        // returns to the chain only while no wire ever
+                        // carried it.
+                        if !pending_sent && !probe.model_setup_sent() {
+                            restore_candidate(&model_state, pending_model.take());
+                        }
                         break 'lanes Ok(cancelled_outcome());
                     }
                     // The lane may still hold this attempt's tail events:
@@ -2372,6 +2577,10 @@ impl VirtualSession {
                     driver_model = Some(next.clone());
                     pending_model = Some(next.clone());
                     request.model = Some(next);
+                    // The send history belongs to the candidate: a fresh
+                    // chain entry leaves `remaining` only while no wire
+                    // carried it, so its history starts empty.
+                    pending_sent = false;
                     prior = Some(outcome);
                 };
                 relay.flush().await;
@@ -2545,7 +2754,7 @@ impl VirtualSession {
                         // no wire ever carried it — evidence folded in
                         // from every attempt it already rode, not just
                         // the probe this open happens to use.
-                        if !pending_sent {
+                        if pending_bind.is_some() && !pending_sent && !probe.model_setup_sent() {
                             restore_candidate(&model_state, pending_bind.take());
                         }
                         break 'lanes outcome;
@@ -2622,6 +2831,17 @@ impl VirtualSession {
                                 if cancellation.load(Ordering::Acquire) != cancel_mark {
                                     drop(guard);
                                     drop(new_session);
+                                    // The opened replacement never
+                                    // installed — a pending candidate no
+                                    // setup call ever carried returns to
+                                    // the chain; one already sent may be
+                                    // bound on the dropped peer.
+                                    if pending_bind.is_some()
+                                        && !pending_sent
+                                        && !probe.model_setup_sent()
+                                    {
+                                        restore_candidate(&model_state, pending_bind.take());
+                                    }
                                     break 'lanes Ok(cancelled_outcome());
                                 }
                                 // The lifecycle check stands immediately
@@ -2842,6 +3062,7 @@ mod tests {
                 max_output_bytes: None,
                 seatbelted_permission: None,
             },
+            false,
         )
     }
 
@@ -2861,6 +3082,7 @@ mod tests {
                 max_output_bytes: None,
                 seatbelted_permission: None,
             },
+            false,
         )
     }
 
@@ -2914,5 +3136,236 @@ mod tests {
         assert!(evidence.output.load(Ordering::Acquire));
         assert!(evidence.billable.load(Ordering::Acquire));
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::MessageChunk { .. })));
+    }
+
+    /// Bookkeeping-only records never mark an attempt served on an
+    /// unprobed lane: an empty chunk, an all-zero usage event and a raw
+    /// record whose only claim is a usage document are not output —
+    /// while a genuine progress record still is.
+    #[test]
+    fn unprobed_lane_relay_ignores_bookkeeping_only_records() {
+        let probe = unprobed_probe();
+        let (events, _rx) = mpsc::unbounded_channel();
+        let evidence = armed();
+        for event in [
+            AgentEvent::MessageChunk {
+                text: String::new(),
+            },
+            AgentEvent::Usage {
+                usage: TokenUsage::default(),
+                raw: None,
+            },
+            AgentEvent::Raw {
+                raw: serde_json::json!({
+                    "type": "result",
+                    "result": "",
+                    "usage": {"inputTokens": 0, "outputTokens": 0}
+                }),
+            },
+        ] {
+            EventRelay::forward(&evidence, &events, &probe, event);
+        }
+        assert!(!evidence.output.load(Ordering::Acquire));
+        assert!(!evidence.billable.load(Ordering::Acquire));
+        EventRelay::forward(
+            &evidence,
+            &events,
+            &probe,
+            AgentEvent::Raw {
+                raw: serde_json::json!({"type": "progress", "message": "working"}),
+            },
+        );
+        assert!(evidence.output.load(Ordering::Acquire));
+        assert!(!evidence.billable.load(Ordering::Acquire));
+    }
+
+    /// A raw record that is genuine progress but carries a billable
+    /// usage document marks both flags; a nonzero usage record alone
+    /// still counts as paid output.
+    #[test]
+    fn unprobed_lane_relay_counts_billable_usage_record() {
+        let probe = unprobed_probe();
+        let (events, _rx) = mpsc::unbounded_channel();
+        let evidence = armed();
+        EventRelay::forward(
+            &evidence,
+            &events,
+            &probe,
+            AgentEvent::Raw {
+                raw: serde_json::json!({
+                    "type": "result",
+                    "result": "",
+                    "usage": {"inputTokens": 3, "outputTokens": 7}
+                }),
+            },
+        );
+        assert!(evidence.output.load(Ordering::Acquire));
+        assert!(evidence.billable.load(Ordering::Acquire));
+    }
+
+    /// A spec builder for probe-only tests: the probe's setup-call list
+    /// is the open request's actual selection, so tests declare the
+    /// same `resuming` flag the driver would compute.
+    fn probe_for(rpc: a4aa::RpcLaneSpec, resuming: bool) -> Arc<DispatchProbe> {
+        DispatchProbe::new(
+            None,
+            &AgentSpec {
+                id: "rpc".to_owned(),
+                client_name: None,
+                lane: LaneSpec::Rpc(Box::new(rpc)),
+                command: a4aa::CommandSpec {
+                    program: "fixture".to_owned(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+                max_output_bytes: None,
+                seatbelted_permission: None,
+            },
+            resuming,
+        )
+    }
+
+    /// Scalar setup params carry an empty slot path: the inline-envelope
+    /// control-field filter applies only where the params merge into the
+    /// frame root — an object document — so a scalar `{model}` keeps its
+    /// root position instead of indexing past the empty path, and the
+    /// journal still reads the substituted `params` value as
+    /// model-carrying.
+    #[test]
+    fn scalar_setup_params_never_panics_under_inline_envelope() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                session_open: Some(a4aa::RpcCallSpec {
+                    method: "session/open".to_owned(),
+                    params: serde_json::json!("{model}"),
+                }),
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!("{prompt}"),
+                },
+                envelope: Some(a4aa::RpcEnvelopeSpec {
+                    method_field: "cmd".to_owned(),
+                    params_inline: true,
+                    response_method: Some("response".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            false,
+        );
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"cmd":"session/open","id":1,"params":"prime"}"#,
+        );
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"cmd":"response","id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_setup_binds_model());
+    }
+
+    /// Two setup calls sharing one wire method attach to the call the
+    /// adapter's own issue order selected — `initialize` first, then the
+    /// session call — and an outbound callback reply that echoes the
+    /// answered command is a response, never a setup request, so it
+    /// claims no journal slot. A fixed-model handshake's refusal stays
+    /// model-free while the model-bearing open's refusal binds.
+    #[test]
+    fn shared_method_journal_attaches_each_request_to_its_call() {
+        let probe = probe_for(
+            a4aa::RpcLaneSpec {
+                initialize: Some(a4aa::RpcCallSpec {
+                    method: "negotiate".to_owned(),
+                    params: serde_json::json!({"model": "handshake"}),
+                }),
+                session_open: Some(a4aa::RpcCallSpec {
+                    method: "negotiate".to_owned(),
+                    params: serde_json::json!({"model": "{model}"}),
+                }),
+                prompt: a4aa::RpcCallSpec {
+                    method: "session/prompt".to_owned(),
+                    params: serde_json::json!({"text": "{prompt}"}),
+                },
+                envelope: Some(a4aa::RpcEnvelopeSpec {
+                    method_field: "cmd".to_owned(),
+                    discriminant_field: Some("type".to_owned()),
+                    request_marker: Some("request".to_owned()),
+                    response_method: Some("response".to_owned()),
+                    command_field: Some("cmd".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            false,
+        );
+        // The host's reply to a peer `negotiate` callback echoes the
+        // command — under the method-name reading it is the same frame
+        // shape as a setup request.
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"type":"response","cmd":"negotiate","id":"cb-1","error":{"code":-32601}}"#,
+        );
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"type":"request","cmd":"negotiate","id":1,"params":{"model":"handshake"}}"#,
+        );
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"type":"request","cmd":"negotiate","id":2,"params":{"model":"prime"}}"#,
+        );
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"type":"response","id":1,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(!probe.refused_setup_binds_model());
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"type":"response","id":2,"error":{"code":-32000,"message":"quota"}}"#,
+        );
+        assert!(probe.refused_setup_binds_model());
+    }
+
+    /// Usage that exists only inside the prompt's synchronous response
+    /// still reaches the served check: the reply is turn evidence by
+    /// request-id correlation, and a nonzero usage record in its result
+    /// payload proves the paid turn ran — while an all-zero record does
+    /// not.
+    #[test]
+    fn prompt_response_usage_reads_as_wire_billable() {
+        let probe = probed_probe();
+        probe.reset("work");
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/prompt","id":7,"params":{"text":"work"}}"#,
+        );
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":7,"result":{"text":"","status":"error","usage":{"inputTokens":3,"outputTokens":7}}}"#,
+        );
+        assert!(probe.wire_event());
+        assert!(probe.wire_billable());
+
+        probe.reset("work");
+        probe.record(
+            "rpc",
+            Direction::Sent,
+            br#"{"method":"session/prompt","id":9,"params":{"text":"work"}}"#,
+        );
+        probe.record(
+            "rpc",
+            Direction::Received,
+            br#"{"id":9,"result":{"text":"","status":"error","usage":{"inputTokens":0,"outputTokens":0}}}"#,
+        );
+        assert!(!probe.wire_billable());
     }
 }

@@ -3571,11 +3571,23 @@ async fn rpc_lane_switch_keeps_the_carried_model_pending() {
     let error = session.prompt("work".to_owned()).await.unwrap_err();
     assert_eq!(error.code, "agent_quota_exhausted");
     assert_eq!(session.active_model().as_deref(), Some("prime"));
+
+    // The refused candidate never became the adapter's persistent
+    // default: the next implicit prompt rides the last accepted model —
+    // `prime` — not the refused `fallback` the session would otherwise
+    // have retained.
+    let error = session.prompt("again".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
     let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
     assert_eq!(
         calls_log.lines().collect::<Vec<_>>(),
-        vec!["session/open|unset", "session/prompt|fallback"],
-        "the replay carried the pending candidate, which was refused: {calls_log}"
+        vec![
+            "session/open|unset",
+            "session/prompt|fallback",
+            "session/prompt|prime",
+        ],
+        "the refused candidate must not remain the session's default: {calls_log}"
     );
     session.close().await.unwrap();
 }
@@ -3689,5 +3701,370 @@ async fn cancel_during_stalled_replacement_open_ends_the_turn() {
         .unwrap()
         .unwrap();
     assert_eq!(outcome.stop_reason, "cancelled");
+    let _ = session.close().await;
+}
+
+/// An enveloped rpc peer: frames carry `cmd` instead of `method`, and
+/// the child exits upon receiving `session/prompt` — the prompt frame
+/// was delivered, then the transport died.
+#[cfg(unix)]
+const RPC_ENVELOPE_DIES_ON_PROMPT: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("cmd")
+    request_id = request.get("id")
+    if method == "session/prompt":
+        sys.stdout.flush()
+        os._exit(1)
+    if method == "session/open":
+        send({"cmd": "response", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif request_id is not None:
+        send({"cmd": "response", "id": request_id, "result": None})
+"#;
+
+/// Build a non-stock-envelope rpc lane on `script`.
+#[cfg(unix)]
+fn rpc_envelope_spec(
+    id: &str,
+    script: &Path,
+    prompt_params: serde_json::Value,
+    envelope: a4aa::RpcEnvelopeSpec,
+) -> AgentSpec {
+    let mut spec = rpc_spec(id, script, json!({}), prompt_params);
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.envelope = Some(envelope);
+    spec
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_inline_envelope_post_dispatch_loss_never_replays() {
+    // An inline envelope merges the call's object params into the frame
+    // root — no `params` member at all. The prompt frame left, then the
+    // peer died: the wire journal must read dispatch from the outbound
+    // encoder's layout or the turn replays on the alternate — a
+    // duplicated, possibly billed, turn.
+    let dir = TestDirectory::new("rpc-inline-loss");
+    let script = dir.path().join("rpc_inline.py");
+    std::fs::write(&script, RPC_ENVELOPE_DIES_ON_PROMPT).unwrap();
+    let envelope = a4aa::RpcEnvelopeSpec {
+        method_field: "cmd".to_owned(),
+        params_inline: true,
+        response_method: Some("response".to_owned()),
+        ..Default::default()
+    };
+    let registry = registry_with_lanes(
+        rpc_envelope_spec("inline", &script, json!({"text": "{prompt}"}), envelope),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("inline".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_transport_failed");
+    let _ = session.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_nested_envelope_post_dispatch_loss_never_replays() {
+    // The same transport loss after delivery under a nested envelope:
+    // `data` is declared for inbound payloads, yet outbound parameters
+    // still sit under `params` — reading the prompt frame through the
+    // inbound field hides the dispatch and replays a billed turn.
+    let dir = TestDirectory::new("rpc-nested-loss");
+    let script = dir.path().join("rpc_nested.py");
+    std::fs::write(&script, RPC_ENVELOPE_DIES_ON_PROMPT).unwrap();
+    let envelope = a4aa::RpcEnvelopeSpec {
+        method_field: "cmd".to_owned(),
+        params_inline: false,
+        response_method: Some("response".to_owned()),
+        data_field: Some("data".to_owned()),
+        ..Default::default()
+    };
+    let registry = registry_with_lanes(
+        rpc_envelope_spec("nested", &script, json!({"text": "{prompt}"}), envelope),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("nested".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_transport_failed");
+    let _ = session.close().await;
+}
+
+/// An rpc peer with no model selector at all: it logs the model member
+/// each call carried — proving the replay omitted the pending
+/// candidate — and serves prompts without one.
+#[cfg(unix)]
+const RPC_SELECTORLESS_LOG: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("session/open|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("session/prompt|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "alt|{}".format(params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_lane_switch_to_selectorless_lane_keeps_the_prior_model() {
+    // The retry scheduled `fallback` on the primary's per-turn surface,
+    // then the prompt's write failed. The alternate has no model
+    // selector: the replay omits the candidate on the wire, so the
+    // served turn is no evidence the lane took it — `active_model` must
+    // stay `prime` instead of publishing a model the lane cannot apply.
+    let dir = TestDirectory::new("rpc-selectorless-switch");
+    let script = dir.path().join("rpc_quota_close.py");
+    std::fs::write(&script, RPC_QUOTA_THEN_CLOSES_STDIN).unwrap();
+    let primary = rpc_spec(
+        "unaccepted",
+        &script,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    let serving = dir.path().join("rpc_plain.py");
+    std::fs::write(&serving, RPC_SELECTORLESS_LOG).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut alternate = rpc_spec(
+        "selectorless",
+        &serving,
+        json!({}),
+        json!({"text": "{prompt}"}),
+    );
+    alternate.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [(
+            "AWP_CALL_LOG".to_owned(),
+            EnvValue::Literal(log.display().to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("unaccepted".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open|unset", "session/prompt|unset"],
+        "the pending candidate never reached the wire: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that refuses prompts and stalls its `session/close`
+/// shutdown call forever.
+#[cfg(unix)]
+const RPC_BOOM_STALLED_CLOSE: &str = r#"
+import json, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message": "permanent boom"}})
+    elif method == "session/close":
+        time.sleep(600)
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stalled_lane_retirement_blocks_neither_turn_nor_close() {
+    // The old lane's shutdown call never answers: retiring it under the
+    // session lock would block both the replay and any later close.
+    // Retirement is interruptible — the turn serves on the replacement
+    // and close proceeds while the stalled shutdown drains alone.
+    let dir = TestDirectory::new("rpc-retire-stall");
+    let boom = dir.path().join("rpc_boom.py");
+    std::fs::write(&boom, RPC_BOOM_STALLED_CLOSE).unwrap();
+    let mut primary = rpc_spec("boom", &boom, json!({}), json!({"text": "{prompt}"}));
+    let LaneSpec::Rpc(lane) = &mut primary.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.session_close = Some(RpcCallSpec {
+        method: "session/close".to_owned(),
+        params: json!({}),
+    });
+    let serving = write_rpc_agent(dir.path());
+    let registry = registry_with_lanes(
+        primary,
+        rpc_spec("serving", &serving, json!({}), json!({"text": "{prompt}"})),
+        ProfilePatch {
+            agent: Some("boom".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        session.prompt("work".to_owned()),
+    )
+    .await
+    .expect("the turn waited on the old lane's stalled shutdown")
+    .unwrap();
+    assert_eq!(outcome.text.trim_end(), "unset|unset|work");
+    tokio::time::timeout(std::time::Duration::from_secs(10), session.close())
+        .await
+        .expect("close waited on the old lane's stalled shutdown")
+        .unwrap();
+}
+
+/// A `BeforeTurn` hook that parks until released — modelling a
+/// reservation that stays in flight while the caller cancels.
+#[cfg(unix)]
+struct PausingHook {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl awp::BeforeTurn for PausingHook {
+    async fn run(&self) -> awp::Result<()> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_during_blocked_reservation_never_dispatches() {
+    // `cancel` lands while the reservation hook is parked: the lane is
+    // idle, so cancel returns having marked nothing — and when the hook
+    // then succeeds the prompt must still not dispatch.
+    let dir = TestDirectory::new("rpc-cancel-admission");
+    let script = dir.path().join("rpc_log.py");
+    std::fs::write(&script, RPC_LOG_METHODS).unwrap();
+    let log = dir.path().join("calls.log");
+    let registry = registry_with(
+        rpc_logging_spec("admission", &script, &log),
+        ProfilePatch {
+            agent: Some("admission".to_owned()),
+            ..Default::default()
+        },
+    );
+    let hook = std::sync::Arc::new(PausingHook {
+        entered: std::sync::Arc::new(tokio::sync::Notify::new()),
+        release: std::sync::Arc::new(tokio::sync::Notify::new()),
+    });
+    let agent = registry.resolve("p").unwrap().before_turn(hook.clone());
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("work".to_owned()).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), hook.entered.notified())
+        .await
+        .expect("the reservation hook never ran");
+    session.cancel().await.unwrap();
+    hook.release.notify_one();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+        .await
+        .expect("the turn outlived cancel during admission")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.stop_reason, "cancelled");
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls_log.lines().any(|method| method == "session/prompt"),
+        "the prompt dispatched after cancel returned: {calls_log}"
+    );
     let _ = session.close().await;
 }

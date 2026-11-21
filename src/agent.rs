@@ -520,6 +520,11 @@ fn uncertain_turn(error: &a4aa::AdapterError) -> bool {
 struct TurnReservation {
     /// `None` until the hook first runs this turn.
     outcome: std::sync::Mutex<Option<a4aa::Result<()>>>,
+    /// The session's cancellation counter and the mark this turn was
+    /// submitted under: a reservation that resolves after cancel moved
+    /// past the mark must still refuse the prompt — the lane was idle
+    /// when cancel ran, so its own cancel path never saw the turn.
+    cancellation: Option<(Arc<AtomicU64>, u64)>,
 }
 
 impl TurnReservation {
@@ -530,6 +535,13 @@ impl TurnReservation {
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
             .is_some_and(|result| result.is_err())
+    }
+
+    /// Whether the session's cancellation moved past this turn's mark.
+    fn cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|(counter, mark)| counter.load(Ordering::Acquire) != *mark)
     }
 }
 
@@ -557,15 +569,35 @@ impl BeforeTurn for ReservationProbe {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        if let Some(outcome) = turn.as_ref().and_then(|turn| {
-            turn.outcome
+        if let Some(turn) = &turn {
+            // Admission itself carries cancellation: a verdict already
+            // recorded this turn cannot dispatch a prompt the caller
+            // cancelled while the lane sat idle.
+            if turn.cancelled() {
+                return Err(a4aa::AdapterError::permanent(
+                    "agent_turn_cancelled",
+                    "session/prompt",
+                ));
+            }
+            if let Some(outcome) = turn
+                .outcome
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .clone()
-        }) {
-            return outcome;
+            {
+                return outcome;
+            }
         }
         let outcome = self.hook.run().await;
+        // Cancellation that landed while the hook was in flight still
+        // refuses the prompt: the lane would dispatch it the moment the
+        // reservation returned.
+        if turn.as_ref().is_some_and(|turn| turn.cancelled()) {
+            return Err(a4aa::AdapterError::permanent(
+                "agent_turn_cancelled",
+                "session/prompt",
+            ));
+        }
         if let Some(turn) = turn {
             *turn
                 .outcome
@@ -668,14 +700,19 @@ impl EventRelay {
     }
 
     /// Relay one event to the caller; count it as the armed attempt's
-    /// evidence only inside the attempt window.
+    /// evidence only inside the attempt window — and only once the
+    /// attempt's prompt actually dispatched, the same attribution the
+    /// wire journal applies: traffic a lane emits at session open can
+    /// still be in flight when the window opens and is never the turn's
+    /// output. Lanes without an observable dispatch point report
+    /// `dispatched` unconditionally.
     fn forward(
         evidence: &RelayEvidence,
         events: &mpsc::UnboundedSender<AgentEvent>,
         probe: &DispatchProbe,
         event: AgentEvent,
     ) {
-        if evidence.armed.load(Ordering::Acquire) {
+        if evidence.armed.load(Ordering::Acquire) && probe.dispatched() {
             evidence.output.store(true, Ordering::Release);
             if turn_output(&event, probe) {
                 evidence.billable.store(true, Ordering::Release);
@@ -746,8 +783,14 @@ struct DispatchProbe {
     discriminant_field: Option<String>,
     /// A declared notification payload field — the envelope's
     /// `data_field`. When declared but absent on a frame, the frame
-    /// itself is the payload document (flat envelopes).
+    /// itself is the payload document (flat envelopes). Inbound only:
+    /// it never locates an outbound call's parameters.
     data_field: Option<String>,
+    /// Whether the prompt call's parameters merge into the outbound
+    /// frame's top level: the lane's encoder inlines an *object* params
+    /// document under an inline envelope (`params_inline`) and puts
+    /// every other shape under `params` — nested envelopes included.
+    prompt_at_root: bool,
     /// The lane's stream-text notification method (`text_event_method`)
     /// and the dotted path to its payload (`text_path`), mirroring how
     /// the lane normalizes stream text.
@@ -810,6 +853,7 @@ impl DispatchProbe {
             usage_path: None,
             prompt_carries_text: false,
             prompt_slots: Vec::new(),
+            prompt_at_root: false,
             expected_prompts: std::sync::Mutex::new(Vec::new()),
             dispatched: AtomicBool::new(false),
             last_sent_was_prompt: AtomicBool::new(false),
@@ -832,6 +876,11 @@ impl DispatchProbe {
             probe.usage_path = rpc.usage_path.clone();
             probe.prompt_slots = prompt_slots(&rpc.prompt.params);
             probe.prompt_carries_text = !probe.prompt_slots.is_empty();
+            probe.prompt_at_root = rpc
+                .envelope
+                .as_ref()
+                .is_some_and(|envelope| envelope.params_inline)
+                && rpc.prompt.params.is_object();
         }
         Arc::new(probe)
     }
@@ -886,31 +935,34 @@ impl DispatchProbe {
     }
 
     /// Whether the frame's params carry this attempt's prompt text at
-    /// every verifiable template position. The params sit at the
-    /// envelope's declared `data_field` when one is configured — the
-    /// frame itself when it is declared but absent (flat envelopes) —
-    /// and at `params` otherwise, the same normalization the lane's
-    /// notification decoding applies.
+    /// every verifiable template position. Outbound parameter placement
+    /// mirrors the lane's own encoder: an inline envelope merges an
+    /// object params document into the frame root; every other shape —
+    /// a nested envelope or a non-object params value — sits under
+    /// `params`.
     fn carries_armed_prompt(&self, frame: &serde_json::Value) -> bool {
-        let params = match &self.data_field {
-            Some(field) => frame.get(field).unwrap_or(frame),
-            None => match frame.get("params") {
+        let params = if self.prompt_at_root {
+            frame
+        } else {
+            match frame.get("params") {
                 Some(params) => params,
                 None => return false,
-            },
+            }
         };
         let expected = self
             .expected_prompts
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        self.prompt_slots
-            .iter()
-            .zip(expected.iter())
-            .all(|((path, _), expected)| {
-                slot_at(params, path)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| value == expected)
-            })
+        self.prompt_slots.len() == expected.len()
+            && self
+                .prompt_slots
+                .iter()
+                .zip(expected.iter())
+                .all(|((path, _), expected)| {
+                    slot_at(params, path)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| value == expected)
+                })
     }
 
     /// In-turn output evidence attributed at wire receipt.
@@ -1583,8 +1635,13 @@ impl VirtualSession {
             // hides its earlier records.
             // One logical turn, one reservation cell: the `before_turn`
             // hook runs at most once for the whole turn, however many lane
-            // or model attempts the turn makes.
-            let turn_reservation = Arc::new(TurnReservation::default());
+            // or model attempts the turn makes. The cell also carries the
+            // turn's cancellation mark so admission itself can refuse a
+            // prompt the caller cancelled while the lane sat idle.
+            let turn_reservation = Arc::new(TurnReservation {
+                outcome: std::sync::Mutex::new(None),
+                cancellation: Some((cancellation.clone(), cancel_mark)),
+            });
             {
                 let lane = lane.lock().await;
                 *lane
@@ -1688,6 +1745,14 @@ impl VirtualSession {
                         let guard = session.read().await;
                         guard.prompt(request.clone()).await
                     };
+                    // A cancel that landed while this attempt sat in
+                    // admission or was in flight ends the turn: the lane
+                    // may have been idle when cancel ran, so its own
+                    // cancel path saw nothing — the driver carries the
+                    // cancelled verdict itself.
+                    if cancellation.load(Ordering::Acquire) != cancel_mark {
+                        break 'lanes Ok(cancelled_outcome());
+                    }
                     // The lane may still hold this attempt's tail events:
                     // settle the queue so the chain and fallback decisions
                     // read complete evidence rather than whatever happened
@@ -1893,16 +1958,14 @@ impl VirtualSession {
                     // (the provider already refused the entry before it),
                     // and any other reopen carries the last accepted
                     // chain entry forward.
-                    let head = pending_bind
-                        .clone()
-                        .or_else(|| driver_model.clone())
-                        .or_else(|| {
-                            model_state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .active
-                                .clone()
-                        });
+                    let pending_candidate = pending_bind.clone().or_else(|| driver_model.clone());
+                    let head = pending_candidate.clone().or_else(|| {
+                        model_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .active
+                            .clone()
+                    });
                     // Re-project the caller's request against this lane:
                     // selectors the previous lane applied at establishment
                     // may belong on turns here, and vice versa. The model
@@ -1912,8 +1975,27 @@ impl VirtualSession {
                     // the same entry `head` carries.
                     let mut projection = lane.requested.clone();
                     projection.config.model = None;
-                    let (new_open, turn_model, turn_effort) =
+                    let (mut new_open, mut turn_model, turn_effort) =
                         lane_open(&spec, &projection, &profile, head.clone());
+                    // A pending candidate is a per-turn selector only on a
+                    // lane with a turn surface: it rides the replayed
+                    // request instead of the replacement session's
+                    // persistent default — a refusal must not leave the
+                    // refused model installed as the session's model,
+                    // ready to send again on the next implicit prompt.
+                    if let Some(candidate) = &pending_candidate {
+                        if new_open.config.model.as_deref() == Some(candidate.as_str())
+                            && spec.selector_support(SelectorPhase::Turn).model
+                                != SelectorSupport::Unsupported
+                        {
+                            new_open.config.model = model_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .active
+                                .clone();
+                            turn_model = Some(candidate.clone());
+                        }
+                    }
                     let (adapter, probe) = lane.adapter(candidate);
                     let (tap_tx, next_tap_rx) = mpsc::unbounded_channel();
                     // The replacement open is interruptible: register
@@ -1974,8 +2056,17 @@ impl VirtualSession {
                                     let _ = new_session.close().await;
                                     break 'lanes Ok(cancelled_outcome());
                                 }
-                                let _ = guard.close().await;
-                                *guard = new_session;
+                                // The lifecycle check stands immediately
+                                // before installation; the old lane then
+                                // retires outside the lock — its shutdown
+                                // call may stall, and holding the write
+                                // lock across it would block close and
+                                // cancel on the read side.
+                                let retiring = std::mem::replace(&mut *guard, new_session);
+                                drop(guard);
+                                tokio::spawn(async move {
+                                    let _ = retiring.close().await;
+                                });
                             }
                             lane.index = candidate;
                             lane.probe = probe.clone();
@@ -1987,14 +2078,21 @@ impl VirtualSession {
                             lane.relay = EventRelay::spawn(next_tap_rx, lane.events.clone(), probe);
                             match pending_bind.take().or_else(|| driver_model.clone()) {
                                 // A candidate the lane switch carried:
-                                // opening only stores it as the lane's
-                                // default — it stays pending until the
-                                // replay proves the lane took it, so a
-                                // refused selector can never publish as
-                                // the chain's active entry. The fresh
-                                // lane's per-turn surface carries it on
-                                // the replayed request.
-                                Some(carried_model) => {
+                                // it stays pending until the replay
+                                // proves the lane took it — bound in the
+                                // open request's session model or
+                                // deliverable on the lane's per-turn
+                                // surface, which carries it on the
+                                // replayed request. A lane with no model
+                                // selector never carries the candidate;
+                                // its replay proves nothing about it, so
+                                // it must not publish.
+                                Some(carried_model)
+                                    if lane.open.config.model.as_deref()
+                                        == Some(carried_model.as_str())
+                                        || spec.selector_support(SelectorPhase::Turn).model
+                                            != SelectorSupport::Unsupported =>
+                                {
                                     driver_model = Some(carried_model.clone());
                                     pending_model = Some(carried_model);
                                     carried = true;
@@ -2008,6 +2106,7 @@ impl VirtualSession {
                                         .unwrap_or_else(|error| error.into_inner())
                                         .active = accepted;
                                 }
+                                Some(_) => {}
                             }
                         }
                         Err(open_error) if model_failure(&open_error) => {

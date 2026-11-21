@@ -305,9 +305,14 @@ impl VirtualAgent {
             // A requested model the lane cannot express at establishment
             // advances the chain before the first turn is even attempted.
             let session = loop {
+                // Every open attempt gets its own event tap: the turn
+                // driver relays lane events to the caller's stream while a
+                // prompt runs and counts them as produced-output evidence
+                // for the fallback decision.
+                let (tap_tx, tap_rx) = mpsc::unbounded_channel();
                 let result = self
                     .adapter(spec)
-                    .open_session(lane_request.clone(), events.clone())
+                    .open_session(lane_request.clone(), tap_tx)
                     .await;
                 match result {
                     Err(error) if model_failure(&error) => {
@@ -324,10 +329,10 @@ impl VirtualAgent {
                         lane_error = Some(error);
                         break None;
                     }
-                    Ok(session) => break Some((session, lane_request)),
+                    Ok(session) => break Some((session, lane_request, tap_rx)),
                 }
             };
-            let Some((session, effective_request)) = session else {
+            let Some((session, effective_request, tap_rx)) = session else {
                 continue;
             };
             let active_model = effective_request
@@ -351,6 +356,7 @@ impl VirtualAgent {
                     requested: request.clone(),
                     open: effective_request,
                     events: events.clone(),
+                    tap_rx: Some(tap_rx),
                     secrets: self.secrets.clone(),
                     observer: self.observer.clone(),
                     permission: self.permission.clone(),
@@ -378,6 +384,10 @@ struct LaneState {
     /// The request the active lane opened with — replayed on the next lane.
     open: SessionRequest,
     events: mpsc::UnboundedSender<AgentEvent>,
+    /// The receiving end of the active lane's event tap. The turn driver
+    /// takes it while a prompt runs and returns it when the turn ends;
+    /// `None` only while a driver holds it.
+    tap_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     secrets: Arc<dyn SecretResolver>,
     observer: SharedObserver,
     permission: Option<Arc<dyn PermissionHandler>>,
@@ -677,12 +687,66 @@ impl VirtualSession {
             let _turn = turn;
             let mut request = request;
             let mut instructions_included = instructions_included;
+            // Lane events travel through the tap channel this driver owns:
+            // each one relays to the caller's stream as it arrives and also
+            // marks the turn as having produced output — evidence
+            // `TurnOutcome` alone can lose, since a structured stream may
+            // end on an empty result record that hides its earlier
+            // records.
+            let (events_out, mut tap_rx) = {
+                let mut lane = lane.lock().await;
+                (lane.events.clone(), lane.tap_rx.take())
+            };
+            // Anything queued outside a turn (session-open notifications)
+            // relays to the caller but is not this turn's output.
+            if let Some(rx) = &mut tap_rx {
+                while let Ok(event) = rx.try_recv() {
+                    let _ = events_out.send(event);
+                }
+            }
+            let mut emitted_output = false;
             let outcome = 'lanes: loop {
                 // The model loop on the current lane: provider-side model
                 // failures advance the chain and resubmit on the same
                 // session.
                 let outcome = loop {
-                    let outcome = session.read().await.prompt(request.clone()).await;
+                    let outcome = {
+                        let guard = session.read().await;
+                        let prompt = guard.prompt(request.clone());
+                        tokio::pin!(prompt);
+                        // Drive the prompt while relaying lane events.
+                        // The lane sends every event before the outcome
+                        // resolves, so draining the queued tail here keeps
+                        // both delivery and the emitted-output evidence
+                        // complete before the fallback decision reads it.
+                        loop {
+                            let next_event = async {
+                                match &mut tap_rx {
+                                    Some(rx) => rx.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            };
+                            tokio::select! {
+                                biased;
+                                outcome = &mut prompt => {
+                                    if let Some(rx) = &mut tap_rx {
+                                        while let Ok(event) = rx.try_recv() {
+                                            emitted_output = true;
+                                            let _ = events_out.send(event);
+                                        }
+                                    }
+                                    break outcome;
+                                }
+                                event = next_event => match event {
+                                    Some(event) => {
+                                        emitted_output = true;
+                                        let _ = events_out.send(event);
+                                    }
+                                    None => tap_rx = None,
+                                },
+                            }
+                        }
+                    };
                     let next = match &outcome {
                         // The prompt may already have produced billed output.
                         // Advancing the model and resubmitting would duplicate
@@ -726,12 +790,14 @@ impl VirtualSession {
                     // `stop_reason: "error"` — could not serve this turn
                     // only when it also produced no output and reported no
                     // usage. Output — even when the retained cap dropped
-                    // the text entirely — or usage proves the paid turn ran.
+                    // the text entirely or an empty result record hid an
+                    // earlier stream — or usage proves the paid turn ran.
                     Ok(result) => {
                         result.stop_reason == "error"
                             && result.text.trim().is_empty()
                             && !result.truncated
                             && result.usage.is_none()
+                            && !emitted_output
                     }
                 };
                 if !lane_failed {
@@ -757,7 +823,8 @@ impl VirtualSession {
                     let (new_open, turn_model, turn_effort) =
                         lane_open(&spec, &lane.requested, &profile, active);
                     let adapter = lane.adapter(lane.index);
-                    let reopen = adapter.open_session(new_open.clone(), lane.events.clone());
+                    let (tap_tx, next_tap_rx) = mpsc::unbounded_channel();
+                    let reopen = adapter.open_session(new_open.clone(), tap_tx);
                     {
                         let mut guard = session.write().await;
                         let _ = guard.close().await;
@@ -765,6 +832,16 @@ impl VirtualSession {
                             Ok(new_session) => {
                                 *guard = new_session;
                                 lane.open = new_open;
+                                // The dead lane may still hold queued
+                                // events — deliver them before listening
+                                // on the reopened lane's tap.
+                                if let Some(rx) = &mut tap_rx {
+                                    while let Ok(event) = rx.try_recv() {
+                                        emitted_output = true;
+                                        let _ = events_out.send(event);
+                                    }
+                                }
+                                tap_rx = Some(next_tap_rx);
                             }
                             Err(open_error) if model_failure(&open_error) => {
                                 break 'lanes Err(open_error);
@@ -792,6 +869,9 @@ impl VirtualSession {
                     continue 'lanes;
                 }
             };
+            // Return the active lane's tap so the next turn's driver can
+            // keep relaying this session's events.
+            lane.lock().await.tap_rx = tap_rx;
             // Preserve profile state and ordering even when only the caller's
             // waiter is dropped. A cancelled first attempt remains pending.
             if record_instructions

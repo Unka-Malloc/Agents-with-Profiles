@@ -669,6 +669,15 @@ fn toml_file_secret_never_resolves_inside_a_string() {
         None
     );
 
+    // An array-of-tables header declares list items, not the table the
+    // dotted path names — the path must not resolve into an element.
+    let aot_path = dir.join("array.toml");
+    std::fs::write(&aot_path, "[[credentials]]\ntoken = \"masquerade\"\n").unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Toml, &aot_path, "credentials.token").resolve(),
+        None
+    );
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -699,6 +708,17 @@ fn yaml_file_secret_resolves_flow_and_plain_scalar_forms() {
             .resolve()
             .as_deref(),
         Some("user's key")
+    );
+
+    // A block scalar resolves to its contents, not its `|`/`>` header.
+    let block_path = dir.join("block.yaml");
+    std::fs::write(&block_path, "credentials:\n  token: |\n    block-value\n").unwrap();
+    assert_eq!(
+        file_recipe(FixtureFormat::Yaml, &block_path, "credentials.token")
+            .resolve()
+            .as_deref()
+            .map(str::trim),
+        Some("block-value")
     );
 
     let _ = std::fs::remove_dir_all(dir);

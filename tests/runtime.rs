@@ -899,6 +899,71 @@ async fn cli_truncated_error_outcome_does_not_replay_on_alternate_lane() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cli_ndjson_progress_with_empty_result_does_not_replay_on_alternate_lane() {
+    // A json_lines lane delivers every record as an event; an empty
+    // `result` record then presents an outcome with no text and no usage.
+    // The emitted stream is still proof the paid turn ran — the alternate
+    // lane must not replay the prompt.
+    let mut primary = cli_spec(
+        "paid",
+        "sh",
+        &[
+            "-c",
+            "exec 0<&-; \
+             echo '{\"type\":\"progress\",\"message\":\"working\"}'; \
+             echo '{\"type\":\"result\",\"result\":\"\"}'; \
+             exit 1",
+        ],
+        PromptChannel::Stdin,
+    );
+    let LaneSpec::Cli(lane) = &mut primary.lane else {
+        panic!("cli_spec builds a cli lane")
+    };
+    lane.json_lines = true;
+    lane.result_selector = Some("result".to_owned());
+    lane.result_path = Some("result".to_owned());
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("paid".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, mut rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert!(
+        outcome.text.trim().is_empty(),
+        "the empty result record hides the stream: {outcome:?}"
+    );
+    let mut forwarded = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        forwarded.push(event);
+    }
+    assert!(
+        forwarded
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Raw { .. })),
+        "the lane's emitted records reached the caller: {forwarded:?}"
+    );
+    assert!(
+        !forwarded.iter().any(
+            |event| matches!(event, AgentEvent::MessageChunk { text } if text.contains("alt|"))
+        ),
+        "alternate did not replay"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn uncertain_prompt_failure_does_not_replay_on_alternate_lane() {
     // The primary prints a chunk and then reports a usage limit. The
     // refusal is uncertain-effect: replaying it on the alternate would

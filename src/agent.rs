@@ -12,7 +12,7 @@
 //! [`InstructionMode`], and model/effort defaults use the session or turn
 //! selector phase the A4AA lane actually supports.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use a4aa::{
@@ -380,6 +380,8 @@ impl VirtualAgent {
                 stateless_lane: Arc::new(AtomicBool::new(matches!(spec.lane, LaneSpec::Cli(_)))),
                 instructions_sent: Arc::new(AtomicBool::new(false)),
                 turn_lock: Arc::new(Mutex::new(())),
+                closing: Arc::new(AtomicBool::new(false)),
+                cancellation: Arc::new(AtomicU64::new(0)),
             });
         }
         Err(lane_error
@@ -754,6 +756,16 @@ struct DispatchProbe {
     /// conventional `params.usage` / `params.message.usage` carriers are
     /// read instead — the same precedence the lane's own ingest applies.
     usage_path: Option<String>,
+    /// Whether the lane's prompt params template declares `{prompt}` —
+    /// the prompt call is then the same-method frame that carries this
+    /// attempt's own text. A configured pre-turn call can share the
+    /// prompt method; its frame must not read as dispatched. When the
+    /// template carries no text placeholder the method name is all the
+    /// wire offers and a matching request counts conservatively.
+    prompt_carries_text: bool,
+    /// This attempt's prompt text — armed at `reset` so the probe can
+    /// recognize the prompt call's own frame among same-method requests.
+    armed_prompt: std::sync::Mutex<String>,
     /// Set once this attempt's prompt frame was observed on the wire. The
     /// turn driver resets it per attempt — a stale flag from an earlier
     /// turn or lane would misreport a pre-dispatch failure as dispatched.
@@ -786,6 +798,8 @@ impl DispatchProbe {
             text_event_method: None,
             text_path: None,
             usage_path: None,
+            prompt_carries_text: false,
+            armed_prompt: std::sync::Mutex::new(String::new()),
             dispatched: AtomicBool::new(false),
             last_sent_was_prompt: AtomicBool::new(false),
             turn_event: AtomicBool::new(false),
@@ -805,6 +819,7 @@ impl DispatchProbe {
             probe.text_event_method = rpc.text_event_method.clone();
             probe.text_path = rpc.text_path.clone();
             probe.usage_path = rpc.usage_path.clone();
+            probe.prompt_carries_text = template_carries_prompt(&rpc.prompt.params);
         }
         Arc::new(probe)
     }
@@ -823,6 +838,28 @@ impl DispatchProbe {
         self.last_sent_was_prompt.load(Ordering::Acquire)
     }
 
+    /// Whether a same-method request frame is this attempt's prompt call
+    /// rather than a configured pre-turn call sharing the method. The
+    /// lane builds the prompt frame from the prompt params template:
+    /// when that template declares `{prompt}` the frame carries this
+    /// attempt's own text, which a pre-turn call does not have. When the
+    /// template has no text placeholder the wire cannot tell the calls
+    /// apart and the request counts conservatively.
+    fn is_prompt_frame(&self, frame: &serde_json::Value) -> bool {
+        frame.get("id").is_some()
+            && frame
+                .get(self.method_field.as_str())
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|method| Some(method) == self.method.as_deref())
+            && (!self.prompt_carries_text || {
+                let armed = self
+                    .armed_prompt
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                armed.is_empty() || frame_has_text(frame, &armed)
+            })
+    }
+
     /// In-turn output evidence attributed at wire receipt.
     fn wire_event(&self) -> bool {
         self.turn_event.load(Ordering::Acquire)
@@ -833,7 +870,14 @@ impl DispatchProbe {
         self.turn_billable.load(Ordering::Acquire)
     }
 
-    fn reset(&self) {
+    /// Open the next physical attempt's journal: stale dispatch and
+    /// event records never carry into it, and the attempt's prompt text
+    /// arms the prompt-call matching above.
+    fn reset(&self, prompt: &str) {
+        *self
+            .armed_prompt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = prompt.to_owned();
         self.dispatched.store(false, Ordering::Release);
         self.last_sent_was_prompt.store(false, Ordering::Release);
         self.turn_event.store(false, Ordering::Release);
@@ -882,6 +926,30 @@ impl DispatchProbe {
             .or_else(|| params.get("usage"))
             .or_else(|| extract_path(params, "message.usage"))
             .is_some_and(normalized_billable)
+    }
+}
+
+/// Whether a params template carries the `{prompt}` placeholder — the
+/// substituted prompt text then identifies the prompt call's own frame.
+fn template_carries_prompt(template: &serde_json::Value) -> bool {
+    match template {
+        serde_json::Value::String(text) => text.contains("{prompt}"),
+        serde_json::Value::Array(items) => items.iter().any(template_carries_prompt),
+        serde_json::Value::Object(map) => map.values().any(template_carries_prompt),
+        _ => false,
+    }
+}
+
+/// Whether any string leaf in a wire frame contains `text` — the
+/// substituted `{prompt}` value lands somewhere under the frame's params
+/// (or inline under an envelope), so a whole-frame walk finds it
+/// regardless of the envelope's payload layout.
+fn frame_has_text(value: &serde_json::Value, text: &str) -> bool {
+    match value {
+        serde_json::Value::String(leaf) => leaf.contains(text),
+        serde_json::Value::Array(items) => items.iter().any(|item| frame_has_text(item, text)),
+        serde_json::Value::Object(map) => map.values().any(|item| frame_has_text(item, text)),
+        _ => false,
     }
 }
 
@@ -994,13 +1062,7 @@ impl Observer for DispatchProbe {
             Direction::Sent => {
                 let prompt = serde_json::from_slice::<serde_json::Value>(bytes)
                     .ok()
-                    .and_then(|frame| {
-                        frame
-                            .get(self.method_field.as_str())
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    });
-                let prompt = prompt.as_deref() == self.method.as_deref();
+                    .is_some_and(|frame| self.is_prompt_frame(&frame));
                 self.last_sent_was_prompt.store(prompt, Ordering::Release);
                 if prompt {
                     self.dispatched.store(true, Ordering::Release);
@@ -1102,6 +1164,19 @@ fn dispatch_verdict(error: &a4aa::AdapterError, probe: &DispatchProbe) -> Dispat
         DispatchVerdict::PossiblyDispatched
     } else {
         DispatchVerdict::Unconfirmed
+    }
+}
+
+/// The turn's own report of an explicit cancellation that landed while
+/// the driver was between physical attempts — the same verdict a lane
+/// gives when its turn is cancelled before dispatch.
+fn cancelled_outcome() -> TurnOutcome {
+    TurnOutcome {
+        stop_reason: "cancelled".to_owned(),
+        text: String::new(),
+        truncated: false,
+        exit_code: None,
+        usage: None,
     }
 }
 
@@ -1252,6 +1327,15 @@ pub struct VirtualSession {
     // Composition and submission share one turn boundary. Concurrent callers
     // must observe the previous turn's confirmed instruction-delivery state.
     turn_lock: Arc<Mutex<()>>,
+    /// Set once `close` begins — before the lane's session is touched, so
+    /// a turn driver still opening a replacement session can never
+    /// install or prompt it after `close` returns.
+    closing: Arc<AtomicBool>,
+    /// Incremented on every `cancel` call. The turn driver snapshots the
+    /// value at turn submission and re-checks it before installing or
+    /// prompting a replacement, so a cancellation that lands while a
+    /// substitute session opens still stops the replay.
+    cancellation: Arc<AtomicU64>,
 }
 
 impl VirtualSession {
@@ -1342,6 +1426,12 @@ impl VirtualSession {
         let turn_effort_default = self.turn_effort_default.clone();
         let stateless = self.stateless_lane.clone();
         let profile = self.profile.clone();
+        let closing = self.closing.clone();
+        let cancellation = self.cancellation.clone();
+        // Cancellation applies to the turn in flight when `cancel` ran:
+        // the mark submitted with this turn, compared again before every
+        // replacement install or prompt below.
+        let cancel_mark = cancellation.load(Ordering::Acquire);
         tokio::spawn(async move {
             let _turn = turn;
             let mut request = request;
@@ -1459,11 +1549,24 @@ impl VirtualSession {
                 // failures advance the chain and resubmit on the same
                 // session.
                 let outcome = loop {
+                    // A close or cancel that landed while the driver was
+                    // arranging this attempt — including a fallback's
+                    // reopen — must stop the turn before anything else
+                    // dispatches.
+                    if closing.load(Ordering::Acquire) {
+                        break 'lanes Err(a4aa::AdapterError::permanent(
+                            "agent_session_closed",
+                            "session/prompt",
+                        ));
+                    }
+                    if cancellation.load(Ordering::Acquire) != cancel_mark {
+                        break 'lanes Ok(cancelled_outcome());
+                    }
                     // One iteration is one physical prompt attempt: reset
                     // the wire journal so an earlier attempt's dispatch
                     // record cannot read this attempt's pre-dispatch
                     // failure as dispatched.
-                    probe.reset();
+                    probe.reset(&request.text);
                     let outcome = {
                         let guard = session.read().await;
                         guard.prompt(request.clone()).await
@@ -1477,14 +1580,21 @@ impl VirtualSession {
                     // A scheduled candidate the lane carried without a
                     // model-level refusal is the accepted replacement:
                     // publish it as the session's default and the chain's
-                    // active entry. A refused candidate never publishes —
-                    // the prior default stays in effect.
+                    // active entry. Acceptance needs evidence the lane
+                    // took the selector onto the wire — a served turn or
+                    // the dispatched prompt frame. A refused candidate
+                    // never publishes, and neither does one whose attempt
+                    // died before dispatch: an error outside the model
+                    // classifier alone does not confirm the selector.
                     if let Some(accepted) = pending_model.take() {
-                        if outcome
-                            .as_ref()
-                            .err()
-                            .is_none_or(|error| !model_failure(error))
-                        {
+                        let confirmed = outcome.as_ref().is_ok_and(|result| {
+                            !matches!(result.stop_reason.as_str(), "cancelled" | "interrupted")
+                        }) || (probe.dispatched()
+                            && outcome
+                                .as_ref()
+                                .err()
+                                .is_none_or(|error| !model_failure(error)));
+                        if confirmed {
                             *turn_model_default
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner()) =
@@ -1642,40 +1752,50 @@ impl VirtualSession {
                 // session retry, the next declared variant otherwise — and
                 // replay the turn there; a reopen that fails keeps walking.
                 let mut retry_same_lane = session_retry;
+                // The search walks with a local index: the installed
+                // lane's position commits only when a replacement session
+                // actually opens — a candidate that fails to open never
+                // advances it, so the installed lane keeps its place for
+                // every later turn.
+                let mut candidate = lane.lock().await.index;
                 loop {
                     let mut lane = lane.lock().await;
                     let same_lane = retry_same_lane;
                     retry_same_lane = false;
                     if !same_lane {
-                        lane.index += 1;
+                        candidate += 1;
                     }
-                    let Some(spec) = lane.specs.get(lane.index).cloned() else {
+                    let Some(spec) = lane.specs.get(candidate).cloned() else {
                         break 'lanes outcome;
                     };
                     // The model this reopen binds: a session-bound retry
-                    // pursues the scheduled candidate; any other reopen
-                    // carries the last accepted chain entry forward.
-                    let head = pending_bind.clone().or_else(|| {
-                        model_state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .active
-                            .clone()
-                    });
+                    // pursues its scheduled candidate, a per-turn retry's
+                    // candidate is the chain position this turn committed
+                    // (the provider already refused the entry before it),
+                    // and any other reopen carries the last accepted
+                    // chain entry forward.
+                    let head = pending_bind
+                        .clone()
+                        .or_else(|| driver_model.clone())
+                        .or_else(|| {
+                            model_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .active
+                                .clone()
+                        });
                     // Re-project the caller's request against this lane:
                     // selectors the previous lane applied at establishment
-                    // may belong on turns here, and vice versa.
-                    let (mut new_open, turn_model, turn_effort) =
-                        lane_open(&spec, &lane.requested, &profile, head.clone());
-                    if same_lane {
-                        // The refused model was bound at establishment, so
-                        // the retry re-opens this lane with the scheduled
-                        // entry in the model slot — the selector phase
-                        // this lane actually supports.
-                        new_open.config.model = head.clone();
-                    }
-                    let index = lane.index;
-                    let (adapter, probe) = lane.adapter(index);
+                    // may belong on turns here, and vice versa. The model
+                    // slot is cleared first so the accepted chain entry —
+                    // not the caller's original value — is the one routed:
+                    // the caller's model either was refused already or is
+                    // the same entry `head` carries.
+                    let mut projection = lane.requested.clone();
+                    projection.config.model = None;
+                    let (new_open, turn_model, turn_effort) =
+                        lane_open(&spec, &projection, &profile, head.clone());
+                    let (adapter, probe) = lane.adapter(candidate);
                     let (tap_tx, next_tap_rx) = mpsc::unbounded_channel();
                     // The replacement session opens while the installed
                     // one stays in place: a refused open leaves the live
@@ -1684,11 +1804,30 @@ impl VirtualSession {
                     // replacement actually opens.
                     match adapter.open_session(new_open.clone(), tap_tx).await {
                         Ok(new_session) => {
+                            // The caller may have closed the session or
+                            // cancelled this turn while the replacement
+                            // was opening: never install it or let it
+                            // serve the replay.
+                            if closing.load(Ordering::Acquire) {
+                                let _ = new_session.close().await;
+                                break 'lanes outcome;
+                            }
+                            if cancellation.load(Ordering::Acquire) != cancel_mark {
+                                let _ = new_session.close().await;
+                                break 'lanes Ok(cancelled_outcome());
+                            }
+                            // The model the replacement actually carries —
+                            // session-bound in `config.model`, or the turn
+                            // default a per-turn lane applies — is the
+                            // chain's new active entry.
+                            let accepted =
+                                new_open.config.model.clone().or_else(|| turn_model.clone());
                             {
                                 let mut guard = session.write().await;
                                 let _ = guard.close().await;
                                 *guard = new_session;
                             }
+                            lane.index = candidate;
                             lane.probe = probe.clone();
                             lane.open = new_open;
                             // The dead lane's relay keeps draining its
@@ -1699,7 +1838,7 @@ impl VirtualSession {
                             model_state
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner())
-                                .active = head.clone();
+                                .active = accepted;
                             pending_bind = None;
                         }
                         Err(open_error) if model_failure(&open_error) => {
@@ -1769,13 +1908,20 @@ impl VirtualSession {
         })?
     }
 
-    /// Explicit user cancellation of the in-flight turn.
+    /// Explicit user cancellation of the in-flight turn. The mark moves
+    /// first: a turn driver between attempts — opening a fallback's
+    /// replacement session — sees the cancellation before it installs
+    /// or prompts anything, even while the current session sits idle.
     pub async fn cancel(&self) -> a4aa::Result<()> {
+        self.cancellation.fetch_add(1, Ordering::AcqRel);
         self.session.read().await.cancel().await
     }
 
-    /// Close the session and terminate the agent process tree.
+    /// Close the session and terminate the agent process tree. The flag
+    /// is raised first: a replacement session still opening in the turn
+    /// driver can never be installed or prompted after close returns.
     pub async fn close(&self) -> a4aa::Result<()> {
+        self.closing.store(true, Ordering::Release);
         self.session.read().await.close().await
     }
 }

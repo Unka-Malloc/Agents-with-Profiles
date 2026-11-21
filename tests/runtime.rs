@@ -2755,3 +2755,600 @@ async fn rpc_events_between_turns_reach_the_caller() {
     );
     session.close().await.unwrap();
 }
+
+/// An rpc peer whose pre-turn call shares the prompt method: the first
+/// `session/prompt` frame is the configuration call, not the prompt.
+/// `AWP_KILL_ON_TEXT=1` makes the peer die only when the frame carries
+/// the turn's own `text` — the real prompt call.
+#[cfg(unix)]
+const RPC_SHARED_PROMPT_METHOD: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+kill_on_text = os.environ.get("AWP_KILL_ON_TEXT", "") == "1"
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/prompt" and (not kill_on_text or params.get("text") is not None):
+        sys.stdout.flush()
+        os._exit(1)
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// One shared-method fixture: a pre-turn `session/prompt` call without a
+/// `text` field stands beside the real prompt call.
+#[cfg(unix)]
+fn rpc_shared_method_spec(id: &str, script: &Path, kill_on_text: bool) -> AgentSpec {
+    let mut spec = rpc_spec(id, script, json!({}), json!({"text": "{prompt}"}));
+    let LaneSpec::Rpc(lane) = &mut spec.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.pre_turn = vec![RpcCallSpec {
+        method: "session/prompt".to_owned(),
+        params: json!({"select": true}),
+    }];
+    spec.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [(
+            "AWP_KILL_ON_TEXT".to_owned(),
+            EnvValue::Literal(if kill_on_text { "1" } else { "0" }.to_owned()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    spec
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_shared_method_pre_turn_disconnect_falls_back() {
+    // The peer dies while the pre-turn call is in flight — the frame that
+    // left was the configuration call sharing the prompt's method, never
+    // the prompt itself. A method-name-only dispatch reading would block
+    // the safe failover: the alternate must serve the turn.
+    let dir = TestDirectory::new("rpc-shared-preturn");
+    let script = dir.path().join("rpc_shared.py");
+    std::fs::write(&script, RPC_SHARED_PROMPT_METHOD).unwrap();
+    let registry = registry_with_lanes(
+        rpc_shared_method_spec("shared", &script, false),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("shared".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_shared_method_prompt_dispatch_never_replays() {
+    // The same shared method now carries the real prompt: the pre-turn
+    // call answers, the frame holding the turn's text leaves, and the
+    // peer dies on it. The prompt provably dispatched — the uncertain
+    // failure must propagate instead of replaying on the alternate.
+    let dir = TestDirectory::new("rpc-shared-dispatch");
+    let script = dir.path().join("rpc_shared.py");
+    std::fs::write(&script, RPC_SHARED_PROMPT_METHOD).unwrap();
+    let registry = registry_with_lanes(
+        rpc_shared_method_spec("shared", &script, true),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("shared".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_transport_failed");
+    let _ = session.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_retry_disconnect_before_dispatch_keeps_the_prior_model() {
+    // `fallback` was scheduled on the turn surface, then the peer died
+    // during the retry's pre-turn call — the candidate's prompt never
+    // dispatched, and every alternate fails to open. The transport error
+    // is no acceptance evidence: `active_model` must stay `prime`.
+    let dir = TestDirectory::new("rpc-retry-unaccepted");
+    let script = dir.path().join("rpc_refuse_die.py");
+    std::fs::write(&script, RPC_REFUSE_THEN_DIE_ON_SECOND_SELECT).unwrap();
+    let mut primary = rpc_spec(
+        "unaccepted",
+        &script,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    let LaneSpec::Rpc(lane) = &mut primary.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.pre_turn = vec![RpcCallSpec {
+        method: "session/select".to_owned(),
+        params: json!({}),
+    }];
+    let dead = dir.path().join("rpc_noopen.py");
+    std::fs::write(&dead, RPC_DIES_ON_METHOD).unwrap();
+    let registry = registry_with_lanes(
+        primary,
+        rpc_kill_spec("noopen", &dead, "session/open"),
+        ProfilePatch {
+            agent: Some("unaccepted".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_transport_failed");
+    assert_eq!(session.active_model().as_deref(), Some("prime"));
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that binds its model at `session/open`: the first prompt
+/// it serves fails with a certain remote error — a lane failure the
+/// session survives — and later prompts refuse `prime` with quota while
+/// serving every other model.
+#[cfg(unix)]
+const RPC_BOOM_THEN_QUOTA_SESSION_MODEL: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_model = None
+prompts = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        session_model = params.get("model")
+        log.write("session/open|{}\n".format(session_model))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        prompts += 1
+        model = params.get("model") or session_model
+        log.write("session/prompt|{}\n".format(model))
+        log.flush()
+        if model == "prime" and prompts == 1:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message": "permanent boom"}})
+        elif model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_failed_alternate_open_keeps_the_installed_lane_index() {
+    // Turn one fails on the primary and every alternate fails to open:
+    // the installed session survives, so its lane index must stay put.
+    // Turn two's quota refusal then triggers the same-lane model retry —
+    // an index left pointing past the lane list would skip the reopen.
+    let dir = TestDirectory::new("rpc-lane-index");
+    let script = dir.path().join("rpc_boom_quota.py");
+    std::fs::write(&script, RPC_BOOM_THEN_QUOTA_SESSION_MODEL).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "surviving",
+        &script,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}"}),
+    );
+    primary.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [(
+            "AWP_CALL_LOG".to_owned(),
+            EnvValue::Literal(log.display().to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let dead = dir.path().join("rpc_noopen.py");
+    std::fs::write(&dead, RPC_DIES_ON_METHOD).unwrap();
+    let registry = registry_with_lanes(
+        primary,
+        rpc_kill_spec("noopen", &dead, "session/open"),
+        ProfilePatch {
+            agent: Some("surviving".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_remote_error");
+
+    // The installed primary session still serves: its quota refusal must
+    // reopen this same lane bound to `fallback`, not skip the retry.
+    let outcome = session.prompt("more".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|more");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open|prime",
+            "session/prompt|prime",
+            "session/prompt|prime",
+            "session/open|fallback",
+            "session/prompt|fallback",
+        ],
+        "the same-lane model retry re-opened the installed lane: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that binds its model at `session/open`, refuses `prime`
+/// with quota at the prompt, and then fails its next prompt with a
+/// certain remote error — the lane failure that sends the turn looking
+/// for an alternate.
+#[cfg(unix)]
+const RPC_QUOTA_SESSION_MODEL_THEN_BOOM: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_model = None
+prompts = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        session_model = params.get("model")
+        log.write("session/open|{}\n".format(session_model))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        prompts += 1
+        model = params.get("model") or session_model
+        log.write("session/prompt|{}\n".format(model))
+        log.flush()
+        if model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        elif prompts >= 2:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message": "permanent boom"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer that binds and serves whatever model its session opened
+/// with, logging both calls.
+#[cfg(unix)]
+const RPC_SESSION_MODEL_LOG: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_model = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        session_model = params.get("model")
+        log.write("session/open|{}\n".format(session_model))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model") or session_model
+        log.write("session/prompt|{}\n".format(model))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "alt|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// Build a session-bound rpc lane on `script` that logs calls to `log`.
+#[cfg(unix)]
+fn rpc_session_bound_spec(id: &str, script: &Path, log: &Path) -> AgentSpec {
+    let mut spec = rpc_spec(
+        id,
+        script,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}"}),
+    );
+    spec.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [(
+            "AWP_CALL_LOG".to_owned(),
+            EnvValue::Literal(log.display().to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    spec
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_lane_switch_projects_the_accepted_model_not_the_requested() {
+    // The caller opened with an explicit `prime`, the session-bound retry
+    // moved the chain to `fallback`, then the lane failed. The alternate
+    // must open bound to the accepted entry — replaying the caller's
+    // original model would have the replacement serve `prime` while the
+    // session reports `fallback` active.
+    let dir = TestDirectory::new("rpc-switch-model");
+    let script = dir.path().join("rpc_quota_boom.py");
+    std::fs::write(&script, RPC_QUOTA_SESSION_MODEL_THEN_BOOM).unwrap();
+    let primary_log = dir.path().join("primary.log");
+    let alt_script = dir.path().join("rpc_alt.py");
+    std::fs::write(&alt_script, RPC_SESSION_MODEL_LOG).unwrap();
+    let alternate_log = dir.path().join("alternate.log");
+    let registry = registry_with_lanes(
+        rpc_session_bound_spec("binds", &script, &primary_log),
+        rpc_session_bound_spec("alternate", &alt_script, &alternate_log),
+        ProfilePatch {
+            agent: Some("binds".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let mut request = SessionRequest::default();
+    request.config.model = Some("prime".to_owned());
+    let session = agent.open_session(request, tx).await.unwrap();
+
+    // `prime` is refused at the prompt; the retry re-opens this lane
+    // bound to `fallback`.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+
+    // The lane then fails mid-session: the alternate opens bound to the
+    // accepted `fallback`, not the caller's original `prime`.
+    let outcome = session.prompt("more".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|fallback|more");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&alternate_log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open|fallback", "session/prompt|fallback"],
+        "the alternate opened with the accepted chain model: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that fails every prompt with a certain remote error — a
+/// lane failure the session survives.
+#[cfg(unix)]
+const RPC_BOOM: &str = r#"
+import json, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message": "permanent boom"}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer that delays its `session/open` answer — long enough for a
+/// caller's close or cancel to land while the replacement opens — then
+/// serves prompts, logging every method it sees.
+#[cfg(unix)]
+const RPC_SLOW_OPEN: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    if method:
+        log.write(method + "\n")
+        log.flush()
+    if method == "session/open":
+        time.sleep(1.0)
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "alt|{}".format(
+                  (request.get("params") or {}).get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn close_during_replacement_open_never_dispatches_the_replay() {
+    // The turn's lane fails and the alternate's session/open is still in
+    // flight when `close` returns: the driver must not install the
+    // replacement or dispatch the replay after close finished — the turn
+    // answers with the failure it already had.
+    let dir = TestDirectory::new("rpc-close-reopen");
+    let boom = dir.path().join("rpc_boom.py");
+    std::fs::write(&boom, RPC_BOOM).unwrap();
+    let slow = dir.path().join("rpc_slow.py");
+    std::fs::write(&slow, RPC_SLOW_OPEN).unwrap();
+    let log = dir.path().join("calls.log");
+    let registry = registry_with_lanes(
+        rpc_spec("boom", &boom, json!({}), json!({"text": "{prompt}"})),
+        rpc_logging_spec("slow", &slow, &log),
+        ProfilePatch {
+            agent: Some("boom".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("work".to_owned()).await })
+    };
+    // The alternate's `session/open` answer is a second out; the close
+    // lands mid-flight by a wide margin.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    session.close().await.unwrap();
+
+    let error = driver.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "agent_remote_error");
+    // The replacement opened — and was closed — but its prompt call must
+    // never have reached the wire after close returned.
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls_log.lines().any(|method| method == "session/prompt"),
+        "the replacement served a replay after close returned: {calls_log}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_during_replacement_open_cancels_the_turn() {
+    // `cancel` on the idle old session returns while a replacement is
+    // still opening: the turn must end cancelled, and the replacement
+    // must never see the replayed prompt.
+    let dir = TestDirectory::new("rpc-cancel-reopen");
+    let boom = dir.path().join("rpc_boom.py");
+    std::fs::write(&boom, RPC_BOOM).unwrap();
+    let slow = dir.path().join("rpc_slow.py");
+    std::fs::write(&slow, RPC_SLOW_OPEN).unwrap();
+    let log = dir.path().join("calls.log");
+    let registry = registry_with_lanes(
+        rpc_spec("boom", &boom, json!({}), json!({"text": "{prompt}"})),
+        rpc_logging_spec("slow", &slow, &log),
+        ProfilePatch {
+            agent: Some("boom".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("work".to_owned()).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    session.cancel().await.unwrap();
+
+    let outcome = driver.await.unwrap().unwrap();
+    assert_eq!(outcome.stop_reason, "cancelled");
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls_log.lines().any(|method| method == "session/prompt"),
+        "the replacement served a replay after cancel returned: {calls_log}"
+    );
+    let _ = session.close().await;
+}

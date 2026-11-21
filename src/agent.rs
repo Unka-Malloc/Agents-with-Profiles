@@ -700,19 +700,20 @@ impl EventRelay {
     }
 
     /// Relay one event to the caller; count it as the armed attempt's
-    /// evidence only inside the attempt window — and only once the
-    /// attempt's prompt actually dispatched, the same attribution the
-    /// wire journal applies: traffic a lane emits at session open can
-    /// still be in flight when the window opens and is never the turn's
-    /// output. Lanes without an observable dispatch point report
-    /// `dispatched` unconditionally.
+    /// evidence only inside the attempt window — and only on lanes
+    /// without an observable dispatch point. On a probed lane the wire
+    /// journal already attributes output at frame receipt: an event
+    /// received before the prompt but dequeued only after dispatch is
+    /// never the attempt's output. Lanes without an observable dispatch
+    /// point keep tap attribution — the armed window is all their
+    /// evidence has.
     fn forward(
         evidence: &RelayEvidence,
         events: &mpsc::UnboundedSender<AgentEvent>,
         probe: &DispatchProbe,
         event: AgentEvent,
     ) {
-        if evidence.armed.load(Ordering::Acquire) && probe.dispatched() {
+        if evidence.armed.load(Ordering::Acquire) && !probe.has_dispatch_point() {
             evidence.output.store(true, Ordering::Release);
             if turn_output(&event, probe) {
                 evidence.billable.store(true, Ordering::Release);
@@ -875,14 +876,43 @@ impl DispatchProbe {
             probe.text_path = rpc.text_path.clone();
             probe.usage_path = rpc.usage_path.clone();
             probe.prompt_slots = prompt_slots(&rpc.prompt.params);
-            probe.prompt_carries_text = !probe.prompt_slots.is_empty();
             probe.prompt_at_root = rpc
                 .envelope
                 .as_ref()
                 .is_some_and(|envelope| envelope.params_inline)
                 && rpc.prompt.params.is_object();
+            if let Some(envelope) = rpc.envelope.as_ref().filter(|_| probe.prompt_at_root) {
+                // The inline encoder merges an object params document
+                // into the frame root, then stamps the envelope's control
+                // fields over the merge — the method field, every const
+                // field, the request discriminant, and `id`. A template
+                // leaf at one of those positions never reaches the wire:
+                // it is not a verifiable prompt position, and demanding
+                // it would hide a dispatch the surviving positions
+                // already prove.
+                let mut overwritten: std::collections::BTreeSet<&str> =
+                    envelope.const_fields.keys().map(String::as_str).collect();
+                overwritten.insert(envelope.method_field.as_str());
+                overwritten.insert("id");
+                if envelope.request_marker.is_some() {
+                    if let Some(field) = &envelope.discriminant_field {
+                        overwritten.insert(field.as_str());
+                    }
+                }
+                probe
+                    .prompt_slots
+                    .retain(|(path, _)| !overwritten.contains(path[0].as_str()));
+            }
+            probe.prompt_carries_text = !probe.prompt_slots.is_empty();
         }
         Arc::new(probe)
+    }
+
+    /// Whether the lane has an observable dispatch point — the wire
+    /// journal then owns output attribution at frame receipt, and tap
+    /// events carry no evidence of their own.
+    fn has_dispatch_point(&self) -> bool {
+        self.method.is_some()
     }
 
     /// Whether this attempt's prompt frame reached the wire. `true` for
@@ -1428,6 +1458,48 @@ fn model_failure(error: &a4aa::AdapterError) -> bool {
 /// the returned `(request, turn_model, turn_effort)` defaults instead.
 /// Used at open and again on every lane switch — a request normalized for
 /// one lane is never replayed verbatim onto another.
+/// Whether the lane's session establishment consumes the model selector
+/// on the wire — an actual open-time binding — as opposed to storing the
+/// open request's model as the default every later turn inherits. Rpc
+/// mirrors the adapter's own discovery: a `model`, `modelProvider` or
+/// `modelId` placeholder inside `initialize`, `session_open` or
+/// `session_resume` — a process-scoped lane has no session calls at all.
+/// Acp negotiates the model in its session handshake and serve applies
+/// it through the server's model endpoint; cli substitutes it into every
+/// spawn's argv, so its open model is always a stored default.
+fn model_binds_at_open(spec: &AgentSpec) -> bool {
+    match &spec.lane {
+        LaneSpec::Cli(_) => false,
+        LaneSpec::Rpc(rpc) => {
+            let uses = |call: &a4aa::RpcCallSpec| {
+                ["model", "modelProvider", "modelId"]
+                    .iter()
+                    .any(|name| contains_placeholder(&call.params, name))
+            };
+            rpc.initialize.as_ref().is_some_and(&uses)
+                || (rpc.session_scope != a4aa::SessionScope::Process
+                    && (rpc.session_open.as_ref().is_some_and(&uses)
+                        || rpc.session_resume.as_ref().is_some_and(&uses)))
+        }
+        _ => spec.selector_support(SelectorPhase::Session).model != SelectorSupport::Unsupported,
+    }
+}
+
+/// Whether a params template consumes one named `{placeholder}` anywhere
+/// in its tree — the same check the lane's own selector discovery runs.
+fn contains_placeholder(template: &serde_json::Value, name: &str) -> bool {
+    match template {
+        serde_json::Value::String(text) => text.contains(&format!("{{{name}}}")),
+        serde_json::Value::Array(items) => {
+            items.iter().any(|item| contains_placeholder(item, name))
+        }
+        serde_json::Value::Object(fields) => fields
+            .values()
+            .any(|value| contains_placeholder(value, name)),
+        _ => false,
+    }
+}
+
 fn lane_open(
     spec: &AgentSpec,
     request: &SessionRequest,
@@ -1745,12 +1817,18 @@ impl VirtualSession {
                         let guard = session.read().await;
                         guard.prompt(request.clone()).await
                     };
-                    // A cancel that landed while this attempt sat in
-                    // admission or was in flight ends the turn: the lane
-                    // may have been idle when cancel ran, so its own
-                    // cancel path saw nothing — the driver carries the
-                    // cancelled verdict itself.
-                    if cancellation.load(Ordering::Acquire) != cancel_mark {
+                    // A cancel that landed while the prompt sat in
+                    // admission ends the turn: the lane was idle when
+                    // cancel ran, so its own cancel path saw nothing —
+                    // the admission refusal is the cancelled verdict.
+                    // Once the attempt was in flight the lane's result
+                    // stands: a genuinely cancelled turn keeps its
+                    // partial text, usage and truncation, and a lane that
+                    // completed the prompt normally — a cancel the lane
+                    // does not support — is not rewritten as cancelled.
+                    if cancellation.load(Ordering::Acquire) != cancel_mark
+                        && matches!(&outcome, Err(error) if error.code == "agent_turn_cancelled")
+                    {
                         break 'lanes Ok(cancelled_outcome());
                     }
                     // The lane may still hold this attempt's tail events:
@@ -1977,16 +2055,25 @@ impl VirtualSession {
                     projection.config.model = None;
                     let (mut new_open, mut turn_model, turn_effort) =
                         lane_open(&spec, &projection, &profile, head.clone());
-                    // A pending candidate is a per-turn selector only on a
-                    // lane with a turn surface: it rides the replayed
-                    // request instead of the replacement session's
-                    // persistent default — a refusal must not leave the
-                    // refused model installed as the session's model,
-                    // ready to send again on the next implicit prompt.
+                    // Where the open request's model is only a stored
+                    // default the lane re-applies to every turn, a pending
+                    // candidate does not belong in it: it rides the
+                    // replayed request instead of becoming the replacement
+                    // session's persistent model — a refusal must not
+                    // leave the refused model installed as the session's
+                    // default, ready to send again on the next implicit
+                    // prompt. The stored slot keeps the last accepted
+                    // chain entry. A lane whose establishment call binds
+                    // the model on the wire is an actual open-time
+                    // selector — the candidate's open binding is the
+                    // selector doing its job, and restoring the exhausted
+                    // active entry there would abort the switch on a
+                    // refusal before the candidate could reach the prompt.
                     if let Some(candidate) = &pending_candidate {
                         if new_open.config.model.as_deref() == Some(candidate.as_str())
                             && spec.selector_support(SelectorPhase::Turn).model
                                 != SelectorSupport::Unsupported
+                            && !model_binds_at_open(&spec)
                         {
                             new_open.config.model = model_state
                                 .lock()
@@ -2064,9 +2151,18 @@ impl VirtualSession {
                                 // cancel on the read side.
                                 let retiring = std::mem::replace(&mut *guard, new_session);
                                 drop(guard);
-                                tokio::spawn(async move {
-                                    let _ = retiring.close().await;
-                                });
+                                // The retired lane's teardown cannot wait
+                                // on its peer: a session/close the peer
+                                // never acknowledges would pin the lane's
+                                // process and the sender feeding its tap —
+                                // the relay draining that tap would hold
+                                // the caller's event stream open forever.
+                                // Dropping the session is the explicit
+                                // teardown: the lane's own Drop kills the
+                                // process tree, the transport's EOF closes
+                                // its tap, and the dead lane's relay exits
+                                // once its queued leftovers settle.
+                                drop(retiring);
                             }
                             lane.index = candidate;
                             lane.probe = probe.clone();
@@ -2201,5 +2297,106 @@ impl VirtualSession {
         self.closing.store(true, Ordering::Release);
         self.lifecycle.notify_waiters();
         self.session.read().await.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probed_probe() -> Arc<DispatchProbe> {
+        DispatchProbe::new(
+            None,
+            &AgentSpec {
+                id: "rpc".to_owned(),
+                client_name: None,
+                lane: LaneSpec::Rpc(Box::new(a4aa::RpcLaneSpec {
+                    prompt: a4aa::RpcCallSpec {
+                        method: "session/prompt".to_owned(),
+                        params: serde_json::json!({"text": "{prompt}"}),
+                    },
+                    ..Default::default()
+                })),
+                command: a4aa::CommandSpec {
+                    program: "fixture".to_owned(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+                max_output_bytes: None,
+                seatbelted_permission: None,
+            },
+        )
+    }
+
+    fn unprobed_probe() -> Arc<DispatchProbe> {
+        DispatchProbe::new(
+            None,
+            &AgentSpec {
+                id: "cli".to_owned(),
+                client_name: None,
+                lane: LaneSpec::Cli(Box::default()),
+                command: a4aa::CommandSpec {
+                    program: "fixture".to_owned(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                },
+                max_output_bytes: None,
+                seatbelted_permission: None,
+            },
+        )
+    }
+
+    fn armed() -> RelayEvidence {
+        RelayEvidence {
+            armed: AtomicBool::new(true),
+            output: AtomicBool::new(false),
+            billable: AtomicBool::new(false),
+        }
+    }
+
+    /// On a probed lane the wire journal owns output attribution: an
+    /// event received before the prompt but relayed only after dispatch
+    /// must not read as the attempt's billable output — the tap still
+    /// forwards it to the caller.
+    #[test]
+    fn probed_lane_relay_never_counts_tap_evidence() {
+        let probe = probed_probe();
+        probe.dispatched.store(true, Ordering::Release);
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let evidence = armed();
+        EventRelay::forward(
+            &evidence,
+            &events,
+            &probe,
+            AgentEvent::MessageChunk {
+                text: "paid".to_owned(),
+            },
+        );
+        assert!(!evidence.output.load(Ordering::Acquire));
+        assert!(!evidence.billable.load(Ordering::Acquire));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::MessageChunk { .. })));
+    }
+
+    /// Lanes without an observable dispatch point keep tap attribution:
+    /// inside the armed window a relayed billable event is the attempt's
+    /// output — the wire has no journal to attribute it instead.
+    #[test]
+    fn unprobed_lane_relay_counts_armed_output() {
+        let probe = unprobed_probe();
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let evidence = armed();
+        EventRelay::forward(
+            &evidence,
+            &events,
+            &probe,
+            AgentEvent::MessageChunk {
+                text: "paid".to_owned(),
+            },
+        );
+        assert!(evidence.output.load(Ordering::Acquire));
+        assert!(evidence.billable.load(Ordering::Acquire));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::MessageChunk { .. })));
     }
 }

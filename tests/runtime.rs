@@ -4068,3 +4068,312 @@ async fn cancel_during_blocked_reservation_never_dispatches() {
     );
     let _ = session.close().await;
 }
+
+/// An rpc peer whose `session/close` shutdown call sleeps forever:
+/// retiring the lane must not wait on the peer — the dead lane's
+/// senders release and its process dies, so the caller's event stream
+/// ends once the session is gone.
+#[cfg(unix)]
+#[tokio::test]
+async fn retired_lane_releases_the_event_stream_and_terminates() {
+    let dir = TestDirectory::new("rpc-retire-release");
+    let boom = dir.path().join("rpc_boom.py");
+    std::fs::write(&boom, RPC_BOOM_STALLED_CLOSE).unwrap();
+    let mut primary = rpc_spec("boom", &boom, json!({}), json!({"text": "{prompt}"}));
+    let LaneSpec::Rpc(lane) = &mut primary.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.session_close = Some(RpcCallSpec {
+        method: "session/close".to_owned(),
+        params: json!({}),
+    });
+    let serving = write_rpc_agent(dir.path());
+    let registry = registry_with_lanes(
+        primary,
+        rpc_spec("serving", &serving, json!({}), json!({"text": "{prompt}"})),
+        ProfilePatch {
+            agent: Some("boom".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "unset|unset|work");
+    session.close().await.unwrap();
+    drop(session);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+        let mut rx = rx;
+        while rx.recv().await.is_some() {}
+    })
+    .await
+    .expect("the retired lane's senders outlived its teardown");
+}
+
+/// An rpc peer with a model selector at both `session/open` and
+/// `session/prompt`: it quota-refuses `prime` at open, logs the model
+/// each call carried, and serves prompts with the model they name.
+#[cfg(unix)]
+const RPC_QUOTA_OPEN_DUAL_MODEL: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        model = params.get("model")
+        log.write("session/open|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("session/prompt|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}".format(params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_dual_selector_switch_routes_the_candidate_to_the_turn() {
+    // The retry scheduled `fallback` on the primary's per-turn surface,
+    // then the prompt's write failed. The alternate selects the model at
+    // both open and prompt — an actual open-time selector, not a stored
+    // default: the pending candidate binds at `session/open`, where the
+    // peer accepts it — restoring the exhausted `prime` there would be
+    // quota-refused before the fallback could reach the prompt.
+    let dir = TestDirectory::new("rpc-dual-selector");
+    let script = dir.path().join("rpc_quota_close.py");
+    std::fs::write(&script, RPC_QUOTA_THEN_CLOSES_STDIN).unwrap();
+    let primary = rpc_spec(
+        "unaccepted",
+        &script,
+        json!({}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    let dual = dir.path().join("rpc_dual.py");
+    std::fs::write(&dual, RPC_QUOTA_OPEN_DUAL_MODEL).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut alternate = rpc_spec(
+        "dual",
+        &dual,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    alternate.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [(
+            "AWP_CALL_LOG".to_owned(),
+            EnvValue::Literal(log.display().to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("unaccepted".to_owned()),
+            model: Some("prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|work");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["session/open|fallback", "session/prompt|fallback"],
+        "the exhausted model must not be retried at open: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_inline_envelope_overwritten_slot_still_marks_dispatch() {
+    // The inline encoder merges object params into the frame root, then
+    // stamps `cmd` with the method name — the templated `cmd` leaf never
+    // reaches the wire, but `text` does: the peer received the prompt
+    // through `text` and died, so the post-dispatch transport loss must
+    // propagate instead of replaying a possibly billed turn.
+    let dir = TestDirectory::new("rpc-inline-overwrite");
+    let script = dir.path().join("rpc_inline.py");
+    std::fs::write(&script, RPC_ENVELOPE_DIES_ON_PROMPT).unwrap();
+    let envelope = a4aa::RpcEnvelopeSpec {
+        method_field: "cmd".to_owned(),
+        params_inline: true,
+        response_method: Some("response".to_owned()),
+        ..Default::default()
+    };
+    let registry = registry_with_lanes(
+        rpc_envelope_spec(
+            "inline",
+            &script,
+            json!({"cmd": "{prompt}", "text": "{prompt}"}),
+            envelope,
+        ),
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("inline".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_transport_failed");
+    let _ = session.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_cancelled_turn_keeps_the_lane_outcome() {
+    // The cli lane's own cancelled outcome carries the text the turn
+    // already produced — the driver's synthesized empty outcome for
+    // admission cancellation must not erase an in-flight lane result.
+    let registry = registry_with(
+        cli_spec(
+            "slow",
+            "sh",
+            &["-c", "printf 'partial-output\\n'; sleep 60", "x|{prompt}"],
+            PromptChannel::ArgOnly,
+        ),
+        ProfilePatch {
+            agent: Some("slow".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = {
+        let turn = session.prompt("work".to_owned());
+        tokio::pin!(turn);
+        tokio::select! {
+            outcome = &mut turn => panic!("turn finished before cancel: {outcome:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+        }
+        session.cancel().await.unwrap();
+        turn.await.unwrap()
+    };
+    assert_eq!(outcome.stop_reason, "cancelled");
+    assert!(
+        outcome.text.contains("partial-output"),
+        "the lane's cancelled outcome lost its partial text: {outcome:?}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that takes one second to answer each prompt: a cancel
+/// that lands mid-turn finds no cancel surface, and the turn completes
+/// normally — an unsupported cancel must not rewrite the lane's result.
+#[cfg(unix)]
+const RPC_SLOW_PROMPT: &str = r#"
+import json, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        time.sleep(1)
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "answered|{}".format(params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_unsupported_lane_keeps_its_served_outcome() {
+    // `cancel` reports `agent_cancel_unsupported` — the lane finished
+    // the turn anyway. Its served result must reach the caller, not the
+    // synthesized empty cancellation.
+    let dir = TestDirectory::new("rpc-cancel-unsupported");
+    let script = dir.path().join("rpc_slow.py");
+    std::fs::write(&script, RPC_SLOW_PROMPT).unwrap();
+    let registry = registry_with(
+        rpc_spec("slow", &script, json!({}), json!({"text": "{prompt}"})),
+        ProfilePatch {
+            agent: Some("slow".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("work".to_owned()).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let error = session.cancel().await.unwrap_err();
+    assert_eq!(error.code, "agent_cancel_unsupported");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+        .await
+        .expect("the turn outlived its own completion")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.text.trim_end(), "answered|work");
+    session.close().await.unwrap();
+}

@@ -11679,3 +11679,560 @@ async fn rpc_null_params_open_binds_the_session_answer() {
     );
     session.close().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_direct_prompt_leaves_the_pending_candidate_queued() {
+    // `fallback` opened the primary with its `provider` member omitted —
+    // stored, pending. The lane dies before the first turn, so the
+    // replacement open happens inside a `prompt_direct` — which fills
+    // no defaults: the queued claim must not bind at the replacement
+    // open or ride the replayed request, and it still belongs to the
+    // next implicit prompt.
+    let dir = TestDirectory::new("rpc-direct-switch");
+    let dying = dir.path().join("rpc_close.py");
+    std::fs::write(&dying, RPC_PROVIDER_OPEN_THEN_CLOSES_STDIN).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "pending",
+        &dying,
+        json!({"provider": "{modelProvider}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let serving = dir.path().join("rpc_serve.py");
+    std::fs::write(&serving, RPC_LOGGED_MODEL_SERVE_THIRD).unwrap();
+    let mut alternate = rpc_spec(
+        "serving",
+        &serving,
+        json!({"note": "alternate"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("pending".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // The direct turn replays on the alternate: no `{model}` member
+    // reaches the wire — the queued claim stays queued.
+    let outcome = session
+        .prompt_direct(TurnRequest {
+            text: "raw".to_owned(),
+            model: None,
+            effort: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|unset|raw");
+    assert_eq!(session.active_model().as_deref(), None);
+
+    // The claim a direct turn never consumed still rides the next
+    // implicit prompt — the wire finally carries `fallback`.
+    let outcome = session.prompt("again".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|again");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "primary/open|vnd",
+            "primary/open|unset",
+            "third/open|unset",
+            "third/prompt|unset",
+            "third/prompt|fallback",
+        ],
+        "a direct prompt must leave the queued claim for implicit turns: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that logs each open's provider and each prompt's model,
+/// refuses a `vnd` open, exits on the third open across restarts, parks
+/// every later open for a minute, refuses a `fallback` prompt, and
+/// serves the rest.
+#[cfg(unix)]
+const RPC_PROVIDER_OPEN_PARKS_ON_FOURTH: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+state = os.environ["AWP_OPEN_STATE"]
+count = 0
+if os.path.exists(state):
+    try:
+        count = int(open(state).read().strip() or "0")
+    except Exception:
+        count = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        count += 1
+        with open(state, "w") as handle:
+            handle.write(str(count))
+        provider = params.get("provider")
+        log.write("session/open|{}\n".format(provider or "unset"))
+        log.flush()
+        if count == 3:
+            sys.exit(0)
+        if count >= 4:
+            time.sleep(60)
+        if provider == "vnd":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+            continue
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("session/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "fallback":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"text": "served|{}|{}".format(
+                      model or "peerdefault", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_close_during_the_poisoned_repair_reports_session_closed() {
+    // `fallback` opened the session stored, pending — and the prompt
+    // carrying it is refused. The retire reopen dies, leaving the lane
+    // marked with the poisoned stored default. The next prompt's repair
+    // parks inside the replacement open: a close landing there must
+    // report the close — the repair dispatched no prompt, so the
+    // synthesized model refusal is not the turn's answer.
+    let dir = TestDirectory::new("rpc-repair-close");
+    let script = dir.path().join("rpc_provider.py");
+    std::fs::write(&script, RPC_PROVIDER_OPEN_PARKS_ON_FOURTH).unwrap();
+    let log = dir.path().join("calls.log");
+    let state = dir.path().join("opens.count");
+    let mut primary = rpc_spec(
+        "parking",
+        &script,
+        json!({"provider": "{modelProvider}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    primary.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [
+            (
+                "AWP_CALL_LOG".to_owned(),
+                EnvValue::Literal(log.display().to_string()),
+            ),
+            (
+                "AWP_OPEN_STATE".to_owned(),
+                EnvValue::Literal(state.display().to_string()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let registry = registry_with(
+        primary,
+        ProfilePatch {
+            agent: Some("parking".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = std::sync::Arc::new(
+        agent
+            .open_session(SessionRequest::default(), tx)
+            .await
+            .unwrap(),
+    );
+
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+
+    // The repair iteration parks inside the replacement open: the
+    // fourth logged open is the handshake the close interrupts.
+    let driver = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt("again".to_owned()).await })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let contents = std::fs::read_to_string(&log).unwrap_or_default();
+        if contents
+            .lines()
+            .filter(|line| line.starts_with("session/open"))
+            .count()
+            >= 4
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the repair open never parked: {contents}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    session.close().await.unwrap();
+
+    let error = driver.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "agent_session_closed");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "session/open|vnd",
+            "session/open|unset",
+            "session/prompt|fallback",
+            "session/open|unset",
+            "session/open|unset",
+        ],
+        "a close during the repair must not surface the synthesized refusal: {calls_log}"
+    );
+}
+
+/// An rpc peer that logs each open's provider and each prompt's model,
+/// refuses a `vnd` open, serves exactly one prompt then closes its
+/// stdin, and exits on the third open across restarts so a repair walk
+/// continues to the alternate.
+#[cfg(unix)]
+const RPC_PROVIDER_OPEN_DIES_ON_THIRD_SERVE: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+state = os.environ["AWP_OPEN_STATE"]
+count = 0
+if os.path.exists(state):
+    try:
+        count = int(open(state).read().strip() or "0")
+    except Exception:
+        count = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        count += 1
+        with open(state, "w") as handle:
+            handle.write(str(count))
+        provider = params.get("provider")
+        log.write("primary/open|{}\n".format(provider or "unset"))
+        log.flush()
+        if count == 3:
+            sys.exit(0)
+        if provider == "vnd":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+            continue
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("primary/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "peerdefault", params.get("text", ""))}})
+        os.close(0)
+        time.sleep(30)
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_refused_active_never_reenters_the_repair() {
+    // `fallback` opened the primary stored, pending — and the first
+    // prompt carries it on the wire, where it is served: the candidate
+    // publishes as the chain's last accepted entry. The alternate's
+    // open binds it on the wire and the peer refuses it — the entry is
+    // spent everywhere, `active` included. The repair reopen must not
+    // select it again: the replacement open and the prompt that follows
+    // carry no model at all.
+    let dir = TestDirectory::new("rpc-active-refused");
+    let script = dir.path().join("rpc_provider.py");
+    std::fs::write(&script, RPC_PROVIDER_OPEN_DIES_ON_THIRD_SERVE).unwrap();
+    let log = dir.path().join("calls.log");
+    let state = dir.path().join("opens.count");
+    let mut primary = rpc_spec(
+        "serving",
+        &script,
+        json!({"provider": "{modelProvider}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    primary.command.env = EnvPolicy::Sanitized {
+        inherit: vec![],
+        set: [
+            (
+                "AWP_CALL_LOG".to_owned(),
+                EnvValue::Literal(log.display().to_string()),
+            ),
+            (
+                "AWP_OPEN_STATE".to_owned(),
+                EnvValue::Literal(state.display().to_string()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let refusing = dir.path().join("rpc_refuse.py");
+    std::fs::write(&refusing, RPC_ALT_OPEN_REFUSES_FALLBACK).unwrap();
+    let mut alternate = rpc_spec(
+        "refusing",
+        &refusing,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("serving".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // The prompt carries `fallback` and the peer serves it — the
+    // candidate confirms and publishes as the chain's active entry.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+
+    // The dead lane's replacement open binds `fallback` on the wire and
+    // the peer refuses it: the mark lands on the installed session and
+    // the refused entry leaves `active`.
+    let error = session.prompt("two".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+
+    // The repair walks past the dead primary to the alternate — which
+    // must open unset instead of rebinding the refused model, then the
+    // prompt carries no model at all.
+    let outcome = session.prompt("three".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|unset|three");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "primary/open|vnd",
+            "primary/open|unset",
+            "primary/prompt|fallback",
+            "alt/open|fallback",
+            "primary/open|unset",
+            "alt/open|unset",
+            "alt/prompt|unset",
+        ],
+        "the open-refused active entry must never re-enter the repair: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that logs each open's model and each prompt's provider,
+/// accepts every open, and refuses every prompt with a quota error —
+/// after the second refusal it closes its stdin and sleeps, so the
+/// next write lands on a dead pipe.
+#[cfg(unix)]
+const RPC_PRIMARY_OPEN_MODEL_REFUSES_PROMPTS: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+def refused(request_id):
+    send({"jsonrpc": "2.0", "id": request_id,
+          "error": {"code": -32000, "message":
+                    "resource_exhausted: quota exceeded for this model"}})
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+refusals = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("primary/open|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        refusals += 1
+        log.write("primary/prompt|{}\n".format(params.get("provider") or "unset"))
+        log.flush()
+        refused(request_id)
+        if refusals == 2:
+            os.close(0)
+            time.sleep(30)
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer that logs each open's model and each prompt's model and
+/// serves everything.
+#[cfg(unix)]
+const RPC_ALT_OPEN_MODEL_SERVES: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("alt/open|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("alt/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "unset", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_unsent_retry_candidate_survives_the_turn() {
+    // `vnd/prime` binds at open, so `fallback` waits in `remaining`. The
+    // explicit prompt carries `vnd` on the wire and the peer refuses it:
+    // the per-turn retry schedules `fallback` — but the lane's only slot
+    // is an unqualified `{modelProvider}` and `fallback` has no provider
+    // part, so the retry sends no selector at all. The refusal keeps the
+    // model reading — a prompt refusal answers the model — so the chain
+    // exhausts on this lane and the turn fails, with the unsent
+    // candidate held only in turn-local state. It must survive the turn:
+    // the peer then closes its stdin, so the next prompt's dead pipe
+    // walks to a lane that can carry it.
+    let dir = TestDirectory::new("rpc-unsent-candidate");
+    let script = dir.path().join("rpc_refuse.py");
+    std::fs::write(&script, RPC_PRIMARY_OPEN_MODEL_REFUSES_PROMPTS).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "refusing",
+        &script,
+        json!({"model": "{model}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let serving = dir.path().join("rpc_serve.py");
+    std::fs::write(&serving, RPC_ALT_OPEN_MODEL_SERVES).unwrap();
+    let mut alternate = rpc_spec(
+        "serving",
+        &serving,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("refusing".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // The explicit model's refusal schedules `fallback`; the retry's
+    // unqualified slot drops it from the frame, and `pending_model` is
+    // already taken while `remaining` is empty — the candidate exists
+    // only in turn-local state and must not disappear with the turn.
+    let error = session
+        .prompt_with(TurnRequest {
+            text: "work".to_owned(),
+            model: Some("vnd/prime".to_owned()),
+            effort: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+
+    // The preserved candidate rides the next implicit prompt: the
+    // primary's pipe is dead for writes now, so the lane walk opens the
+    // alternate with `fallback` and its prompt carries it to a peer
+    // that serves it.
+    let outcome = session.prompt("again".to_owned()).await;
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    let outcome = outcome.unwrap_or_else(|error| panic!("again failed {error:?}: {calls_log}"));
+    assert_eq!(outcome.text.trim_end(), "served|fallback|again");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "primary/open|vnd/prime",
+            "primary/prompt|vnd",
+            "primary/prompt|unset",
+            "alt/open|fallback",
+            "alt/prompt|fallback",
+        ],
+        "an unsent scheduled candidate must survive the turn: {calls_log}"
+    );
+    session.close().await.unwrap();
+}

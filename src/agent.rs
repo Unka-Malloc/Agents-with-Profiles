@@ -3953,6 +3953,33 @@ impl VirtualSession {
                             {
                                 lane.lock().await.refused_default = Some(accepted);
                             }
+                        } else if !pending_sent
+                            && matches!(&outcome, Err(error) if model_failure(error))
+                        {
+                            // A model refusal that never saw the candidate
+                            // spends nothing — the unsent entry exists only
+                            // in turn-local state and ends with the turn
+                            // otherwise. The awaiting claim keeps it riding
+                            // implicit prompts for a lane that can send it;
+                            // it must not re-enter `remaining` ahead of the
+                            // retry below, which would re-schedule the same
+                            // unsent entry on this lane. Cancellations and
+                            // transport losses restore through
+                            // `restore_candidate` — only a refusal has no
+                            // other path back.
+                            let mut chain = model_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            if chain.active.as_deref() != Some(accepted.as_str())
+                                && chain.pending.as_deref() != Some(accepted.as_str())
+                                && !chain.remaining.iter().any(|entry| entry == &accepted)
+                            {
+                                if chain.pending.is_none() {
+                                    chain.pending = Some(accepted);
+                                } else {
+                                    chain.remaining.push(accepted);
+                                }
+                            }
                         }
                     }
                     // A cancelled outcome can arrive after a model-free
@@ -4225,12 +4252,18 @@ impl VirtualSession {
                             // A candidate the installed open accepted
                             // without carry evidence rides the switch
                             // too — the new lane's binding is its next
-                            // chance to prove itself.
-                            model_state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .pending
-                                .clone()
+                            // chance to prove itself. The claim is a
+                            // default: a direct prompt fills none, so it
+                            // stays queued for the next implicit prompt.
+                            record_instructions
+                                .then(|| {
+                                    model_state
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .pending
+                                        .clone()
+                                })
+                                .flatten()
                         });
                     let head = pending_candidate.clone().or_else(|| {
                         model_state
@@ -4289,7 +4322,17 @@ impl VirtualSession {
                     tokio::pin!(notified);
                     let _ = notified.as_mut().enable();
                     if closing.load(Ordering::Acquire) {
-                        break 'lanes outcome;
+                        // The poisoned iteration's synthesized refusal is
+                        // no completed attempt's answer: the close owns
+                        // the verdict when nothing dispatched.
+                        break 'lanes if poisoned {
+                            Err(a4aa::AdapterError::permanent(
+                                "agent_session_closed",
+                                "session/prompt",
+                            ))
+                        } else {
+                            outcome
+                        };
                     }
                     // The cancellation mark moved before this candidate's
                     // open even began — the completed attempt's result is
@@ -4340,7 +4383,14 @@ impl VirtualSession {
                         result = adapter.open_session(new_open.clone(), tap_tx) => result,
                         _ = notified.as_mut() => {
                             if closing.load(Ordering::Acquire) {
-                                break 'lanes outcome;
+                                break 'lanes if poisoned {
+                                    Err(a4aa::AdapterError::permanent(
+                                        "agent_session_closed",
+                                        "session/prompt",
+                                    ))
+                                } else {
+                                    outcome
+                                };
                             }
                             // The abandoned open never completed — a
                             // pending candidate goes back to the chain
@@ -4409,7 +4459,14 @@ impl VirtualSession {
                                     // driver and the caller's event stream
                                     // on a peer that may never answer.
                                     drop(new_session);
-                                    break 'lanes outcome;
+                                    break 'lanes if poisoned {
+                                        Err(a4aa::AdapterError::permanent(
+                                            "agent_session_closed",
+                                            "session/prompt",
+                                        ))
+                                    } else {
+                                        outcome
+                                    };
                                 }
                                 if cancellation.load(Ordering::Acquire) != cancel_mark {
                                     drop(guard);
@@ -4517,13 +4574,18 @@ impl VirtualSession {
                                 }
                                 // No scheduled candidate: the model the
                                 // replacement carries is the last
-                                // accepted chain entry — publish it.
+                                // accepted chain entry — publish it. A
+                                // direct prompt never consumed the
+                                // queued claim, so it stays pending for
+                                // the next implicit prompt.
                                 None => {
                                     let mut chain = model_state
                                         .lock()
                                         .unwrap_or_else(|error| error.into_inner());
                                     chain.active = accepted;
-                                    chain.pending = None;
+                                    if record_instructions {
+                                        chain.pending = None;
+                                    }
                                 }
                                 // A candidate this lane cannot deliver —
                                 // its binding never reached the wire and
@@ -4580,6 +4642,17 @@ impl VirtualSession {
                                         .unwrap_or_else(|error| error.into_inner());
                                     if chain.pending.as_deref() == Some(refused.as_str()) {
                                         chain.pending = None;
+                                    }
+                                    // A refused entry is spent even where
+                                    // it was the last accepted one: left
+                                    // `active`, the repair reopen or a
+                                    // later lane switch would select it
+                                    // again and reinstall or resend it.
+                                    // The installed session's own record —
+                                    // `lane.open`'s stored slot and the
+                                    // mark below — still describes it.
+                                    if chain.active.as_deref() == Some(refused.as_str()) {
+                                        chain.active = None;
                                     }
                                 }
                                 if lane.open.config.model.as_deref() == Some(refused.as_str())

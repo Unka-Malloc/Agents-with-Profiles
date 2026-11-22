@@ -3675,12 +3675,17 @@ impl VirtualSession {
                             // refuses it — on a session that only expresses
                             // the model per turn this projection is its
                             // carry, on one that stores it the slot resolves
-                            // the same value either way.
-                            model_state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .pending
-                                .clone()
+                            // the same value either way. The claim is a
+                            // default: a direct prompt fills none.
+                            record_instructions
+                                .then(|| {
+                                    model_state
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .pending
+                                        .clone()
+                                })
+                                .flatten()
                         })
                         .or_else(|| {
                             record_instructions
@@ -3729,16 +3734,13 @@ impl VirtualSession {
                 // failures advance the chain and resubmit on the same
                 // session.
                 let outcome = loop {
-                    if poisoned {
-                        break Err(a4aa::AdapterError::permanent(
-                            "agent_model_refused",
-                            "session/open",
-                        ));
-                    }
                     // A close or cancel that landed while the driver was
                     // arranging this attempt — including a fallback's
                     // reopen — must stop the turn before anything else
-                    // dispatches.
+                    // dispatches. The poisoned iteration dispatches
+                    // nothing, so lifecycle answers first: a cancel before
+                    // the repair open is a cancelled turn, never a model
+                    // refusal.
                     if closing.load(Ordering::Acquire) {
                         break 'lanes Err(a4aa::AdapterError::permanent(
                             "agent_session_closed",
@@ -3765,6 +3767,15 @@ impl VirtualSession {
                             );
                         }
                         break 'lanes prior.take().unwrap_or_else(|| Ok(cancelled_outcome()));
+                    }
+                    // The repair iteration synthesized a model refusal so
+                    // the reopen below knows to re-establish the session:
+                    // it is not a completed attempt's answer.
+                    if poisoned {
+                        break Err(a4aa::AdapterError::permanent(
+                            "agent_model_refused",
+                            "session/open",
+                        ));
                     }
                     // One iteration is one physical prompt attempt: reset
                     // the wire journal so an earlier attempt's dispatch
@@ -3910,14 +3921,18 @@ impl VirtualSession {
                                 .unwrap_or_else(|error| error.into_inner());
                             chain.active = Some(accepted);
                             chain.pending = None;
-                        } else if matches!(&outcome, Err(error)
-                            if model_failure(error)
-                                && turn_refusal_binds_model(error, &probe))
+                        } else if serving_sent
+                            && matches!(&outcome, Err(error)
+                                if model_failure(error)
+                                    && turn_refusal_binds_model(error, &probe))
                         {
                             // A pending candidate the lane provably
                             // refused is spent: the shared chain must not
                             // keep it as the awaiting entry for a later
-                            // lane walk to pick again.
+                            // lane walk to pick again. The carry evidence
+                            // is this lane's own send record — a refusal
+                            // on a model-free prompt never used the
+                            // candidate, so the claim survives.
                             {
                                 let mut chain = model_state
                                     .lock()
@@ -4300,7 +4315,14 @@ impl VirtualSession {
                                 pending_bind.take().or_else(|| driver_model.take()),
                             );
                         }
-                        break 'lanes outcome;
+                        // The poisoned iteration's synthesized refusal is
+                        // no completed attempt's answer: cancellation owns
+                        // the verdict when nothing dispatched.
+                        break 'lanes if poisoned {
+                            prior.take().unwrap_or_else(|| Ok(cancelled_outcome()))
+                        } else {
+                            outcome
+                        };
                     }
                     // The replacement session opens while the installed
                     // one stays in place: a refused open leaves the live
@@ -4541,6 +4563,37 @@ impl VirtualSession {
                             // is the lane's answer and the walk moves on.
                             if !refused_call_binds_model(&spec, resuming(&new_open), &probe) {
                                 continue;
+                            }
+                            // The refused open's model is spent: a shared
+                            // `pending` claim still holding it would
+                            // re-enter on the next implicit prompt when no
+                            // replacement installs, and the driver's own
+                            // candidates must not ride this walk again.
+                            // The installed session storing it as its
+                            // default keeps the poisoned-slot mark — an
+                            // open that never carried it — until a clean
+                            // replacement takes over.
+                            if let Some(refused) = new_open.config.model.clone() {
+                                {
+                                    let mut chain = model_state
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner());
+                                    if chain.pending.as_deref() == Some(refused.as_str()) {
+                                        chain.pending = None;
+                                    }
+                                }
+                                if lane.open.config.model.as_deref() == Some(refused.as_str())
+                                    && !lane.probe.model_setup_sent()
+                                {
+                                    lane.refused_default = Some(refused.clone());
+                                }
+                                for slot in
+                                    [&mut pending_bind, &mut driver_model, &mut pending_model]
+                                {
+                                    if slot.as_deref() == Some(refused.as_str()) {
+                                        *slot = None;
+                                    }
+                                }
                             }
                             let next = {
                                 let mut chain = model_state

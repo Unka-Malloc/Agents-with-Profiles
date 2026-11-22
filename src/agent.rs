@@ -315,9 +315,26 @@ impl VirtualAgent {
         for (lane_index, spec) in self.specs.iter().enumerate() {
             let (mut lane_request, turn_model_default, turn_effort_default) =
                 lane_open(spec, &request, &self.profile, lane_model.clone());
+            // The candidate an open could not bind — every declared slot
+            // resolved its value absent — parked aside for the pending
+            // claim below. Leaving it in `config.model` would store it
+            // as the adapter's session default, where every later
+            // prompt's `{model}` substitution inherits it — a direct
+            // prompt included — though the wire never carried it.
+            let mut parked_model = None;
             // A requested model the lane cannot express at establishment
             // advances the chain before the first turn is even attempted.
             let session = loop {
+                if model_binds_at_open(spec, resuming(&lane_request))
+                    && !setup_carries_model(spec, &lane_request)
+                {
+                    // The open's model slots exist but none resolves
+                    // this candidate — an unqualified `{modelProvider}`
+                    // — so establishment cannot bind it. Out of the
+                    // stored slot it waits pending: only an implicit
+                    // prompt supplies the queued claim.
+                    parked_model = lane_request.config.model.take();
+                }
                 // Every open attempt gets its own event tap: the session's
                 // relay drains it into the caller's stream for the whole
                 // lifetime and counts each armed attempt's produced-output
@@ -405,7 +422,10 @@ impl VirtualAgent {
                     None,
                 )
             } else {
-                (None, effective_request.config.model.clone())
+                (
+                    None,
+                    effective_request.config.model.clone().or(parked_model),
+                )
             };
             let remaining_models =
                 remaining_models(&chain, pending_model.as_deref().or(active_model.as_deref()));
@@ -1999,6 +2019,23 @@ fn leaf_carries_model(leaf: &str, vars: &ProbeVars) -> bool {
     })
 }
 
+/// Whether a model slot's leaf resolves a selector value for this
+/// candidate — the same per-token reading `leaf_carries_model` makes of
+/// the resolved vars, computed before any wire journal exists:
+/// `{model}` and `{modelId}` resolve for every non-empty candidate,
+/// `{modelProvider}` only for a `provider/model` selection.
+fn leaf_resolves_model(leaf: &str, model: &str) -> bool {
+    MODEL_NAMES.iter().any(|name| {
+        leaf.contains(&format!("{{{name}}}"))
+            && match *name {
+                "modelProvider" => model
+                    .split_once('/')
+                    .is_some_and(|(provider, _)| !provider.is_empty()),
+                _ => !model.is_empty(),
+            }
+    })
+}
+
 fn model_slots(template: &serde_json::Value) -> Vec<(Vec<String>, String)> {
     fn walk(
         value: &serde_json::Value,
@@ -3232,6 +3269,34 @@ fn rpc_call_binds_model(rpc: &a4aa::RpcLaneSpec, call: &a4aa::RpcCallSpec) -> bo
     }
 }
 
+/// Whether a setup call can put this model value on the wire —
+/// `rpc_call_binds_model`'s surviving-slot read narrowed by the value's
+/// own resolution: a `{modelProvider}`-only slot emits nothing for an
+/// unqualified candidate, so the call cannot bind it however the
+/// template declares.
+fn rpc_call_carries_model(rpc: &a4aa::RpcLaneSpec, call: &a4aa::RpcCallSpec, model: &str) -> bool {
+    let slots = model_slots(&call.params)
+        .into_iter()
+        .filter(|(_, leaf)| leaf_resolves_model(leaf, model))
+        .collect::<Vec<_>>();
+    if slots.is_empty() {
+        return false;
+    }
+    match rpc
+        .envelope
+        .as_ref()
+        .filter(|envelope| envelope.params_inline)
+    {
+        Some(envelope) if call.params.is_object() => {
+            let overwritten = inline_overwritten(envelope);
+            slots
+                .iter()
+                .any(|(path, _)| !overwritten.contains(path[0].as_str()))
+        }
+        _ => true,
+    }
+}
+
 /// Session-phase selector support for the setup call this request
 /// actually selects — the same classification the adapter's session
 /// validation applies at open, so a projected value never reaches a
@@ -3291,6 +3356,21 @@ fn model_binds_at_open(spec: &AgentSpec, resuming: bool) -> bool {
             .into_iter()
             .any(|call| rpc_call_binds_model(rpc, call)),
         _ => spec.selector_support(SelectorPhase::Session).model != SelectorSupport::Unsupported,
+    }
+}
+
+/// Whether one of the lane's setup calls can put this request's model
+/// on the wire — `model_binds_at_open`'s declared slot read resolved
+/// against the actual candidate. Non-rpc lanes keep the declared
+/// open-binding reading.
+fn setup_carries_model(spec: &AgentSpec, request: &SessionRequest) -> bool {
+    match &spec.lane {
+        LaneSpec::Rpc(rpc) => request.config.model.as_deref().is_some_and(|model| {
+            rpc_setup_calls(rpc, resuming(request))
+                .into_iter()
+                .any(|call| rpc_call_carries_model(rpc, call, model))
+        }),
+        _ => model_binds_at_open(spec, resuming(request)),
     }
 }
 
@@ -3580,6 +3660,12 @@ impl VirtualSession {
             // never publishes, and neither does one whose attempt died
             // before dispatch.
             let mut pending_model: Option<String> = None;
+            // Chain candidates this lane's refusals never saw — held out
+            // of `remaining` so the retry below cannot re-select the
+            // identical unsent entry for another go on this same lane.
+            // They return to the chain when the lane changes or the
+            // turn ends.
+            let mut held_unsent: Vec<String> = Vec::new();
             // This turn ends on a re-established session whose stored
             // default is cleared of the refused pending candidate —
             // nothing replays on it; the refusal still answers the turn.
@@ -3961,10 +4047,12 @@ impl VirtualSession {
                             // in turn-local state and ends with the turn
                             // otherwise. The awaiting claim keeps it riding
                             // implicit prompts for a lane that can send it;
-                            // it must not re-enter `remaining` ahead of the
-                            // retry below, which would re-schedule the same
-                            // unsent entry on this lane. Cancellations and
-                            // transport losses restore through
+                            // it must not re-enter `remaining`, where the
+                            // retry below would immediately re-select the
+                            // identical unsent entry for the same lane —
+                            // it holds outside the retry queue until the
+                            // lane changes or the turn ends. Cancellations
+                            // and transport losses restore through
                             // `restore_candidate` — only a refusal has no
                             // other path back.
                             let mut chain = model_state
@@ -3973,11 +4061,12 @@ impl VirtualSession {
                             if chain.active.as_deref() != Some(accepted.as_str())
                                 && chain.pending.as_deref() != Some(accepted.as_str())
                                 && !chain.remaining.iter().any(|entry| entry == &accepted)
+                                && !held_unsent.iter().any(|entry| entry == &accepted)
                             {
                                 if chain.pending.is_none() {
                                     chain.pending = Some(accepted);
                                 } else {
-                                    chain.remaining.push(accepted);
+                                    held_unsent.push(accepted);
                                 }
                             }
                         }
@@ -4297,10 +4386,14 @@ impl VirtualSession {
                     // selector doing its job, and restoring the exhausted
                     // active entry there would abort the switch on a
                     // refusal before the candidate could reach the prompt.
+                    // A declared slot that cannot resolve the candidate —
+                    // an unqualified `{modelProvider}` — binds nothing
+                    // either: left stored, every later prompt's `{model}`
+                    // substitution would inherit the unconfirmed claim.
                     if let Some(candidate) = &pending_candidate {
                         if new_open.config.model.as_deref() == Some(candidate.as_str())
                             && turn_binds_model(&spec)
-                            && !model_binds_at_open(&spec, resuming(&new_open))
+                            && !setup_carries_model(&spec, &new_open)
                         {
                             new_open.config.model = model_state
                                 .lock()
@@ -4606,7 +4699,27 @@ impl VirtualSession {
                                 }
                             }
                         }
-                        Err(open_error) if model_failure(&open_error) => {
+                        Err(open_error) => {
+                            // A close landing while the replacement open
+                            // sat in flight owns the verdict — the biased
+                            // select can take this arm with the lifecycle
+                            // signal already raised, and a failed open is
+                            // no completed attempt's answer — least of
+                            // all the poisoned iteration's synthesized
+                            // refusal.
+                            if closing.load(Ordering::Acquire) {
+                                break 'lanes if poisoned {
+                                    Err(a4aa::AdapterError::permanent(
+                                        "agent_session_closed",
+                                        "session/prompt",
+                                    ))
+                                } else {
+                                    outcome
+                                };
+                            }
+                            if !model_failure(&open_error) {
+                                continue;
+                            }
                             // A verified model refusal at establishment —
                             // the lane's own setup answered about the
                             // model, not about the lane — walks the chain
@@ -4655,6 +4768,18 @@ impl VirtualSession {
                                         chain.active = None;
                                     }
                                 }
+                                // The stored turn default is spent with
+                                // it: left holding the refused entry, the
+                                // still-installed lane's next implicit
+                                // prompt would resend it.
+                                {
+                                    let mut default = turn_model_default
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner());
+                                    if default.as_deref() == Some(refused.as_str()) {
+                                        *default = None;
+                                    }
+                                }
                                 if lane.open.config.model.as_deref() == Some(refused.as_str())
                                     && !lane.probe.model_setup_sent()
                                 {
@@ -4686,7 +4811,6 @@ impl VirtualSession {
                             }
                             break 'lanes Err(open_error);
                         }
-                        Err(_) => continue,
                     }
                     // A candidate still pending acceptance on the
                     // per-turn surface keeps the last accepted turn
@@ -4729,9 +4853,21 @@ impl VirtualSession {
                     if !poisoned {
                         prior = Some(outcome);
                     }
+                    // Held unsent candidates return to the chain with
+                    // the lane change — the replacement's own slots may
+                    // carry what this lane never could.
+                    for candidate in held_unsent.drain(..).rev() {
+                        restore_candidate(&model_state, Some(candidate));
+                    }
                     continue 'lanes;
                 }
             };
+            // Held unsent candidates survive the turn: restored to the
+            // chain, the next prompt may still try them on a lane that
+            // can carry them.
+            for candidate in held_unsent.drain(..).rev() {
+                restore_candidate(&model_state, Some(candidate));
+            }
             // Preserve profile state and ordering even when only the caller's
             // waiter is dropped. A cancelled first attempt remains pending.
             if record_instructions

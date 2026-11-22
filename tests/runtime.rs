@@ -1534,9 +1534,12 @@ def send(value):
     sys.stdout.flush()
 
 request = json.loads(sys.stdin.readline())
+# stdin closes before the answer flushes, so a prompt the client writes
+# after the open resolves is guaranteed to land on a dead pipe — never
+# in the gap where the transport could still accept it.
+os.close(0)
 send({"jsonrpc": "2.0", "id": request["id"],
       "result": {"sessionId": "awp-rpc-session"}})
-os.close(0)
 time.sleep(30)
 "#;
 
@@ -15083,6 +15086,253 @@ async fn rpc_repair_reopen_transport_loss_returns_the_real_error() {
             "b/open|why",
         ],
         "the claim's repair reopen must die on the dead lane: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer with a `{model}` open that accepts everything, logs each
+/// open's and each prompt's resolved model, and serves every prompt —
+/// the alternate a transport failover replays onto.
+#[cfg(unix)]
+const RPC_MODEL_OPEN_PROMPT_LOGS_AND_SERVES: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_model = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        session_model = params.get("model")
+        log.write("b/open|{}\n".format(session_model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model") or session_model
+        log.write("b/prompt|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "peerdefault", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_transport_failover_keeps_the_callers_model() {
+    // `first` parked on the shared claim — the unqualified provider slot
+    // emitted nothing — so no accepted model stands when the primary's
+    // pipe dies. A transport failover replays the caller's explicit
+    // model on the alternate: the parked claim is a default fill the
+    // chain may not promote ahead of a model that was never refused.
+    let dir = TestDirectory::new("rpc-failover-caller-model");
+    let dying = dir.path().join("rpc_die.py");
+    std::fs::write(&dying, RPC_PROVIDER_OPEN_ACCEPTS_THEN_DIES).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "pending",
+        &dying,
+        json!({"provider": "{modelProvider}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let serving = dir.path().join("rpc_serve.py");
+    std::fs::write(&serving, RPC_MODEL_OPEN_PROMPT_LOGS_AND_SERVES).unwrap();
+    let mut alternate = rpc_spec(
+        "serving",
+        &serving,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("pending".to_owned()),
+            model: Some("first".to_owned()),
+            models: Some(vec!["second".to_owned(), "third".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // The caller's model was never refused — only the lane died — so the
+    // replay carries `callers`, not the parked claim the chain would
+    // otherwise promote onto the alternate's per-turn slot.
+    let outcome = session
+        .prompt_with(TurnRequest {
+            text: "work".to_owned(),
+            model: Some("callers".to_owned()),
+            effort: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|callers|work");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["a/open|unset", "b/open|unset", "b/prompt|callers"],
+        "transport failover must not promote a chain entry ahead of the \
+         caller's model: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that logs the first request's method and dies before
+/// answering — a transport loss during the lane's model-free `initialize`
+/// handshake, before the model-carrying `session/open` is ever attempted.
+#[cfg(unix)]
+const RPC_DIES_ON_FIRST_REQUEST: &str = r#"
+import json, os, sys
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+request = json.loads(sys.stdin.readline())
+log.write("b/{}\n".format(request.get("method")))
+log.flush()
+sys.exit(0)
+"#;
+
+/// An rpc peer with a `{modelProvider}`-only open and prompt — a lane
+/// that can carry only `provider/model` candidates — that accepts
+/// everything and serves the bound provider.
+#[cfg(unix)]
+const RPC_PROVIDER_OPEN_PROMPT_LOGS_AND_SERVES: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+session_provider = None
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        session_provider = params.get("provider")
+        log.write("c/open|{}\n".format(session_provider or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        provider = params.get("provider") or session_provider
+        log.write("c/prompt|{}\n".format(params.get("provider") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  provider or "peerdefault", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_unsent_alternate_pick_parks_for_a_later_deliverable_entry() {
+    // `first` parked on the shared claim as in the refused-pick case; a
+    // direct prompt walks to a middle alternate that dies during its
+    // model-free `initialize` — its pick `lone` never reached the wire.
+    // The last lane can carry `vnd/duo` but cannot resolve `lone`
+    // anywhere: the unsent pick parks back into the chain and the next
+    // deliverable entry opens and serves — never the peer's own default
+    // while a deliverable entry stood untried.
+    let dir = TestDirectory::new("rpc-unsent-pick-parks");
+    let dying_primary = dir.path().join("rpc_die_primary.py");
+    std::fs::write(&dying_primary, RPC_PROVIDER_OPEN_ACCEPTS_THEN_DIES).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "pending",
+        &dying_primary,
+        json!({"provider": "{modelProvider}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let dying_middle = dir.path().join("rpc_die_middle.py");
+    std::fs::write(&dying_middle, RPC_DIES_ON_FIRST_REQUEST).unwrap();
+    let mut middle = rpc_spec(
+        "dying-init",
+        &dying_middle,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    let LaneSpec::Rpc(lane) = &mut middle.lane else {
+        panic!("rpc_spec builds an rpc lane")
+    };
+    lane.initialize = Some(RpcCallSpec {
+        method: "initialize".to_owned(),
+        params: json!({}),
+    });
+    attach_call_log(&mut middle, &log);
+    let serving = dir.path().join("rpc_serve.py");
+    std::fs::write(&serving, RPC_PROVIDER_OPEN_PROMPT_LOGS_AND_SERVES).unwrap();
+    let mut last = rpc_spec(
+        "provider-only",
+        &serving,
+        json!({"provider": "{modelProvider}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut last, &log);
+    let mut document = RegistryDocument::default();
+    document.agents.insert(
+        primary.id.clone(),
+        awp::AgentEntry {
+            spec: primary,
+            alternates: vec![middle, last],
+        },
+    );
+    document.profiles.insert(
+        "p".to_owned(),
+        ProfilePatch {
+            agent: Some("pending".to_owned()),
+            model: Some("first".to_owned()),
+            models: Some(vec!["lone".to_owned(), "vnd/duo".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let registry = Registry::from_document(document).unwrap();
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session
+        .prompt_direct(TurnRequest {
+            text: "work".to_owned(),
+            model: None,
+            effort: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|vnd|work");
+    assert_eq!(session.active_model().as_deref(), Some("vnd/duo"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec!["a/open|unset", "b/initialize", "c/open|vnd", "c/prompt|vnd"],
+        "an unsent pick must park for the next deliverable entry: {calls_log}"
     );
     session.close().await.unwrap();
 }

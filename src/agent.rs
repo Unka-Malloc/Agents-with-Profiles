@@ -4652,6 +4652,33 @@ impl VirtualSession {
                             _ => outcome,
                         };
                     };
+                    // A pick scheduled against an earlier lane's slots
+                    // rides the walk only where this lane can carry it:
+                    // opening here unable to deliver it would sit the
+                    // peer on its own default before the entries this
+                    // lane can serve were ever tried. An unsent pick this
+                    // lane can deliver nowhere returns to the chain
+                    // before this lane's selection runs; one the wire
+                    // already carried stays spent.
+                    if !pending_sent {
+                        for slot in [&mut pending_bind, &mut driver_model] {
+                            let undeliverable = slot.as_deref().is_some_and(|candidate| {
+                                !turn_carries_candidate(&spec, candidate)
+                                    && !setup_carries_candidate(
+                                        &spec,
+                                        candidate,
+                                        resuming(&lane.requested),
+                                    )
+                            });
+                            if undeliverable {
+                                let pick = slot.take();
+                                if pending_model == pick {
+                                    pending_model = None;
+                                }
+                                restore_candidate(&model_state, pick);
+                            }
+                        }
+                    }
                     // Nothing scheduled rides this reopen and no accepted
                     // entry stands — the untried chain is what the walk
                     // has left. Move the first entry this lane's own slots
@@ -4659,8 +4686,10 @@ impl VirtualSession {
                     // before opening: the peer's refusal then spends it
                     // instead of leaving it queued for the next retry to
                     // re-pick, and the restore paths return it only while
-                    // no wire carried it.
-                    if pending_bind.is_none() && driver_model.is_none() {
+                    // no wire carried it. An explicit turn model is the
+                    // caller's own: the chain advances only on a verified
+                    // model refusal, never on a lane's transport failure.
+                    if caller_model.is_none() && pending_bind.is_none() && driver_model.is_none() {
                         let mut chain = model_state
                             .lock()
                             .unwrap_or_else(|error| error.into_inner());
@@ -4694,9 +4723,13 @@ impl VirtualSession {
                             // without carry evidence rides the switch
                             // too — the new lane's binding is its next
                             // chance to prove itself. The claim is a
-                            // default: a direct prompt fills none, so it
-                            // stays queued for the next implicit prompt.
-                            record_instructions
+                            // default: a direct prompt fills none, and a
+                            // caller-modelled prompt names its own value —
+                            // the chain may not promote its entries ahead
+                            // of an explicit model that was never refused,
+                            // so it stays queued for the next implicit
+                            // prompt either way.
+                            (record_instructions && caller_model.is_none())
                                 .then(|| {
                                     model_state
                                         .lock()

@@ -362,7 +362,12 @@ impl VirtualAgent {
                         // call, so the refusal is the lane's answer and
                         // the walk moves on.
                         if !refused_call_binds_model(spec, resuming(&lane_request), &probe) {
-                            lane_model = lane_request.config.model.clone().or(lane_model);
+                            lane_model = lane_request
+                                .config
+                                .model
+                                .clone()
+                                .or_else(|| parked_model.clone())
+                                .or(lane_model);
                             lane_error = Some(error);
                             break None;
                         }
@@ -390,8 +395,18 @@ impl VirtualAgent {
                         // carries to the next lane: refused entries
                         // already advanced the request past themselves,
                         // and a lane that never got to express a model
-                        // leaves the cursor untouched.
-                        lane_model = lane_request.config.model.clone().or(lane_model);
+                        // leaves the cursor untouched. An open whose
+                        // model slot could not resolve its candidate
+                        // holds the entry parked outside the slot — it
+                        // is the cursor the walk actually reached, and
+                        // the cleared slot must not read as the refused
+                        // entry before it.
+                        lane_model = lane_request
+                            .config
+                            .model
+                            .clone()
+                            .or_else(|| parked_model.clone())
+                            .or(lane_model);
                         lane_error = Some(error);
                         break None;
                     }
@@ -4324,6 +4339,17 @@ impl VirtualSession {
                     retry_same_lane = false;
                     if !same_lane {
                         candidate += 1;
+                        // Candidates a refusal never saw on the failed
+                        // lane waited outside the retry queue so it could
+                        // not re-select an identical unsent request — the
+                        // search has moved on now: this lane's slots may
+                        // carry what that lane could not, so they
+                        // re-enter the chain before its first setup
+                        // attempt, where a refused open's chain walk can
+                        // reach them.
+                        for held in held_unsent.drain(..).rev() {
+                            restore_candidate(&model_state, Some(held));
+                        }
                     }
                     let Some(spec) = lane.specs.get(candidate).cloned() else {
                         break 'lanes outcome;
@@ -4379,27 +4405,43 @@ impl VirtualSession {
                     // session's persistent model — a refusal must not
                     // leave the refused model installed as the session's
                     // default, ready to send again on the next implicit
-                    // prompt. The stored slot keeps the last accepted
-                    // chain entry. A lane whose establishment call binds
-                    // the model on the wire is an actual open-time
-                    // selector — the candidate's open binding is the
-                    // selector doing its job, and restoring the exhausted
-                    // active entry there would abort the switch on a
-                    // refusal before the candidate could reach the prompt.
-                    // A declared slot that cannot resolve the candidate —
-                    // an unqualified `{modelProvider}` — binds nothing
-                    // either: left stored, every later prompt's `{model}`
-                    // substitution would inherit the unconfirmed claim.
+                    // prompt. A stored-default slot keeps the last
+                    // accepted chain entry. A lane whose establishment
+                    // call binds the model on the wire is an actual
+                    // open-time selector — the candidate's open binding
+                    // is the selector doing its job, and restoring the
+                    // exhausted active entry there would abort the
+                    // switch on a refusal before the candidate could
+                    // reach the prompt. A declared slot that cannot
+                    // resolve the candidate — an unqualified
+                    // `{modelProvider}` — binds nothing either: left
+                    // stored, every later prompt's `{model}` substitution
+                    // would inherit the unconfirmed claim, and filling
+                    // it with the exhausted entry would resolve the
+                    // slot the candidate could not and resend a model
+                    // the chain already spent.
                     if let Some(candidate) = &pending_candidate {
                         if new_open.config.model.as_deref() == Some(candidate.as_str())
                             && turn_binds_model(&spec)
                             && !setup_carries_model(&spec, &new_open)
                         {
-                            new_open.config.model = model_state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .active
-                                .clone();
+                            // The open's declared slots exist but this
+                            // candidate resolves none of them — the
+                            // slot stays empty rather than carrying the
+                            // exhausted entry onto the wire. Where the
+                            // lane's establishment binds nothing at all
+                            // the slot is only a stored default, and it
+                            // keeps the last accepted entry.
+                            new_open.config.model =
+                                if model_binds_at_open(&spec, resuming(&new_open)) {
+                                    None
+                                } else {
+                                    model_state
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .active
+                                        .clone()
+                                };
                             turn_model = Some(candidate.clone());
                         }
                     }

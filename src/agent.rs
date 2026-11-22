@@ -1218,6 +1218,10 @@ struct DispatchProbe {
     result_selector: Option<String>,
     result_selector_field: Option<String>,
     result_path: Option<String>,
+    /// A cli lane's declared session-id carrier (`session_id_path`): a
+    /// record whose only claim is that value is the session's own init
+    /// marker — bookkeeping, not turn output.
+    session_id_path: Option<String>,
     /// A cli lane's raw stream records are the records themselves — the
     /// lane's own selectors read the full NDJSON document, not a
     /// `params` member inside it.
@@ -1377,6 +1381,7 @@ impl DispatchProbe {
             result_selector: None,
             result_selector_field: None,
             result_path: None,
+            session_id_path: None,
             cli: false,
             json_lines: false,
             overwritten: std::collections::BTreeSet::new(),
@@ -1426,6 +1431,7 @@ impl DispatchProbe {
             probe.result_selector = cli.result_selector.clone();
             probe.result_selector_field = cli.result_selector_field.clone();
             probe.result_path = cli.result_path.clone();
+            probe.session_id_path = cli.session_id_path.clone();
             probe.cli = true;
             probe.json_lines = cli.json_lines;
         }
@@ -1990,17 +1996,18 @@ impl DispatchProbe {
     }
 
     /// Whether a raw record's only evidence claim is bookkeeping — a
-    /// usage document, or an empty result at the lane's declared result
-    /// position — versus genuine turn progress. The lane's own
+    /// usage document, an empty result at the lane's declared result
+    /// position, or the session binding at its declared `session_id_path`
+    /// — versus genuine turn progress. The lane's own
     /// selection leads: a record matching the declared result selector
     /// is bookkeeping exactly when its result text is empty, regardless
     /// of a usage claim beside it. Every other record is bookkeeping
-    /// only when a usage document is its whole claim — one that also
-    /// carries progress text is real output even with all-zero
-    /// counters, and one carrying no usage at all is progress by
-    /// default. The declared `usage_path` leads; the conventional
-    /// `usage` / `message.usage` positions follow, resolved where
-    /// `billable_raw` reads the record.
+    /// only when a usage document or a session-init marker is its whole
+    /// claim — one that also carries progress text is real output even
+    /// with all-zero counters, and one carrying no usage at all is
+    /// progress by default. The declared `usage_path` leads; the
+    /// conventional `usage` / `message.usage` positions follow, resolved
+    /// where `billable_raw` reads the record.
     fn bookkeeping_raw(&self, raw: &serde_json::Value) -> bool {
         let root = if self.cli {
             raw
@@ -2017,13 +2024,24 @@ impl DispatchProbe {
                     .is_none_or(|text| text.trim().is_empty());
             }
         }
-        self.usage_path
+        // A session-init record is bookkeeping the same way a usage-only
+        // record is: its whole claim is the session binding the lane's
+        // declared `session_id_path` reads. A record that also carries
+        // progress text or a usage document still counts on its own
+        // merits — the init marker does not launder real output.
+        let session_init = self.session_id_path.as_deref().is_some_and(|path| {
+            extract_path(root, path)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+        });
+        let usage_only = self
+            .usage_path
             .as_deref()
             .and_then(|path| extract_path(root, path))
             .or_else(|| root.get("usage"))
             .or_else(|| extract_path(root, "message.usage"))
-            .is_some_and(|usage| usage.is_object())
-            && !record_progress(root)
+            .is_some_and(|usage| usage.is_object());
+        (usage_only || session_init) && !record_progress(root)
     }
 
     /// Whether a synchronous prompt response's payload proves billed
@@ -4565,11 +4583,78 @@ impl VirtualSession {
                         // A refusal the wire attributes to a model-free
                         // pre-turn call is no model answer at all: it is
                         // the lane's, and the lane-fallback rule below
-                        // applies.
+                        // applies. The chain is only exhausted once every
+                        // entry was tried: candidates this lane could
+                        // deliver nowhere — still queued behind its pick,
+                        // held out of its retry walk, or parked on the
+                        // shared claim — were never refused, so a later
+                        // lane's slots may still carry them and the refusal
+                        // stands only as this lane's answer. Billable
+                        // evidence stays decisive: a possibly paid turn
+                        // never replays.
                         Err(error)
                             if model_failure(error) && turn_refusal_binds_model(error, &probe) =>
                         {
-                            break 'lanes outcome
+                            // The entry the peer could actually refuse:
+                            // the candidate the refused turn call carried
+                            // on the wire, or — for a model-free call —
+                            // the session model a setup call bound. A
+                            // refusal from a lane whose wire never
+                            // carried a model answers no chain entry:
+                            // masked slots and absent resolutions are
+                            // scaffolding, not a model the peer saw.
+                            let refused = if probe.prompt_model_sent() || probe.turn_model_sent() {
+                                request
+                                    .model
+                                    .clone()
+                                    .or_else(|| installed_open.config.model.clone())
+                            } else if probe.model_setup_sent() {
+                                installed_open.config.model.clone()
+                            } else {
+                                None
+                            };
+                            // The chain is only exhausted once every
+                            // entry was tried: candidates this lane could
+                            // deliver nowhere — still queued behind its
+                            // pick, held out of its retry walk, or parked
+                            // on the shared claim — were never refused,
+                            // so a later lane's slots may still carry
+                            // them and the refusal stands only as this
+                            // lane's answer. Billable evidence stays
+                            // decisive: a possibly paid turn never
+                            // replays.
+                            let untried = !held_unsent.is_empty() || {
+                                let chain = model_state
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                !chain.remaining.is_empty()
+                                    || (chain.active.is_some() && chain.active != refused)
+                                    || (record_instructions
+                                        && chain.pending.is_some()
+                                        && chain.pending != refused)
+                            };
+                            if emitted_billable || probe.wire_billable() || !untried {
+                                break 'lanes outcome;
+                            }
+                            // The refused entry is spent wherever the
+                            // chain holds it — the same rule a refused
+                            // open applies. Left `active`, the walk's
+                            // untried pick could never run and the next
+                            // lane would re-open on the model the peer
+                            // just refused; left pending, the claim would
+                            // keep a refused entry queued.
+                            {
+                                let mut chain = model_state
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if chain.active == refused {
+                                    chain.active = None;
+                                }
+                                if chain.pending == refused {
+                                    chain.pending = None;
+                                }
+                            }
+                            true
                         }
                         // A lane failure after streamed text or billable usage
                         // may already have produced paid output — replaying it

@@ -7636,6 +7636,50 @@ async fn cli_progress_with_zero_usage_never_replays_on_alternate_lane() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cli_session_init_record_does_not_suppress_fallback() {
+    // A json_lines lane that emits only its session-init record and exits
+    // non-zero did no served work: the record's only claim is the session
+    // binding at the lane's declared `session_id_path` — bookkeeping, not
+    // turn output. The alternate must serve the turn, exactly as it does
+    // when the primary emits no record at all.
+    let mut primary = cli_spec(
+        "init-only",
+        "sh",
+        &[
+            "-c",
+            "exec 0<&-; \
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-1\"}'; \
+             exit 7",
+        ],
+        PromptChannel::Stdin,
+    );
+    let LaneSpec::Cli(lane) = &mut primary.lane else {
+        panic!("cli_spec builds a cli lane")
+    };
+    lane.json_lines = true;
+    lane.session_id_path = Some("session_id".to_owned());
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("init-only".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn cli_quota_refusal_advances_the_model_chain() {
     // A stderr-only quota refusal is a certain-effect admission
     // rejection: nothing ran, so the turn retries the chain's next entry
@@ -7816,8 +7860,9 @@ async fn rpc_inline_overwritten_model_slot_never_retries_the_exchange() {
     // The only `{model}` position in `session/open` sits under `id` —
     // the inline envelope stamps its request id over the merged params,
     // so the model never reaches the wire and no chain entry could
-    // change the call's answer. The refusal must propagate after one
-    // identical exchange, not reopen for a second.
+    // change the call's answer. The refusal is this lane's answer, not a
+    // model verdict: the turn replays on the alternate — but only after
+    // one identical exchange, never a reopened second.
     let dir = TestDirectory::new("rpc-inline-masked-model");
     let script = dir.path().join("rpc_inline_masked.py");
     std::fs::write(&script, RPC_INLINE_PROMPT_QUOTA).unwrap();
@@ -7857,8 +7902,8 @@ async fn rpc_inline_overwritten_model_slot_never_retries_the_exchange() {
         .await
         .unwrap();
 
-    let error = session.prompt("work".to_owned()).await.unwrap_err();
-    assert_eq!(error.code, "agent_quota_exhausted");
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
     let calls_log = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
         calls_log.lines().collect::<Vec<_>>(),
@@ -8999,8 +9044,9 @@ async fn rpc_inline_overwritten_turn_slot_never_retries_the_exchange() {
     // The prompt's only `{model}` position sits under `id` — the inline
     // envelope stamps the request id over the merged params, so the
     // model never reaches the wire and no chain entry could change the
-    // answer. The refusal must propagate after one identical exchange,
-    // not exhaust candidates on a model-free payload.
+    // answer. The refusal is this lane's answer: the turn replays on the
+    // alternate — but only after one identical exchange, never a second
+    // try on the same model-free payload.
     let dir = TestDirectory::new("rpc-inline-masked-turn");
     let script = dir.path().join("rpc_inline_masked.py");
     std::fs::write(&script, RPC_INLINE_PROMPT_QUOTA).unwrap();
@@ -9040,8 +9086,8 @@ async fn rpc_inline_overwritten_turn_slot_never_retries_the_exchange() {
         .await
         .unwrap();
 
-    let error = session.prompt("work".to_owned()).await.unwrap_err();
-    assert_eq!(error.code, "agent_quota_exhausted");
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "alt|work");
     let calls_log = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
         calls_log.lines().collect::<Vec<_>>(),
@@ -11042,7 +11088,8 @@ async fn rpc_model_free_refusal_keeps_the_unsent_candidate() {
     // that resolves absent on an unqualified model: the replayed prompt
     // is model-free, so its quota refusal is the lane's answer — never
     // proof the peer refused `fallback`. The shared pending claim must
-    // survive for a lane that can actually carry it.
+    // survive for a lane that can actually carry it — and the walk
+    // reaches that lane inside the same turn.
     let dir = TestDirectory::new("rpc-model-free-refusal");
     let dying = dir.path().join("rpc_close.py");
     std::fs::write(&dying, RPC_PROVIDER_OPEN_THEN_CLOSES_STDIN).unwrap();
@@ -11099,13 +11146,14 @@ async fn rpc_model_free_refusal_keeps_the_unsent_candidate() {
 
     // The replayed prompt is model-free — the candidate's
     // `{modelProvider}` resolves absent — so the refusal cannot spend a
-    // claim the peer never saw.
-    let error = session.prompt("work".to_owned()).await.unwrap_err();
-    assert_eq!(error.code, "agent_quota_exhausted");
+    // claim the peer never saw: the lane answer walks the surviving
+    // claim to the third lane, whose open and prompt carry `fallback`
+    // to a peer that serves it in the same turn.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
 
-    // The alternate is dead on the next write: the lane switch still
-    // rides the surviving pending claim, and the third lane's open and
-    // prompt finally carry `fallback` to a peer that serves it.
+    // The bound session keeps serving the model it accepted.
     let outcome = session.prompt("again".to_owned()).await.unwrap();
     assert_eq!(outcome.text.trim_end(), "served|fallback|again");
     assert_eq!(session.active_model().as_deref(), Some("fallback"));
@@ -11118,6 +11166,7 @@ async fn rpc_model_free_refusal_keeps_the_unsent_candidate() {
             "alt/open|unset",
             "alt/prompt|unset",
             "third/open|fallback",
+            "third/prompt|fallback",
             "third/prompt|fallback",
         ],
         "an unsent candidate must survive a model-free refusal: {calls_log}"
@@ -12159,12 +12208,11 @@ async fn rpc_unsent_retry_candidate_survives_the_turn() {
     // wire and the peer refuses it: the per-turn retry schedules
     // `fallback` — but the lane's only slot on either surface is an
     // unqualified `{modelProvider}` and `fallback` has no provider
-    // part, so the retry sends no selector at all. The refusal keeps
-    // the model reading — a prompt refusal answers the model — so the
-    // chain exhausts on this lane and the turn fails, with the unsent
-    // candidate held only in the shared claim. It must survive the
-    // turn: the peer then closes its stdin, so the next prompt's dead
-    // pipe walks to a lane that can carry it.
+    // part, so the retry sends no selector at all. The refusal is this
+    // lane's answer, not the chain's: the unsent candidate was never
+    // refused, so the walk must keep it and reach the alternate whose
+    // `{model}` slots carry it — open and prompt alike — inside the
+    // same turn.
     let dir = TestDirectory::new("rpc-unsent-candidate");
     let script = dir.path().join("rpc_refuse.py");
     std::fs::write(&script, RPC_PRIMARY_OPEN_PROVIDER_REFUSES_PROMPTS).unwrap();
@@ -12203,28 +12251,20 @@ async fn rpc_unsent_retry_candidate_survives_the_turn() {
         .unwrap();
 
     // The explicit model's refusal schedules `fallback`; the retry's
-    // unqualified slot drops it from the frame, and `pending_model` is
-    // already taken while `remaining` is empty — the candidate exists
-    // only in turn-local state and must not disappear with the turn.
-    let error = session
+    // unqualified slot drops it from the frame, and `remaining` is
+    // empty — the candidate exists only in the awaiting claim, so the
+    // walk must carry it to the alternate instead of ending the turn.
+    let outcome = session
         .prompt_with(TurnRequest {
             text: "work".to_owned(),
             model: Some("vnd/prime".to_owned()),
             effort: None,
         })
         .await
-        .unwrap_err();
-    assert_eq!(error.code, "agent_quota_exhausted");
-
-    // The preserved candidate rides the next implicit prompt: the
-    // primary's pipe is dead for writes now, so the lane walk opens the
-    // alternate with `fallback` and its prompt carries it to a peer
-    // that serves it.
-    let outcome = session.prompt("again".to_owned()).await;
-    let calls_log = std::fs::read_to_string(&log).unwrap();
-    let outcome = outcome.unwrap_or_else(|error| panic!("again failed {error:?}: {calls_log}"));
-    assert_eq!(outcome.text.trim_end(), "served|fallback|again");
+        .unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|work");
     assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
         calls_log.lines().collect::<Vec<_>>(),
         vec![
@@ -12234,7 +12274,7 @@ async fn rpc_unsent_retry_candidate_survives_the_turn() {
             "alt/open|fallback",
             "alt/prompt|fallback",
         ],
-        "an unsent scheduled candidate must survive the turn: {calls_log}"
+        "an unsent scheduled candidate must survive the walk: {calls_log}"
     );
     session.close().await.unwrap();
 }
@@ -13529,12 +13569,14 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
 "#;
 
-/// An rpc peer that logs each open's model, refuses `vnd/prime` at
-/// `session/open`, and serves everything else — the alternate a failed
-/// lane's setup walk retries on.
+/// An rpc peer with a `{modelProvider}` open that accepts everything
+/// and answers its first `session/prompt` — stdin already closed, so
+/// the next write lands on a dead pipe: the lane that parks an
+/// unqualified candidate as a stored claim while it still serves, then
+/// dies for the turn after.
 #[cfg(unix)]
-const RPC_ALT_OPEN_REFUSES_PRIME_MODEL_PROMPT_SERVES: &str = r#"
-import json, os, sys
+const RPC_PROVIDER_OPEN_SERVES_FIRST_THEN_DIES: &str = r#"
+import json, os, sys, time
 
 def send(value):
     sys.stdout.write(json.dumps(value) + "\n")
@@ -13550,23 +13592,21 @@ for line in sys.stdin:
     request_id = request.get("id")
     params = request.get("params") or {}
     if method == "session/open":
-        model = params.get("model")
-        log.write("alt/open|{}\n".format(model or "unset"))
-        log.flush()
-        if model == "vnd/prime":
-            send({"jsonrpc": "2.0", "id": request_id,
-                  "error": {"code": -32000, "message":
-                            "resource_exhausted: quota exceeded for this model"}})
-        else:
-            send({"jsonrpc": "2.0", "id": request_id,
-                  "result": {"sessionId": "awp-rpc-session"}})
-    elif method == "session/prompt":
-        model = params.get("model")
-        log.write("alt/prompt|{}\n".format(model or "unset"))
+        log.write("alt/open|{}\n".format(params.get("provider") or "unset"))
         log.flush()
         send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("alt/prompt|{}\n".format(params.get("provider") or "unset"))
+        log.flush()
+        # stdin is closed before the answer flushes, so the next write
+        # is guaranteed to land on a dead pipe
+        os.close(0)
+        send({"jsonrpc": "2.0", "id": request_id,
               "result": {"text": "served|{}|{}".format(
-                  model or "peerdefault", params.get("text", ""))}})
+                  params.get("provider") or "peerdefault",
+                  params.get("text", ""))}})
+        time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
 "#;
@@ -13575,11 +13615,14 @@ for line in sys.stdin:
 #[tokio::test]
 async fn rpc_direct_prompt_never_spends_the_pending_claim() {
     // `vnd/prime` binds the primary's open; two prompt refusals spend it
-    // and park the unqualified `fallback` on the shared pending claim,
-    // then the lane dies. A `prompt_direct` whose replacement open
-    // exhausts the retry queue must not consume the claim — it fills no
-    // defaults — so the walk reports exhaustion instead of binding
-    // `fallback` for a turn it was never queued for.
+    // and park the unqualified `fallback` on the shared pending claim —
+    // the `{modelProvider}` prompt emits it absent — then the refusal
+    // walks to an alternate whose provider-only slots can likewise only
+    // park it: the model-free serve answers the turn with the claim
+    // still queued. A `prompt_direct` fills no defaults — the dead pipe
+    // carries it to the third lane, which opens and serves model-free —
+    // so the claim rides the next implicit prompt to a lane that can
+    // finally carry it.
     let dir = TestDirectory::new("rpc-direct-pending-walk");
     let dying = dir.path().join("rpc_die.py");
     std::fs::write(&dying, RPC_PROVIDER_OPEN_REFUSES_TWO_PROMPTS_THEN_DIES).unwrap();
@@ -13591,18 +13634,34 @@ async fn rpc_direct_prompt_never_spends_the_pending_claim() {
         json!({"provider": "{modelProvider}", "text": "{prompt}"}),
     );
     attach_call_log(&mut primary, &log);
-    let refusing = dir.path().join("rpc_refuse.py");
-    std::fs::write(&refusing, RPC_ALT_OPEN_REFUSES_PRIME_MODEL_PROMPT_SERVES).unwrap();
+    let parking = dir.path().join("rpc_park.py");
+    std::fs::write(&parking, RPC_PROVIDER_OPEN_SERVES_FIRST_THEN_DIES).unwrap();
     let mut alternate = rpc_spec(
-        "serving",
-        &refusing,
-        json!({"model": "{model}"}),
-        json!({"text": "{prompt}", "model": "{model}"}),
+        "parking",
+        &parking,
+        json!({"provider": "{modelProvider}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
     );
     attach_call_log(&mut alternate, &log);
-    let registry = registry_with_lanes(
-        primary,
-        alternate,
+    let serving = dir.path().join("rpc_serve.py");
+    std::fs::write(&serving, RPC_LOGGED_MODEL_SERVE_THIRD).unwrap();
+    let mut third = rpc_spec(
+        "serving",
+        &serving,
+        json!({"provider": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut third, &log);
+    let mut document = RegistryDocument::default();
+    document.agents.insert(
+        primary.id.clone(),
+        awp::AgentEntry {
+            spec: primary,
+            alternates: vec![alternate, third],
+        },
+    );
+    document.profiles.insert(
+        "p".to_owned(),
         ProfilePatch {
             agent: Some("pending".to_owned()),
             model: Some("vnd/prime".to_owned()),
@@ -13610,6 +13669,7 @@ async fn rpc_direct_prompt_never_spends_the_pending_claim() {
             ..Default::default()
         },
     );
+    let registry = Registry::from_document(document).unwrap();
     let agent = registry.resolve("p").unwrap();
     let (tx, _rx) = events();
     let session = agent
@@ -13617,25 +13677,27 @@ async fn rpc_direct_prompt_never_spends_the_pending_claim() {
         .await
         .unwrap();
 
-    // The implicit prompt spends `vnd/prime` and parks `fallback` on the
-    // shared claim before the lane dies.
-    let error = session.prompt("work".to_owned()).await.unwrap_err();
-    assert_eq!(error.code, "agent_quota_exhausted");
+    // The walk past the spent `vnd/prime` can only park `fallback` on
+    // the alternate's absent provider slot: the model-free serve ends
+    // the turn with the claim intact.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|peerdefault|work");
 
-    // The direct turn's replacement open is refused and the queued claim
-    // is not its to spend: exhaustion answers it.
-    let error = session
+    // The direct turn's replay lands on the third lane: no default to
+    // fill, so the open and the prompt both carry nothing — the claim
+    // is not its to spend.
+    let outcome = session
         .prompt_direct(TurnRequest {
             text: "raw".to_owned(),
             model: None,
             effort: None,
         })
         .await
-        .unwrap_err();
-    assert_eq!(error.code, "agent_quota_exhausted");
+        .unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|unset|raw");
 
-    // The claim a direct turn never consumed still rides the next
-    // implicit prompt — the alternate's open and prompt carry it.
+    // The claim a direct turn never consumed rides the next implicit
+    // prompt — the third lane's prompt carries it at last.
     let outcome = session.prompt("again".to_owned()).await.unwrap();
     assert_eq!(outcome.text.trim_end(), "served|fallback|again");
     assert_eq!(session.active_model().as_deref(), Some("fallback"));
@@ -13646,9 +13708,11 @@ async fn rpc_direct_prompt_never_spends_the_pending_claim() {
             "primary/open|vnd",
             "primary/prompt|vnd",
             "primary/prompt|unset",
-            "alt/open|vnd/prime",
-            "alt/open|fallback",
-            "alt/prompt|fallback",
+            "alt/open|unset",
+            "alt/prompt|unset",
+            "third/open|unset",
+            "third/prompt|unset",
+            "third/prompt|fallback",
         ],
         "a direct prompt must not consume the queued claim: {calls_log}"
     );
@@ -14554,6 +14618,72 @@ async fn rpc_lane_fallback_tries_the_held_candidates() {
     session.close().await.unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_prompt_refusal_walks_the_untried_candidate_to_the_alternate() {
+    // The setup-only primary binds `vendor/prime` through `{modelProvider}`
+    // and its model-free prompt is refused: the unqualified `backup`
+    // resolves no slot on this lane, so it stays queued untried — never
+    // refused. The refusal is this lane's answer, not the chain's: the
+    // walk must preserve `backup` and reach the `{model}` alternate,
+    // which binds it at open and serves the replay.
+    let dir = TestDirectory::new("rpc-untried-lane-fallback");
+    let refusing = dir.path().join("rpc_refusing.py");
+    std::fs::write(&refusing, RPC_PROVIDER_OPEN_ACCEPTS_PROMPTS_REFUSE_THEN_DIE).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "setuponly",
+        &refusing,
+        json!({"provider": "{modelProvider}"}),
+        json!({"text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let serving = dir.path().join("rpc_serving.py");
+    std::fs::write(&serving, RPC_MODEL_OPEN_ACCEPTS_ALL_PROMPT_ECHOES).unwrap();
+    let mut alternate = rpc_spec(
+        "carrying",
+        &serving,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("setuponly".to_owned()),
+            model: Some("vendor/prime".to_owned()),
+            models: Some(vec!["backup".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // `vendor/prime` refused on the bound prompt, `backup` untried behind
+    // it — the alternate carries the candidate the primary could not.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|backup|work");
+    assert_eq!(session.active_model().as_deref(), Some("backup"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "a/open|vendor",
+            "a/prompt|unset",
+            "c/open|backup",
+            "c/prompt|backup",
+        ],
+        "an untried candidate must follow the walk to a carrying lane: \
+         {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
 /// An rpc peer with a `{modelProvider}`-only open that accepts
 /// everything and refuses its first three prompts, then closes stdin so
 /// the next write lands on a dead pipe — the lane whose death carries
@@ -14648,13 +14778,14 @@ for line in sys.stdin:
 async fn rpc_setup_only_lane_delivers_the_queued_claim() {
     // `vnd/prime` binds the primary's open; prompt refusals park the
     // unqualified `why` on the shared pending claim — the
-    // `{modelProvider}` prompt emits it absent — before the lane dies.
-    // The direct retry installs the setup-only alternate: `vnd/prime`
-    // is refused at its open, `zee` binds and serves, and `why` —
-    // never this turn's to spend — stays queued. The lane has no turn
-    // selector, so the next implicit prompt would answer on `zee`
-    // forever and leave the claim queued: the session must first
-    // re-establish bound to `why`, whose setup slot can carry it.
+    // `{modelProvider}` prompt emits it absent — while `zee` waits
+    // held behind it. The refusal is this lane's answer: the walk
+    // installs the setup-only alternate inside the direct turn, where
+    // `zee` binds and serves — and a direct turn fills no defaults, so
+    // the claim stays queued. The lane has no turn selector, so the
+    // next implicit prompt would answer on `zee` forever and leave the
+    // claim queued: the session must first re-establish bound to
+    // `why`, whose setup slot can carry it.
     let dir = TestDirectory::new("rpc-setup-only-claim");
     let dying = dir.path().join("rpc_die.py");
     std::fs::write(&dying, RPC_PROVIDER_OPEN_ACCEPTS_PROMPTS_REFUSE_THEN_DIE).unwrap();
@@ -14696,15 +14827,11 @@ async fn rpc_setup_only_lane_delivers_the_queued_claim() {
         .await
         .unwrap();
 
-    // The implicit prompt spends `vnd/prime` and parks `why` on the
-    // shared claim — refused while the wire never carried it — with
-    // `zee` untouched behind it before the lane's stdin dies.
-    let error = session.prompt("work".to_owned()).await.unwrap_err();
-    assert_eq!(error.code, "agent_quota_exhausted");
-
-    // The direct turn retries on the setup-only alternate: `vnd/prime`
-    // is refused at the open, `zee` binds the replacement and serves —
-    // and `why` was never this turn's to spend: the claim survives.
+    // The direct turn spends `vnd/prime` and parks `why` on the shared
+    // claim — refused while the wire never carried it — with `zee`
+    // held behind it: the walk binds `zee` on the setup-only alternate
+    // and serves, and the claim a direct turn never consumed stays
+    // queued.
     let outcome = session
         .prompt_direct(TurnRequest {
             text: "raw".to_owned(),
@@ -14730,7 +14857,6 @@ async fn rpc_setup_only_lane_delivers_the_queued_claim() {
             "a/prompt|vnd",
             "a/prompt|unset",
             "a/prompt|unset",
-            "b/open|vnd/prime",
             "b/open|zee",
             "b/prompt",
             "b/open|why",
@@ -15066,18 +15192,16 @@ async fn rpc_repair_reopen_transport_loss_returns_the_real_error() {
 
     // Same parked walk as the queued-claim case: `why` waits on the
     // shared claim while `zee` binds the setup-only alternate and
-    // serves the direct retry — the alternate's stdin then dies.
-    let error = session.prompt("work".to_owned()).await.unwrap_err();
-    assert_eq!(error.code, "agent_quota_exhausted");
+    // serves the direct turn — the alternate's stdin then dies.
     let outcome = session
         .prompt_direct(TurnRequest {
-            text: "raw".to_owned(),
+            text: "work".to_owned(),
             model: None,
             effort: None,
         })
         .await
         .unwrap();
-    assert_eq!(outcome.text.trim_end(), "served|zee|raw");
+    assert_eq!(outcome.text.trim_end(), "served|zee|work");
 
     // The implicit prompt enters repair for the claim: the same-lane
     // reopen loses its transport mid-open and no alternate remains, so
@@ -15093,7 +15217,6 @@ async fn rpc_repair_reopen_transport_loss_returns_the_real_error() {
             "a/prompt|vnd",
             "a/prompt|unset",
             "a/prompt|unset",
-            "b/open|vnd/prime",
             "b/open|zee",
             "b/prompt",
             "b/open|why",

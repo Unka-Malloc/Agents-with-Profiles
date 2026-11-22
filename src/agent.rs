@@ -312,9 +312,36 @@ impl VirtualAgent {
         // alternate resumes with the entry the previous lane was
         // attempting — never the chain head it already proved refused.
         let mut lane_model = chain.first().cloned();
+        // Entries a lane's open refused — provider-side refusals stay
+        // spent for every later lane: once held entries can rewind the
+        // walk behind the cursor, the cursor alone cannot express them.
+        let mut spent: Vec<String> = Vec::new();
+        // Entries a lane could not deliver at all — no setup call binds
+        // them and no turn slot resolves them — held out of that lane's
+        // walk. They re-enter in chain order on the next lane, and
+        // survive into the session's `remaining` for a later lane or
+        // turn.
+        let mut held: Vec<String> = Vec::new();
         for (lane_index, spec) in self.specs.iter().enumerate() {
+            // Entries a previous lane held as undeliverable re-enter this
+            // lane's walk at their chain position — its slots may resolve
+            // what theirs could not.
+            if let Some(earliest) = held.first().cloned() {
+                lane_model = Some(earliest);
+                held.clear();
+            }
+            // A cursor left on an entry the peer already refused never
+            // re-projects: refused candidates stay spent on every later
+            // lane.
+            while lane_model
+                .as_deref()
+                .is_some_and(|entry| spent.iter().any(|refused| refused == entry))
+            {
+                lane_model = next_model(&chain, lane_model.as_deref());
+            }
             let (mut lane_request, turn_model_default, turn_effort_default) =
                 lane_open(spec, &request, &self.profile, lane_model.clone());
+            let lane_resuming = resuming(&lane_request);
             // The candidate an open could not bind — every declared slot
             // resolved its value absent — parked aside for the pending
             // claim below. Leaving it in `config.model` would store it
@@ -375,18 +402,45 @@ impl VirtualAgent {
                         // carried this candidate — the entry is spent:
                         // refused candidates never publish as the
                         // session's model and the chain moves on.
+                        if let Some(refused) = lane_request.config.model.clone() {
+                            if !spent.iter().any(|entry| entry == &refused) {
+                                spent.push(refused);
+                            }
+                        }
                         if lane_request.config.model == request.config.model {
                             // The caller's explicit model was just refused:
                             // later lanes project the advanced cursor —
                             // never the refused original value.
                             request.config.model = None;
                         }
-                        let Some(next) = next_model(&chain, lane_request.config.model.as_deref())
-                        else {
-                            // Model exhaustion is provider-side: remaining
-                            // lanes answer from the same account, so the
-                            // failure belongs to the caller's next profile.
-                            return Err(error);
+                        // The entry replacing it must be one this lane
+                        // can deliver: an unqualified fallback on a
+                        // provider-only lane would open with a model-free
+                        // request the peer accepts on its own default
+                        // while the entries behind it were never tried —
+                        // hold it out and walk on.
+                        let Some(next) = next_deliverable(
+                            &chain,
+                            lane_request.config.model.as_deref(),
+                            spec,
+                            lane_resuming,
+                            &spent,
+                            &mut held,
+                        ) else {
+                            // Model exhaustion is provider-side only once
+                            // the chain is fully spent — every entry
+                            // refused. Entries merely held out of this
+                            // lane stay in the walk: the next chain entry
+                            // parks pending and the model-free open
+                            // leaves the peer on its own default until a
+                            // lane or turn can carry the claim.
+                            match held.first().cloned() {
+                                Some(parked) => {
+                                    lane_request.config.model = Some(parked);
+                                    continue;
+                                }
+                                None => return Err(error),
+                            }
                         };
                         lane_request.config.model = Some(next);
                     }
@@ -442,8 +496,11 @@ impl VirtualAgent {
                     effective_request.config.model.clone().or(parked_model),
                 )
             };
-            let remaining_models =
-                remaining_models(&chain, pending_model.as_deref().or(active_model.as_deref()));
+            let remaining_models = remaining_models(
+                &chain,
+                pending_model.as_deref().or(active_model.as_deref()),
+                &spent,
+            );
             return Ok(VirtualSession {
                 session: Arc::new(tokio::sync::RwLock::new(session)),
                 profile: self.profile.clone(),
@@ -558,13 +615,19 @@ struct ModelChain {
     remaining: Vec<String>,
 }
 
-/// Chain entries that remain after `active` — every entry once `active` is
-/// not part of the chain.
-fn remaining_models(chain: &[String], active: Option<&str>) -> Vec<String> {
-    match active.and_then(|value| chain.iter().position(|entry| entry == value)) {
-        Some(index) => chain[index + 1..].to_vec(),
-        None => chain.to_vec(),
-    }
+/// Chain entries still eligible once `published` is out — every entry
+/// the peer never refused and the session did not publish, in chain
+/// order. Entries an establishment walk held as undeliverable on the
+/// serving lane stay eligible: a later lane or turn may still carry
+/// them.
+fn remaining_models(chain: &[String], published: Option<&str>, spent: &[String]) -> Vec<String> {
+    chain
+        .iter()
+        .filter(|entry| {
+            Some(entry.as_str()) != published && !spent.iter().any(|refused| refused == *entry)
+        })
+        .cloned()
+        .collect()
 }
 
 /// The next chain entry after `current`, or the chain head when `current`
@@ -573,6 +636,38 @@ fn next_model(chain: &[String], current: Option<&str>) -> Option<String> {
     match current.and_then(|value| chain.iter().position(|entry| entry == value)) {
         Some(index) => chain.get(index + 1).cloned(),
         None => chain.first().cloned(),
+    }
+}
+
+/// The next chain entry after `current` this lane can actually deliver —
+/// one a setup call binds or a turn slot resolves. Entries the peer
+/// already refused stay spent; entries this lane can carry nowhere are
+/// held out for a later lane or turn rather than opening a model-free
+/// request the peer accepts on its own default while the entries
+/// behind them were never tried.
+fn next_deliverable(
+    chain: &[String],
+    current: Option<&str>,
+    spec: &AgentSpec,
+    resuming: bool,
+    spent: &[String],
+    held: &mut Vec<String>,
+) -> Option<String> {
+    let mut cursor = current.map(str::to_owned);
+    loop {
+        let candidate = next_model(chain, cursor.as_deref())?;
+        cursor = Some(candidate.clone());
+        if spent.iter().any(|entry| entry == &candidate) {
+            continue;
+        }
+        if setup_carries_candidate(spec, &candidate, resuming)
+            || turn_carries_candidate(spec, &candidate)
+        {
+            return Some(candidate);
+        }
+        if !held.iter().any(|entry| entry == &candidate) {
+            held.push(candidate);
+        }
     }
 }
 
@@ -3427,6 +3522,26 @@ fn turn_binds_model(spec: &AgentSpec) -> bool {
     }
 }
 
+/// Whether this lane's per-turn surface can put `model` on the wire —
+/// `turn_binds_model`'s effective-slot read narrowed by the value's own
+/// resolution, the way `setup_carries_candidate` narrows
+/// `model_binds_at_open`: a `{modelProvider}`-only prompt emits nothing
+/// for an unqualified candidate, so scheduling a retry for it resubmits
+/// the identical model-free request and the peer serves its own
+/// default while the entries behind it were never tried.
+fn turn_carries_candidate(spec: &AgentSpec, model: &str) -> bool {
+    match &spec.lane {
+        LaneSpec::Rpc(rpc) => {
+            rpc_call_carries_model(rpc, &rpc.prompt, model)
+                || rpc
+                    .pre_turn
+                    .iter()
+                    .any(|call| rpc_call_carries_model(rpc, call, model))
+        }
+        _ => spec.selector_support(SelectorPhase::Turn).model != SelectorSupport::Unsupported,
+    }
+}
+
 /// Whether the call an open-stage model refusal answers carried the
 /// model. Rpc reports every setup failure as `rpc/call`, so the wire
 /// journal names the refused call by its request id: only a refusal
@@ -4034,8 +4149,17 @@ impl VirtualSession {
                             let mut chain = model_state
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
+                            // The claim is a default fill: when the
+                            // confirmed entry is not the claim itself —
+                            // a candidate a direct retry carried and the
+                            // queued default it never used — the claim
+                            // stays parked for the next implicit prompt.
+                            let claim_confirmed =
+                                chain.pending.as_deref() == Some(accepted.as_str());
                             chain.active = Some(accepted);
-                            chain.pending = None;
+                            if record_instructions || claim_confirmed {
+                                chain.pending = None;
+                            }
                         } else if serving_sent
                             && matches!(&outcome, Err(error)
                                 if model_failure(error)
@@ -4147,32 +4271,50 @@ impl VirtualSession {
                             let mut chain = model_state
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
-                            // A lane with no per-turn surface retries by
-                            // re-establishing its session — but only a
-                            // candidate a setup call can actually carry
-                            // binds anything: an unqualified entry on a
-                            // provider-only lane would reopen with the
-                            // identical model-free request forever. Hold
+                            // Prefer the first entry this lane can
+                            // actually deliver on the surface the retry
+                            // will use — resolving an effective turn
+                            // slot where the lane has one, or carried by
+                            // a setup call where the retry re-opens the
+                            // session. An entry it can deliver nowhere —
+                            // an unqualified candidate on a
+                            // provider-only lane — would resubmit the
+                            // identical model-free request and serve the
+                            // peer's own default while deliverable
+                            // entries behind it were never tried; hold
                             // it out of this lane's retry queue and walk
-                            // on; a later lane or turn may still carry
-                            // it.
-                            while let Some(candidate) = chain.remaining.first() {
-                                if turn_model != SelectorSupport::Unsupported
-                                    || setup_carries_candidate(
+                            // on. When nothing deliverable stands, the
+                            // head stays the pick on a lane whose turn
+                            // surface carries models — the last-resort
+                            // retry serves the same default it always
+                            // has. A lane with no turn surface at all
+                            // has no such retry: the identical reopen
+                            // would only resend what the refusal already
+                            // answered.
+                            match chain.remaining.iter().position(|candidate| {
+                                if turn_model != SelectorSupport::Unsupported {
+                                    turn_carries_candidate(&active_spec, candidate)
+                                } else {
+                                    setup_carries_candidate(
                                         &active_spec,
                                         candidate,
                                         resuming(&installed_open),
                                     )
-                                {
-                                    break;
                                 }
-                                let candidate = candidate.clone();
-                                chain.remaining.remove(0);
-                                if !held_unsent.iter().any(|entry| entry == &candidate) {
-                                    held_unsent.push(candidate);
+                            }) {
+                                Some(index) => {
+                                    for candidate in chain.remaining.drain(..index) {
+                                        if !held_unsent.iter().any(|entry| entry == &candidate) {
+                                            held_unsent.push(candidate);
+                                        }
+                                    }
+                                    chain.remaining.first().cloned()
                                 }
+                                None if turn_model != SelectorSupport::Unsupported => {
+                                    chain.remaining.first().cloned()
+                                }
+                                None => None,
                             }
-                            chain.remaining.first().cloned()
                         }
                         _ => None,
                     };
@@ -4459,7 +4601,6 @@ impl VirtualSession {
                     // the chain already spent.
                     if let Some(candidate) = &pending_candidate {
                         if new_open.config.model.as_deref() == Some(candidate.as_str())
-                            && turn_binds_model(&spec)
                             && !setup_carries_model(&spec, &new_open)
                         {
                             // The open's declared slots exist but this
@@ -4479,7 +4620,13 @@ impl VirtualSession {
                                         .active
                                         .clone()
                                 };
-                            turn_model = Some(candidate.clone());
+                            // The candidate rides the replay only where
+                            // a turn slot can actually resolve it — an
+                            // unqualified `{modelProvider}` entry emits
+                            // nothing there either.
+                            if turn_carries_candidate(&spec, candidate) {
+                                turn_model = Some(candidate.clone());
+                            }
                         }
                     }
                     let (adapter, probe) = lane.adapter(candidate, &new_open);
@@ -4727,7 +4874,13 @@ impl VirtualSession {
                                         .lock()
                                         .unwrap_or_else(|error| error.into_inner());
                                     chain.active = Some(carried_model.clone());
-                                    chain.pending = None;
+                                    // The claim is a default fill: a
+                                    // direct prompt never consumed it,
+                                    // so it stays queued for the next
+                                    // implicit prompt.
+                                    if record_instructions {
+                                        chain.pending = None;
+                                    }
                                     drop(chain);
                                     driver_model = Some(carried_model.clone());
                                     pending_model = Some(carried_model);
@@ -4735,11 +4888,13 @@ impl VirtualSession {
                                 // A candidate deliverable on the lane's
                                 // per-turn surface stays pending until the
                                 // replay proves the lane took it — it rides
-                                // the replayed request. A lane with no
-                                // model selector never carries the
-                                // candidate; its replay proves nothing
+                                // the replayed request. A lane whose turn
+                                // slots cannot resolve it never carries
+                                // the candidate; its replay proves nothing
                                 // about it, so it must not publish.
-                                Some(carried_model) if turn_binds_model(&spec) => {
+                                Some(carried_model)
+                                    if turn_carries_candidate(&spec, &carried_model) =>
+                                {
                                     driver_model = Some(carried_model.clone());
                                     pending_model = Some(carried_model);
                                     carried = true;
@@ -4879,14 +5034,15 @@ impl VirtualSession {
                                 // The retry reopens this same lane, so the
                                 // delivery check the prompt pick applies
                                 // stands here too: an entry the lane can
-                                // neither bind at setup nor carry per turn
-                                // would reopen with a model-free request —
-                                // accepted on the peer's own default while
-                                // the entries behind it were never tried.
-                                // Hold it out of this lane's walk; a later
-                                // lane or turn may still carry it.
+                                // neither bind at setup nor resolve in a
+                                // turn slot would reopen with a model-free
+                                // request — accepted on the peer's own
+                                // default while the entries behind it were
+                                // never tried. Hold it out of this lane's
+                                // walk; a later lane or turn may still
+                                // carry it.
                                 while let Some(candidate) = chain.remaining.first() {
-                                    if turn_binds_model(&spec)
+                                    if turn_carries_candidate(&spec, candidate)
                                         || setup_carries_candidate(
                                             &spec,
                                             candidate,
@@ -4911,12 +5067,12 @@ impl VirtualSession {
                                 // walk offers it before declaring the
                                 // chain exhausted. The claim is a default
                                 // fill — a direct prompt never consumes it —
-                                // and a lane that cannot carry it has no
-                                // retry to spend it on.
+                                // and a lane whose slots cannot resolve it
+                                // has no retry to spend it on.
                                 next.or_else(|| {
                                     chain.pending.clone().filter(|pending| {
                                         record_instructions
-                                            && (turn_binds_model(&spec)
+                                            && (turn_carries_candidate(&spec, pending)
                                                 || setup_carries_candidate(
                                                     &spec,
                                                     pending,

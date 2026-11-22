@@ -353,6 +353,12 @@ impl VirtualAgent {
                         // carried this candidate — the entry is spent:
                         // refused candidates never publish as the
                         // session's model and the chain moves on.
+                        if lane_request.config.model == request.config.model {
+                            // The caller's explicit model was just refused:
+                            // later lanes project the advanced cursor —
+                            // never the refused original value.
+                            request.config.model = None;
+                        }
                         let Some(next) = next_model(&chain, lane_request.config.model.as_deref())
                         else {
                             // Model exhaustion is provider-side: remaining
@@ -418,6 +424,7 @@ impl VirtualAgent {
                     index: lane_index,
                     requested: request.clone(),
                     open: effective_request,
+                    refused_default: None,
                     events: events.clone(),
                     relay: EventRelay::spawn(tap_rx, events.clone(), probe.clone()),
                     secrets: self.secrets.clone(),
@@ -451,6 +458,12 @@ struct LaneState {
     requested: SessionRequest,
     /// The request the active lane opened with — replayed on the next lane.
     open: SessionRequest,
+    /// The stored default the provider refused while it was an
+    /// unconfirmed pending candidate — installed by an open that never
+    /// carried it. The session still holds it, so every implicit prompt
+    /// would resend the refused model; the lane keeps the mark until a
+    /// replacement session installs a clean slot.
+    refused_default: Option<String>,
     events: mpsc::UnboundedSender<AgentEvent>,
     /// The active lane's event path: a forwarder task drains the lane's
     /// tap into the caller's stream for the session's whole lifetime —
@@ -3567,12 +3580,6 @@ impl VirtualSession {
             // never publishes, and neither does one whose attempt died
             // before dispatch.
             let mut pending_model: Option<String> = None;
-            // The pending candidate the serving attempt actually carried
-            // and dropped unconfirmed — kept so a refusal attributed to
-            // it can retire the session's stored default: an entry the
-            // provider just refused must not ride every later implicit
-            // prompt on the installed session's stored model.
-            let mut attempted_pending: Option<String> = None;
             // This turn ends on a re-established session whose stored
             // default is cleared of the refused pending candidate —
             // nothing replays on it; the refusal still answers the turn.
@@ -3620,13 +3627,14 @@ impl VirtualSession {
                 // and that decides how a chain retry applies the next
                 // entry: a per-turn surface takes it on the request, a
                 // session-bound one re-establishes the session.
-                let (probe, relay, active_spec, installed_open) = {
+                let (probe, relay, active_spec, installed_open, refused_default) = {
                     let lane = lane.lock().await;
                     (
                         lane.probe.clone(),
                         lane.relay.clone(),
                         lane.specs[lane.index].clone(),
                         lane.open.clone(),
+                        lane.refused_default.clone(),
                     )
                 };
                 let (turn_selectors, session_model) = {
@@ -3662,6 +3670,19 @@ impl VirtualSession {
                         .clone()
                         .or_else(|| caller_model.clone())
                         .or_else(|| {
+                            // The chain's awaiting candidate keeps riding
+                            // implicit prompts until the wire proves or
+                            // refuses it — on a session that only expresses
+                            // the model per turn this projection is its
+                            // carry, on one that stores it the slot resolves
+                            // the same value either way.
+                            model_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .pending
+                                .clone()
+                        })
+                        .or_else(|| {
                             record_instructions
                                 .then(|| {
                                     turn_model_default
@@ -3688,14 +3709,32 @@ impl VirtualSession {
                 };
                 relay.flush().await;
                 relay.arm();
+                // A stored default the provider refused — the lane keeps
+                // it marked until a clean replacement session takes over —
+                // must never ride another implicit prompt: this iteration
+                // exists only to re-establish the session before anything
+                // dispatches. An explicit turn model names its own value
+                // and needs no repair.
+                let poisoned = refused_default.is_some()
+                    && installed_open.config.model == refused_default
+                    && request
+                        .model
+                        .as_deref()
+                        .is_none_or(|model| refused_default.as_deref() == Some(model));
                 // Set when the next chain entry can only apply by
                 // re-establishing this lane's session — a model bound at
                 // session/open has no per-turn surface to carry it.
-                let mut session_retry = false;
+                let mut session_retry = poisoned;
                 // The model loop on the current lane: provider-side model
                 // failures advance the chain and resubmit on the same
                 // session.
                 let outcome = loop {
+                    if poisoned {
+                        break Err(a4aa::AdapterError::permanent(
+                            "agent_model_refused",
+                            "session/open",
+                        ));
+                    }
                     // A close or cancel that landed while the driver was
                     // arranging this attempt — including a fallback's
                     // reopen — must stop the turn before anything else
@@ -3756,7 +3795,7 @@ impl VirtualSession {
                         serving_sent |= sent;
                     }
                     {
-                        let mut chain = model_state
+                        let chain = model_state
                             .lock()
                             .unwrap_or_else(|error| error.into_inner());
                         let wire_model = request
@@ -3767,7 +3806,13 @@ impl VirtualSession {
                             pending_sent = true;
                             serving_sent = true;
                             if pending_model.is_none() {
-                                pending_model = chain.pending.take();
+                                // The shared claim stays in place until a
+                                // refusal spends it or a confirmation
+                                // publishes it: a `Sent` record is intent,
+                                // so the write may yet be confirmed
+                                // failed — taking the claim here would
+                                // drop a candidate the wire never carried.
+                                pending_model = chain.pending.clone();
                             }
                         }
                     }
@@ -3865,8 +3910,34 @@ impl VirtualSession {
                                 .unwrap_or_else(|error| error.into_inner());
                             chain.active = Some(accepted);
                             chain.pending = None;
-                        } else {
-                            attempted_pending = Some(accepted);
+                        } else if matches!(&outcome, Err(error)
+                            if model_failure(error)
+                                && turn_refusal_binds_model(error, &probe))
+                        {
+                            // A pending candidate the lane provably
+                            // refused is spent: the shared chain must not
+                            // keep it as the awaiting entry for a later
+                            // lane walk to pick again.
+                            {
+                                let mut chain = model_state
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if chain.pending.as_deref() == Some(accepted.as_str()) {
+                                    chain.pending = None;
+                                }
+                            }
+                            // The refused entry installed as this
+                            // session's stored default — an open that
+                            // never carried it — poisons every later
+                            // implicit prompt: mark the lane's slot until
+                            // a clean replacement session takes over. A
+                            // model the open itself bound is a real
+                            // session binding, not a poisoned default.
+                            if installed_open.config.model.as_deref() == Some(accepted.as_str())
+                                && !probe.model_setup_sent()
+                            {
+                                lane.lock().await.refused_default = Some(accepted);
+                            }
                         }
                     }
                     // A cancelled outcome can arrive after a model-free
@@ -3997,37 +4068,35 @@ impl VirtualSession {
                 };
                 relay.flush().await;
                 let (emitted_output, emitted_billable) = relay.disarm();
-                // A refused pending candidate is spent — but a session
-                // that stores it as the default would resend it on every
-                // later implicit prompt. The retire is only for a stored
-                // default the open never carried: a model the open itself
-                // bound is a real session binding and keeps the "last
-                // accepted" reading even when a prompt refuses it.
-                // Re-establishing this lane's session with the chain's
-                // last accepted entry retires the poisoned default; the
-                // refusal still answers this turn, nothing replays on the
-                // replacement.
+                // A refused pending candidate installed as the session's
+                // stored default is spent — but the session would resend
+                // it on every later implicit prompt. The retire is only
+                // for a stored default the open never carried — marked
+                // on the lane when the refusal was attributed, so a
+                // later candidate's refusal cannot mask it: a model the
+                // open itself bound is a real session binding and keeps
+                // the "last accepted" reading even when a prompt refuses
+                // it. Re-establishing this lane's session with the
+                // chain's last accepted entry retires the poisoned
+                // default; the refusal still answers this turn, nothing
+                // replays on the replacement.
+                let refused_default = lane.lock().await.refused_default.clone();
                 if !session_retry
                     && matches!(&outcome, Err(error) if model_failure(error)
                         && turn_refusal_binds_model(error, &probe))
-                    && attempted_pending.is_some()
-                    && installed_open.config.model == attempted_pending
+                    && refused_default.is_some()
+                    && installed_open.config.model == refused_default
                     && !probe.model_setup_sent()
                 {
                     session_retry = true;
                     retire_default = true;
                     // The refused entry is spent everywhere: a scheduled
                     // copy rides the same reopen's projection as the
-                    // candidate, and an unconfirmed `pending` claim is no
-                    // longer the chain's awaiting entry — the
-                    // re-established session binds the last accepted one.
+                    // candidate, and the shared `pending` claim was
+                    // already dropped when the refusal was attributed —
+                    // the re-established session binds the last accepted
+                    // one.
                     driver_model = None;
-                    let mut chain = model_state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if chain.pending == attempted_pending {
-                        chain.pending = None;
-                    }
                 }
                 // A session-bound retry keeps its lane: the session is
                 // reopened below with the accepted model. Any other
@@ -4363,6 +4432,10 @@ impl VirtualSession {
                             lane.index = candidate;
                             lane.probe = probe.clone();
                             lane.open = new_open;
+                            // The replacement's stored slot is clean: the
+                            // retired session carried the refused default
+                            // out of service with it.
+                            lane.refused_default = None;
                             // The dead lane's relay keeps draining its
                             // tap to the caller on its own — leftovers
                             // are the dead attempt's evidence, never
@@ -4522,7 +4595,14 @@ impl VirtualSession {
                     if retire_default {
                         break 'lanes outcome;
                     }
-                    prior = Some(outcome);
+                    // The poisoned-default iteration ran no attempt: its
+                    // synthesized outcome is not a completed attempt's
+                    // result — after the replacement installs, the
+                    // 'lanes loop re-enters and the turn dispatches on
+                    // the clean session.
+                    if !poisoned {
+                        prior = Some(outcome);
+                    }
                     continue 'lanes;
                 }
             };

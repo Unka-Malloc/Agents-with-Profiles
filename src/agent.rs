@@ -2164,8 +2164,10 @@ fn leaf_carries_model(leaf: &str, vars: &ProbeVars) -> bool {
 /// Whether a model slot's leaf resolves a selector value for this
 /// candidate — the same per-token reading `leaf_carries_model` makes of
 /// the resolved vars, computed before any wire journal exists:
-/// `{model}` and `{modelId}` resolve for every non-empty candidate,
-/// `{modelProvider}` only for a `provider/model` selection.
+/// `{model}` resolves for every non-empty candidate, `{modelId}` only
+/// for one whose post-slash id part is non-empty — `provider/` resolves
+/// it to nothing, the same `split_once('/')` the adapter's vars apply —
+/// and `{modelProvider}` only for a `provider/model` selection.
 fn leaf_resolves_model(leaf: &str, model: &str) -> bool {
     MODEL_NAMES.iter().any(|name| {
         leaf.contains(&format!("{{{name}}}"))
@@ -2173,6 +2175,11 @@ fn leaf_resolves_model(leaf: &str, model: &str) -> bool {
                 "modelProvider" => model
                     .split_once('/')
                     .is_some_and(|(provider, _)| !provider.is_empty()),
+                "modelId" => !model
+                    .split_once('/')
+                    .map(|(_, id)| id)
+                    .unwrap_or(model)
+                    .is_empty(),
                 _ => !model.is_empty(),
             }
     })
@@ -4021,6 +4028,16 @@ impl VirtualSession {
                                 &claim,
                                 resuming(&installed_open),
                             )
+                            // The installed session is already bound to
+                            // this claim and its wire provably carried no
+                            // model: the identical reopen would repeat an
+                            // evidence-free open and the claim would
+                            // re-enter repair without ever dispatching —
+                            // it waits for a lane that can carry it.
+                            && !(probe.has_dispatch_point()
+                                && installed_open.config.model.as_deref()
+                                    == Some(claim.as_str())
+                                && !probe.model_setup_sent())
                         {
                             pending_bind = Some(claim);
                             pending_sent = false;
@@ -4587,6 +4604,13 @@ impl VirtualSession {
                 // session retry, the next declared variant otherwise — and
                 // replay the turn there; a reopen that fails keeps walking.
                 let mut retry_same_lane = session_retry;
+                // The real answer a repair reopen produced: the repair
+                // iteration's own `outcome` is the synthesized model
+                // refusal, so a search that runs out of lanes must return
+                // the failure the peer actually reported — a lost
+                // transport, a protocol fault — never the marker that
+                // entered repair.
+                let mut reopen_error: Option<a4aa::AdapterError> = None;
                 // The search walks with a local index: the installed
                 // lane's position commits only when a replacement session
                 // actually opens — a candidate that fails to open never
@@ -4612,8 +4636,50 @@ impl VirtualSession {
                         }
                     }
                     let Some(spec) = lane.specs.get(candidate).cloned() else {
-                        break 'lanes outcome;
+                        // The search is over with nothing served — a
+                        // scheduled candidate no wire ever carried goes
+                        // back to the chain for the next turn, the same
+                        // restoration rule the abandoned-open guards
+                        // apply.
+                        if !pending_sent {
+                            restore_candidate(
+                                &model_state,
+                                pending_bind.take().or_else(|| driver_model.take()),
+                            );
+                        }
+                        break 'lanes match reopen_error {
+                            Some(error) if repair => Err(error),
+                            _ => outcome,
+                        };
                     };
+                    // Nothing scheduled rides this reopen and no accepted
+                    // entry stands — the untried chain is what the walk
+                    // has left. Move the first entry this lane's own slots
+                    // can deliver into the scheduled candidate state
+                    // before opening: the peer's refusal then spends it
+                    // instead of leaving it queued for the next retry to
+                    // re-pick, and the restore paths return it only while
+                    // no wire carried it.
+                    if pending_bind.is_none() && driver_model.is_none() {
+                        let mut chain = model_state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if chain.active.is_none()
+                            && !(record_instructions && chain.pending.is_some())
+                        {
+                            if let Some(index) = chain.remaining.iter().position(|candidate| {
+                                turn_carries_candidate(&spec, candidate)
+                                    || setup_carries_candidate(
+                                        &spec,
+                                        candidate,
+                                        resuming(&lane.requested),
+                                    )
+                            }) {
+                                pending_bind = Some(chain.remaining.remove(index));
+                                pending_sent = false;
+                            }
+                        }
+                    }
                     // The model this reopen binds: a session-bound retry
                     // pursues its scheduled candidate, a per-turn retry's
                     // candidate is the chain position this turn committed
@@ -4641,29 +4707,11 @@ impl VirtualSession {
                                 .flatten()
                         });
                     let head = pending_candidate.clone().or_else(|| {
-                        let chain = model_state
+                        model_state
                             .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        chain.active.clone().or_else(|| {
-                            // The last accepted entry is spent — the
-                            // untried chain is what the walk has left:
-                            // prefer the first entry this lane's own
-                            // slots can deliver, so its open attempts a
-                            // candidate rather than the peer's default
-                            // while untried entries wait behind it.
-                            chain
-                                .remaining
-                                .iter()
-                                .find(|candidate| {
-                                    turn_carries_candidate(&spec, candidate)
-                                        || setup_carries_candidate(
-                                            &spec,
-                                            candidate,
-                                            resuming(&lane.requested),
-                                        )
-                                })
-                                .cloned()
-                        })
+                            .unwrap_or_else(|error| error.into_inner())
+                            .active
+                            .clone()
                     });
                     // Re-project the caller's request against this lane:
                     // selectors the previous lane applied at establishment
@@ -5050,6 +5098,12 @@ impl VirtualSession {
                                     outcome
                                 };
                             }
+                            // The repair iteration's `outcome` is
+                            // synthesized — keep the lane's real answer
+                            // so an exhausted search returns it.
+                            if repair {
+                                reopen_error = Some(open_error.clone());
+                            }
                             if !model_failure(&open_error) {
                                 continue;
                             }
@@ -5237,8 +5291,19 @@ impl VirtualSession {
                     }
                     // A retire reopen only clears the stored default —
                     // the refusal already answered this turn, so nothing
-                    // replays on the replacement session.
+                    // replays on the replacement session. A scheduled
+                    // candidate the install left awaiting evidence —
+                    // pending on the per-turn surface — never dispatched:
+                    // it returns to the chain while no wire carried it,
+                    // the same restoration rule the abandoned-open
+                    // guards apply.
                     if retire_default {
+                        if !pending_sent {
+                            restore_candidate(
+                                &model_state,
+                                pending_model.take().or_else(|| driver_model.take()),
+                            );
+                        }
                         break 'lanes outcome;
                     }
                     // The repair iteration ran no attempt: its

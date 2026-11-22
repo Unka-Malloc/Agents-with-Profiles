@@ -3853,8 +3853,11 @@ impl VirtualSession {
             // manages them. An explicit value stays caller-owned through
             // every lane attempt — the lane's own validation answers it —
             // while everything else is driver state the lane's selector
-            // surface decides how to carry.
-            let caller_model = request.model.clone();
+            // surface decides how to carry. A refusal that answers the
+            // explicit value spends it like any driver-held entry: the
+            // fallback arm's refusal record clears it so the alternate's
+            // projection falls to the untried chain.
+            let mut caller_model = request.model.clone();
             let caller_effort = request.effort.clone();
             // The chain candidate a model retry scheduled on a per-turn
             // surface this turn — kept so a lane switch replays it where
@@ -4717,6 +4720,15 @@ impl VirtualSession {
                                     *slot = None;
                                 }
                             }
+                            // The caller's explicit selector is spent
+                            // with them: left standing, it would head the
+                            // alternate's projection ahead of the untried
+                            // chain — the alternate opens with no
+                            // candidate and replays the model the peer
+                            // just refused.
+                            if refused_entry(&caller_model) {
+                                caller_model = None;
+                            }
                             true
                         }
                         // A lane failure after streamed text or billable usage
@@ -5359,6 +5371,12 @@ impl VirtualSession {
                                     if slot.as_deref() == Some(refused.as_str()) {
                                         *slot = None;
                                     }
+                                }
+                                // The caller's explicit selector is
+                                // spent too where the open's refused
+                                // entry names it: the peer answered it.
+                                if caller_model.as_deref() == Some(refused.as_str()) {
+                                    caller_model = None;
                                 }
                             }
                             let next = {

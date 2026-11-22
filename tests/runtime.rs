@@ -14803,6 +14803,83 @@ async fn rpc_refused_driver_pick_never_heads_the_alternate() {
     session.close().await.unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_refused_explicit_model_never_heads_the_alternate() {
+    // The same provider-only primary and chain as the driver-pick case,
+    // but `vendor/prime` arrives as the caller's explicit turn selector
+    // through `prompt_with`: refused on the wire, then the retry's
+    // `vendor2/next` refused as well, while unqualified `backup` waits
+    // held — never sent. The walk must spend the explicit selector with
+    // the rest of the refusal record: left caller-owned, it would head
+    // the alternate's open and prompt while `backup` stays untried.
+    let dir = TestDirectory::new("rpc-refused-explicit-fallback");
+    let refusing = dir.path().join("rpc_refusing.py");
+    std::fs::write(&refusing, RPC_PROVIDER_OPEN_ACCEPTS_PROMPTS_REFUSE_THEN_DIE).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "provideronly",
+        &refusing,
+        json!({"provider": "{modelProvider}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let serving = dir.path().join("rpc_serving.py");
+    std::fs::write(&serving, RPC_MODEL_OPEN_ACCEPTS_ALL_PROMPT_ECHOES).unwrap();
+    let mut alternate = rpc_spec(
+        "carrying",
+        &serving,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("provideronly".to_owned()),
+            model: Some("vendor/prime".to_owned()),
+            models: Some(vec!["backup".to_owned(), "vendor2/next".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // Both qualified entries refused on the primary — `vendor/prime` as
+    // the caller's own selector this time; the untried `backup` — not
+    // the just-refused explicit model — is what the alternate binds and
+    // serves.
+    let outcome = session
+        .prompt_with(TurnRequest {
+            text: "work".to_owned(),
+            model: Some("vendor/prime".to_owned()),
+            effort: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|backup|work");
+    assert_eq!(session.active_model().as_deref(), Some("backup"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "a/open|vendor",
+            "a/prompt|vendor",
+            "a/prompt|vendor2",
+            "c/open|backup",
+            "c/prompt|backup",
+        ],
+        "a refused explicit model must never head the alternate's \
+         projection: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
 /// An rpc peer with a `{modelProvider}`-only open that accepts
 /// everything and refuses its first three prompts, then closes stdin so
 /// the next write lands on a dead pipe — the lane whose death carries

@@ -9974,9 +9974,11 @@ for line in sys.stdin:
                   "error": {"code": -32000, "message":
                             "resource_exhausted: quota exceeded for this model"}})
             continue
+        # stdin closes before the answer flushes, so the prompt write is
+        # guaranteed to land on a dead pipe
+        os.close(0)
         send({"jsonrpc": "2.0", "id": request_id,
               "result": {"sessionId": "awp-rpc-session"}})
-        os.close(0)
         time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
@@ -10452,10 +10454,12 @@ for line in sys.stdin:
         model = params.get("model")
         log.write("primary/prompt|{}\n".format(model or "unset"))
         log.flush()
+        # stdin closes before the answer flushes, so the next write is
+        # guaranteed to land on a dead pipe
+        os.close(0)
         send({"jsonrpc": "2.0", "id": request_id,
               "error": {"code": -32000, "message":
                         "resource_exhausted: quota exceeded for this model"}})
-        os.close(0)
         time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
@@ -10732,10 +10736,12 @@ for line in sys.stdin:
                   "error": {"code": -32000, "message":
                             "resource_exhausted: quota exceeded for this model"}})
         else:
+            # stdin closes before the answer flushes, so the next write
+            # is guaranteed to land on a dead pipe
+            os.close(0)
             send({"jsonrpc": "2.0", "id": request_id,
                   "result": {"text": "served|{}|{}".format(
                       model or "unset", params.get("text", ""))}})
-            os.close(0)
             time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
@@ -11017,10 +11023,12 @@ for line in sys.stdin:
     elif method == "session/prompt":
         log.write("alt/prompt|{}\n".format(params.get("provider") or "unset"))
         log.flush()
+        # stdin closes before the answer flushes, so the next write is
+        # guaranteed to land on a dead pipe
+        os.close(0)
         send({"jsonrpc": "2.0", "id": request_id,
               "error": {"code": -32000, "message":
                         "resource_exhausted: quota exceeded for this model"}})
-        os.close(0)
         time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
@@ -11955,10 +11963,12 @@ for line in sys.stdin:
         model = params.get("model")
         log.write("primary/prompt|{}\n".format(model or "unset"))
         log.flush()
+        # stdin closes before the answer flushes, so the next write is
+        # guaranteed to land on a dead pipe
+        os.close(0)
         send({"jsonrpc": "2.0", "id": request_id,
               "result": {"text": "served|{}|{}".format(
                   model or "peerdefault", params.get("text", ""))}})
-        os.close(0)
         time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
@@ -12473,10 +12483,12 @@ for line in sys.stdin:
         log.write("primary/prompt|{}\n".format(model or "unset"))
         log.flush()
         if model == "fallback":
+            # stdin closes before the answer flushes, so the next write
+            # is guaranteed to land on a dead pipe
+            os.close(0)
             send({"jsonrpc": "2.0", "id": request_id,
                   "result": {"text": "served|{}|{}".format(
                       model, params.get("text", ""))}})
-            os.close(0)
             time.sleep(30)
         else:
             send({"jsonrpc": "2.0", "id": request_id,
@@ -13802,12 +13814,12 @@ for line in sys.stdin:
         provider = params.get("provider")
         log.write("a/prompt|{}\n".format(provider or "unset"))
         log.flush()
+        # stdin closes before the served answer flushes, so the next
+        # prompt write is guaranteed to land on a dead pipe
+        os.close(0)
         send({"jsonrpc": "2.0", "id": request_id,
               "result": {"text": "served|{}|{}".format(
                   provider or "peerdefault", params.get("text", ""))}})
-        # stdin closes after the served answer flushes, so the next
-        # prompt write is guaranteed to land on a dead pipe
-        os.close(0)
         time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
@@ -14575,13 +14587,14 @@ for line in sys.stdin:
         provider = params.get("provider")
         log.write("a/prompt|{}\n".format(provider or "unset"))
         log.flush()
+        if prompts >= 3:
+            # stdin closes before the answer flushes, so the next prompt
+            # write is guaranteed to land on a dead pipe
+            os.close(0)
         send({"jsonrpc": "2.0", "id": request_id,
               "error": {"code": -32000, "message":
                         "resource_exhausted: quota exceeded for this model"}})
         if prompts >= 3:
-            # stdin closes after the answer flushes, so the next prompt
-            # write is guaranteed to land on a dead pipe
-            os.close(0)
             time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})
@@ -14841,11 +14854,11 @@ for line in sys.stdin:
     if method == "session/open":
         log.write("a/open|{}\n".format(params.get("provider") or "unset"))
         log.flush()
-        send({"jsonrpc": "2.0", "id": request_id,
-              "result": {"sessionId": "awp-rpc-session"}})
-        # stdin closes after the answer flushes, so the prompt write is
+        # stdin closes before the answer flushes, so the prompt write is
         # guaranteed to land on a dead pipe
         os.close(0)
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
         time.sleep(30)
     elif request_id is not None:
         send({"jsonrpc": "2.0", "id": request_id, "result": None})

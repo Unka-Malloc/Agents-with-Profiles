@@ -4876,6 +4876,31 @@ impl VirtualSession {
                                 let mut chain = model_state
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner());
+                                // The retry reopens this same lane, so the
+                                // delivery check the prompt pick applies
+                                // stands here too: an entry the lane can
+                                // neither bind at setup nor carry per turn
+                                // would reopen with a model-free request —
+                                // accepted on the peer's own default while
+                                // the entries behind it were never tried.
+                                // Hold it out of this lane's walk; a later
+                                // lane or turn may still carry it.
+                                while let Some(candidate) = chain.remaining.first() {
+                                    if turn_binds_model(&spec)
+                                        || setup_carries_candidate(
+                                            &spec,
+                                            candidate,
+                                            resuming(&new_open),
+                                        )
+                                    {
+                                        break;
+                                    }
+                                    let candidate = candidate.clone();
+                                    chain.remaining.remove(0);
+                                    if !held_unsent.iter().any(|entry| entry == &candidate) {
+                                        held_unsent.push(candidate);
+                                    }
+                                }
                                 let next = chain.remaining.first().cloned();
                                 if next.is_some() {
                                     chain.remaining.remove(0);
@@ -4884,8 +4909,21 @@ impl VirtualSession {
                                 // fallback too: it was parked awaiting its
                                 // carry evidence, never refused, so the
                                 // walk offers it before declaring the
-                                // chain exhausted.
-                                next.or_else(|| chain.pending.clone())
+                                // chain exhausted. The claim is a default
+                                // fill — a direct prompt never consumes it —
+                                // and a lane that cannot carry it has no
+                                // retry to spend it on.
+                                next.or_else(|| {
+                                    chain.pending.clone().filter(|pending| {
+                                        record_instructions
+                                            && (turn_binds_model(&spec)
+                                                || setup_carries_candidate(
+                                                    &spec,
+                                                    pending,
+                                                    resuming(&new_open),
+                                                ))
+                                    })
+                                })
                             };
                             if let Some(next) = next {
                                 pending_bind = Some(next);

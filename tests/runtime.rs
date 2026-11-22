@@ -13302,3 +13302,338 @@ async fn rpc_undeliverable_candidates_leave_the_setup_only_retry_queue() {
     );
     session.close().await.unwrap();
 }
+
+/// An rpc peer that accepts every `session/open`, logging the model it
+/// carried, refuses one `session/prompt` with a quota error — closing
+/// its stdin before the refusal flushes so the next write lands on a
+/// dead pipe — and sleeps.
+#[cfg(unix)]
+const RPC_OPEN_MODEL_REFUSES_ONE_PROMPT_THEN_DIES: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+def refused(request_id):
+    send({"jsonrpc": "2.0", "id": request_id,
+          "error": {"code": -32000, "message":
+                    "resource_exhausted: quota exceeded for this model"}})
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+refusals = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("primary/open|{}\n".format(params.get("model") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        refusals += 1
+        log.write("primary/prompt|{}\n".format(params.get("provider") or "unset"))
+        log.flush()
+        # stdin is closed before the refusal is flushed, so the next
+        # prompt write is guaranteed to land on a dead pipe
+        if refusals == 1:
+            os.close(0)
+        refused(request_id)
+        if refusals == 1:
+            time.sleep(30)
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer whose open's only model slot is `{modelProvider}`: it
+/// logs the provider each open resolved, refuses `first`, accepts
+/// everything else, and serves every prompt — the setup-only lane whose
+/// same-lane retry must not reopen with a model-free request.
+#[cfg(unix)]
+const RPC_PROVIDER_OPEN_REFUSES_FIRST_PROMPT_SERVES: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        provider = params.get("provider")
+        log.write("alt/open|{}\n".format(provider or "unset"))
+        log.flush()
+        if provider == "first":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("alt/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "peerdefault", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_setup_walk_skips_candidates_the_lane_cannot_carry() {
+    // `vnd/prime` binds the primary's open; one prompt refusal spends it
+    // and the lane dies while `first/one` heads the chain. The
+    // alternate's only model surface is `{modelProvider}` at setup — no
+    // slot on it can carry the unqualified `plain`. Its open refuses
+    // `first`: the same-lane walk must hold `plain` — a retry would
+    // emit a model-free request the peer accepts on its own default —
+    // and reach `good/two`, the deliverable candidate behind it.
+    let dir = TestDirectory::new("rpc-setup-walk-hold");
+    let dying = dir.path().join("rpc_die.py");
+    std::fs::write(&dying, RPC_OPEN_MODEL_REFUSES_ONE_PROMPT_THEN_DIES).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "holding",
+        &dying,
+        json!({"model": "{model}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let refusing = dir.path().join("rpc_refuse.py");
+    std::fs::write(&refusing, RPC_PROVIDER_OPEN_REFUSES_FIRST_PROMPT_SERVES).unwrap();
+    let mut alternate = rpc_spec(
+        "provideronly",
+        &refusing,
+        json!({"provider": "{modelProvider}"}),
+        json!({"text": "{prompt}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("holding".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec![
+                "first/one".to_owned(),
+                "plain".to_owned(),
+                "good/two".to_owned(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // `first/one` is refused at the alternate's open; `plain` waits out
+    // the same-lane walk — no setup call can carry it — and `good/two`
+    // binds the next reopen.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|peerdefault|work");
+    assert_eq!(session.active_model().as_deref(), Some("good/two"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "primary/open|vnd/prime",
+            "primary/prompt|vnd",
+            "alt/open|first",
+            "alt/open|good",
+            "alt/prompt|unset",
+        ],
+        "an undeliverable candidate must not reopen the same lane: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that accepts every `session/open` — logging the provider
+/// it carried — refuses two `session/prompt` calls with a quota error,
+/// closing its stdin before the second refusal flushes so the next
+/// write lands on a dead pipe, and sleeps.
+#[cfg(unix)]
+const RPC_PROVIDER_OPEN_REFUSES_TWO_PROMPTS_THEN_DIES: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+def refused(request_id):
+    send({"jsonrpc": "2.0", "id": request_id,
+          "error": {"code": -32000, "message":
+                    "resource_exhausted: quota exceeded for this model"}})
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+refusals = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("primary/open|{}\n".format(params.get("provider") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        refusals += 1
+        log.write("primary/prompt|{}\n".format(params.get("provider") or "unset"))
+        log.flush()
+        # stdin is closed before the second refusal is flushed, so the
+        # next prompt write is guaranteed to land on a dead pipe
+        if refusals == 2:
+            os.close(0)
+        refused(request_id)
+        if refusals == 2:
+            time.sleep(30)
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+/// An rpc peer that logs each open's model, refuses `vnd/prime` at
+/// `session/open`, and serves everything else — the alternate a failed
+/// lane's setup walk retries on.
+#[cfg(unix)]
+const RPC_ALT_OPEN_REFUSES_PRIME_MODEL_PROMPT_SERVES: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        model = params.get("model")
+        log.write("alt/open|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "vnd/prime":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("alt/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "peerdefault", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_direct_prompt_never_spends_the_pending_claim() {
+    // `vnd/prime` binds the primary's open; two prompt refusals spend it
+    // and park the unqualified `fallback` on the shared pending claim,
+    // then the lane dies. A `prompt_direct` whose replacement open
+    // exhausts the retry queue must not consume the claim — it fills no
+    // defaults — so the walk reports exhaustion instead of binding
+    // `fallback` for a turn it was never queued for.
+    let dir = TestDirectory::new("rpc-direct-pending-walk");
+    let dying = dir.path().join("rpc_die.py");
+    std::fs::write(&dying, RPC_PROVIDER_OPEN_REFUSES_TWO_PROMPTS_THEN_DIES).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "pending",
+        &dying,
+        json!({"provider": "{modelProvider}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let refusing = dir.path().join("rpc_refuse.py");
+    std::fs::write(&refusing, RPC_ALT_OPEN_REFUSES_PRIME_MODEL_PROMPT_SERVES).unwrap();
+    let mut alternate = rpc_spec(
+        "serving",
+        &refusing,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("pending".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["fallback".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // The implicit prompt spends `vnd/prime` and parks `fallback` on the
+    // shared claim before the lane dies.
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+
+    // The direct turn's replacement open is refused and the queued claim
+    // is not its to spend: exhaustion answers it.
+    let error = session
+        .prompt_direct(TurnRequest {
+            text: "raw".to_owned(),
+            model: None,
+            effort: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+
+    // The claim a direct turn never consumed still rides the next
+    // implicit prompt — the alternate's open and prompt carry it.
+    let outcome = session.prompt("again".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|fallback|again");
+    assert_eq!(session.active_model().as_deref(), Some("fallback"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "primary/open|vnd",
+            "primary/prompt|vnd",
+            "primary/prompt|unset",
+            "alt/open|vnd/prime",
+            "alt/open|fallback",
+            "alt/prompt|fallback",
+        ],
+        "a direct prompt must not consume the queued claim: {calls_log}"
+    );
+    session.close().await.unwrap();
+}

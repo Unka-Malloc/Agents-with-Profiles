@@ -339,6 +339,38 @@ impl VirtualAgent {
             {
                 lane_model = next_model(&chain, lane_model.as_deref());
             }
+            // A resumed cursor must also be one this lane can actually
+            // deliver: an entry no setup call binds and no turn slot
+            // resolves would open model-free — the peer accepts on its
+            // own default while a deliverable entry behind it is never
+            // tried. Re-check the cursor against this lane's own slots
+            // before opening on the peer's default: undeliverable
+            // entries re-hold for a later lane or turn, and the walk
+            // resumes at the first one this lane can carry — or parks
+            // the earliest held entry pending when none stands. The
+            // first lane keeps the parked-head reading: its cursor is
+            // the untouched chain head, whose claim rides the peer's
+            // default by design.
+            if lane_index > 0 {
+                if let Some(cursor) = lane_model.clone() {
+                    if !setup_carries_candidate(spec, &cursor, resuming(&request))
+                        && !turn_carries_candidate(spec, &cursor)
+                    {
+                        if !held.iter().any(|entry| entry == &cursor) {
+                            held.push(cursor.clone());
+                        }
+                        lane_model = next_deliverable(
+                            &chain,
+                            Some(&cursor),
+                            spec,
+                            resuming(&request),
+                            &spent,
+                            &mut held,
+                        )
+                        .or_else(|| held.first().cloned());
+                    }
+                }
+            }
             let (mut lane_request, turn_model_default, turn_effort_default) =
                 lane_open(spec, &request, &self.profile, lane_model.clone());
             let lane_resuming = resuming(&lane_request);
@@ -3960,6 +3992,43 @@ impl VirtualSession {
                 // re-establishing this lane's session — a model bound at
                 // session/open has no per-turn surface to carry it.
                 let mut session_retry = poisoned;
+                // The queued claim still awaits carry evidence on a lane
+                // whose turn surface cannot deliver it: every implicit
+                // prompt fills nothing for it and keeps answering on the
+                // installed model, so the claim would queue forever.
+                // Where a setup call on this lane can carry the claim,
+                // re-establish the session bound to it before anything
+                // dispatches — the same repair iteration the poisoned
+                // default takes, and like it no completed attempt's
+                // answer. A caller-owned value owns the prompt instead,
+                // and a claim the turn slots resolve simply rides the
+                // request.
+                let mut repair = poisoned;
+                if !repair && record_instructions && pending_bind.is_none() {
+                    let claim = model_state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .pending
+                        .clone();
+                    if let Some(claim) = claim {
+                        if request
+                            .model
+                            .as_deref()
+                            .is_none_or(|model| model == claim.as_str())
+                            && !turn_carries_candidate(&active_spec, &claim)
+                            && setup_carries_candidate(
+                                &active_spec,
+                                &claim,
+                                resuming(&installed_open),
+                            )
+                        {
+                            pending_bind = Some(claim);
+                            pending_sent = false;
+                            session_retry = true;
+                            repair = true;
+                        }
+                    }
+                }
                 // The model loop on the current lane: provider-side model
                 // failures advance the chain and resubmit on the same
                 // session.
@@ -4001,7 +4070,7 @@ impl VirtualSession {
                     // The repair iteration synthesized a model refusal so
                     // the reopen below knows to re-establish the session:
                     // it is not a completed attempt's answer.
-                    if poisoned {
+                    if repair {
                         break Err(a4aa::AdapterError::permanent(
                             "agent_model_refused",
                             "session/open",
@@ -4272,10 +4341,10 @@ impl VirtualSession {
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
                             // Prefer the first entry this lane can
-                            // actually deliver on the surface the retry
-                            // will use — resolving an effective turn
-                            // slot where the lane has one, or carried by
-                            // a setup call where the retry re-opens the
+                            // actually deliver on whichever surface
+                            // carries it — resolving an effective turn
+                            // slot where the lane has one, or bound by a
+                            // setup call where the retry re-opens the
                             // session. An entry it can deliver nowhere —
                             // an unqualified candidate on a
                             // provider-only lane — would resubmit the
@@ -4292,15 +4361,13 @@ impl VirtualSession {
                             // would only resend what the refusal already
                             // answered.
                             match chain.remaining.iter().position(|candidate| {
-                                if turn_model != SelectorSupport::Unsupported {
-                                    turn_carries_candidate(&active_spec, candidate)
-                                } else {
-                                    setup_carries_candidate(
+                                (turn_model != SelectorSupport::Unsupported
+                                    && turn_carries_candidate(&active_spec, candidate))
+                                    || setup_carries_candidate(
                                         &active_spec,
                                         candidate,
                                         resuming(&installed_open),
                                     )
-                                }
                             }) {
                                 Some(index) => {
                                     for candidate in chain.remaining.drain(..index) {
@@ -4328,32 +4395,46 @@ impl VirtualSession {
                     }
                     // Decide which surface carries the next entry before
                     // spending it: a per-turn selector takes it on the
-                    // request, a session-bound selector re-establishes
-                    // the session, and a lane with no model surface keeps
-                    // the refused entry active. The entry leaves
-                    // `remaining` once scheduled — it is never retried —
-                    // but the chain's active entry and the session's
-                    // default publish only when the lane accepts it.
-                    let session_bound = if turn_model != SelectorSupport::Unsupported {
+                    // request where the lane's turn slots resolve this
+                    // candidate, a session-bound selector re-establishes
+                    // the session for a candidate only a setup call
+                    // carries — the prompt cannot express it, and
+                    // resending the identical model-free request would
+                    // just earn the same refusal — and a lane with no
+                    // model surface keeps the refused entry active. The
+                    // entry leaves `remaining` once scheduled — it is
+                    // never retried — but the chain's active entry and
+                    // the session's default publish only when the lane
+                    // accepts it.
+                    let session_bound = if turn_model != SelectorSupport::Unsupported
+                        && turn_carries_candidate(&active_spec, &next)
+                    {
                         false
                     } else {
                         // The retry re-establishes this lane's session to
                         // bind the candidate — meaningful only when the
                         // setup call this request actually selects carries
-                        // the model on the wire. The session's aggregate
-                        // rpc support counts `session_resume` even for a
+                        // it on the wire. The session's aggregate rpc
+                        // support counts `session_resume` even for a
                         // fresh session that never calls it, which would
                         // reopen the identical session once per chain
                         // entry and replay the identical prompt without a
-                        // model.
+                        // model. An entry no surface carries — the
+                        // last-resort head pick — keeps the identical
+                        // per-turn resend on a lane whose turn surface
+                        // exists, and ends the turn where none does.
                         let binds = match &active_spec.lane {
-                            LaneSpec::Rpc(_) => {
-                                model_binds_at_open(&active_spec, resuming(&installed_open))
-                            }
+                            LaneSpec::Rpc(_) => setup_carries_candidate(
+                                &active_spec,
+                                &next,
+                                resuming(&installed_open),
+                            ),
                             _ => session_model != SelectorSupport::Unsupported,
                         };
                         if binds {
                             true
+                        } else if turn_model != SelectorSupport::Unsupported {
+                            false
                         } else {
                             break outcome;
                         }
@@ -4560,11 +4641,29 @@ impl VirtualSession {
                                 .flatten()
                         });
                     let head = pending_candidate.clone().or_else(|| {
-                        model_state
+                        let chain = model_state
                             .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .active
-                            .clone()
+                            .unwrap_or_else(|error| error.into_inner());
+                        chain.active.clone().or_else(|| {
+                            // The last accepted entry is spent — the
+                            // untried chain is what the walk has left:
+                            // prefer the first entry this lane's own
+                            // slots can deliver, so its open attempts a
+                            // candidate rather than the peer's default
+                            // while untried entries wait behind it.
+                            chain
+                                .remaining
+                                .iter()
+                                .find(|candidate| {
+                                    turn_carries_candidate(&spec, candidate)
+                                        || setup_carries_candidate(
+                                            &spec,
+                                            candidate,
+                                            resuming(&lane.requested),
+                                        )
+                                })
+                                .cloned()
+                        })
                     });
                     // Re-project the caller's request against this lane:
                     // selectors the previous lane applied at establishment
@@ -4641,10 +4740,10 @@ impl VirtualSession {
                     tokio::pin!(notified);
                     let _ = notified.as_mut().enable();
                     if closing.load(Ordering::Acquire) {
-                        // The poisoned iteration's synthesized refusal is
+                        // The repair iteration's synthesized refusal is
                         // no completed attempt's answer: the close owns
                         // the verdict when nothing dispatched.
-                        break 'lanes if poisoned {
+                        break 'lanes if repair {
                             Err(a4aa::AdapterError::permanent(
                                 "agent_session_closed",
                                 "session/prompt",
@@ -4677,10 +4776,10 @@ impl VirtualSession {
                                 pending_bind.take().or_else(|| driver_model.take()),
                             );
                         }
-                        // The poisoned iteration's synthesized refusal is
+                        // The repair iteration's synthesized refusal is
                         // no completed attempt's answer: cancellation owns
                         // the verdict when nothing dispatched.
-                        break 'lanes if poisoned {
+                        break 'lanes if repair {
                             prior.take().unwrap_or_else(|| Ok(cancelled_outcome()))
                         } else {
                             outcome
@@ -4702,7 +4801,7 @@ impl VirtualSession {
                         result = adapter.open_session(new_open.clone(), tap_tx) => result,
                         _ = notified.as_mut() => {
                             if closing.load(Ordering::Acquire) {
-                                break 'lanes if poisoned {
+                                break 'lanes if repair {
                                     Err(a4aa::AdapterError::permanent(
                                         "agent_session_closed",
                                         "session/prompt",
@@ -4778,7 +4877,7 @@ impl VirtualSession {
                                     // driver and the caller's event stream
                                     // on a peer that may never answer.
                                     drop(new_session);
-                                    break 'lanes if poisoned {
+                                    break 'lanes if repair {
                                         Err(a4aa::AdapterError::permanent(
                                             "agent_session_closed",
                                             "session/prompt",
@@ -4939,10 +5038,10 @@ impl VirtualSession {
                             // select can take this arm with the lifecycle
                             // signal already raised, and a failed open is
                             // no completed attempt's answer — least of
-                            // all the poisoned iteration's synthesized
+                            // all the repair iteration's synthesized
                             // refusal.
                             if closing.load(Ordering::Acquire) {
-                                break 'lanes if poisoned {
+                                break 'lanes if repair {
                                     Err(a4aa::AdapterError::permanent(
                                         "agent_session_closed",
                                         "session/prompt",
@@ -5087,6 +5186,25 @@ impl VirtualSession {
                                 retry_same_lane = true;
                                 continue;
                             }
+                            // The candidates this lane cannot express
+                            // stayed untried — held out of its walk, or
+                            // queued on the shared claim. A later lane's
+                            // slots may still carry them: advance the
+                            // fallback and let the lane change restore
+                            // them rather than declaring exhaustion
+                            // while candidates remain. Only with nothing
+                            // untried is this refusal the chain's
+                            // answer.
+                            let untried = !held_unsent.is_empty()
+                                || (record_instructions
+                                    && model_state
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .pending
+                                        .is_some());
+                            if untried {
+                                continue;
+                            }
                             break 'lanes Err(open_error);
                         }
                     }
@@ -5123,12 +5241,12 @@ impl VirtualSession {
                     if retire_default {
                         break 'lanes outcome;
                     }
-                    // The poisoned-default iteration ran no attempt: its
+                    // The repair iteration ran no attempt: its
                     // synthesized outcome is not a completed attempt's
                     // result — after the replacement installs, the
                     // 'lanes loop re-enters and the turn dispatches on
                     // the clean session.
-                    if !poisoned {
+                    if !repair {
                         prior = Some(outcome);
                     }
                     // Held unsent candidates return to the chain with

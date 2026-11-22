@@ -3389,6 +3389,20 @@ fn setup_carries_model(spec: &AgentSpec, request: &SessionRequest) -> bool {
     }
 }
 
+/// Whether one of the setup calls this request's reopen issues can put
+/// `model` on the wire. Declared support is not enough: a
+/// `{modelProvider}`-only lane emits nothing for an unqualified
+/// candidate however its slots read, so a session-bound retry for it
+/// would only reopen the lane and repeat the identical refused request.
+fn setup_carries_candidate(spec: &AgentSpec, model: &str, resuming: bool) -> bool {
+    match &spec.lane {
+        LaneSpec::Rpc(rpc) => rpc_setup_calls(rpc, resuming)
+            .into_iter()
+            .any(|call| rpc_call_carries_model(rpc, call, model)),
+        _ => spec.selector_support(SelectorPhase::Session).model != SelectorSupport::Unsupported,
+    }
+}
+
 /// Whether the rpc lane's turn surface can carry the model selector on
 /// the wire — a `{model}`-family slot in the prompt or a pre-turn call
 /// that survives the encoding, read the same effective way
@@ -4130,12 +4144,35 @@ impl VirtualSession {
                                 && !billed
                                 && turn_refusal_binds_model(error, &probe) =>
                         {
-                            model_state
+                            let mut chain = model_state
                                 .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .remaining
-                                .first()
-                                .cloned()
+                                .unwrap_or_else(|error| error.into_inner());
+                            // A lane with no per-turn surface retries by
+                            // re-establishing its session — but only a
+                            // candidate a setup call can actually carry
+                            // binds anything: an unqualified entry on a
+                            // provider-only lane would reopen with the
+                            // identical model-free request forever. Hold
+                            // it out of this lane's retry queue and walk
+                            // on; a later lane or turn may still carry
+                            // it.
+                            while let Some(candidate) = chain.remaining.first() {
+                                if turn_model != SelectorSupport::Unsupported
+                                    || setup_carries_candidate(
+                                        &active_spec,
+                                        candidate,
+                                        resuming(&installed_open),
+                                    )
+                                {
+                                    break;
+                                }
+                                let candidate = candidate.clone();
+                                chain.remaining.remove(0);
+                                if !held_unsent.iter().any(|entry| entry == &candidate) {
+                                    held_unsent.push(candidate);
+                                }
+                            }
+                            chain.remaining.first().cloned()
                         }
                         _ => None,
                     };
@@ -4843,7 +4880,12 @@ impl VirtualSession {
                                 if next.is_some() {
                                     chain.remaining.remove(0);
                                 }
-                                next
+                                // The shared pending claim is an eligible
+                                // fallback too: it was parked awaiting its
+                                // carry evidence, never refused, so the
+                                // walk offers it before declaring the
+                                // chain exhausted.
+                                next.or_else(|| chain.pending.clone())
                             };
                             if let Some(next) = next {
                                 pending_bind = Some(next);

@@ -13075,3 +13075,230 @@ async fn rpc_held_candidates_enter_the_alternate_setup_walk() {
     );
     session.close().await.unwrap();
 }
+
+/// An rpc peer that logs each open's model and each prompt's model,
+/// refuses `three` and `two` at `session/open`, and serves everything
+/// else — the alternate whose setup walk must reach the shared pending
+/// claim after the queued fallbacks are spent.
+#[cfg(unix)]
+const RPC_ALT_OPEN_REFUSES_THREE_TWO_MODEL_PROMPT_SERVES: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        model = params.get("model")
+        log.write("alt/open|{}\n".format(model or "unset"))
+        log.flush()
+        if model == "three" or model == "two":
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32000, "message":
+                            "resource_exhausted: quota exceeded for this model"}})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        model = params.get("model")
+        log.write("alt/prompt|{}\n".format(model or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"text": "served|{}|{}".format(
+                  model or "peerdefault", params.get("text", ""))}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_pending_candidate_enters_the_setup_walk_before_exhaustion() {
+    // `vnd/prime` binds the primary's open; prompt refusals spend it,
+    // park unqualified `one` on the shared pending claim, and hold `two`
+    // unsent. The lane dies mid-retry carrying `three`, and the
+    // alternate's setup refuses both `three` and `two`. Once the queued
+    // fallbacks are spent the walk must offer the parked `one` — a claim
+    // awaiting its carry evidence was never refused — instead of
+    // declaring exhaustion with an eligible candidate still standing.
+    let dir = TestDirectory::new("rpc-pending-walk");
+    let dying = dir.path().join("rpc_die.py");
+    std::fs::write(&dying, RPC_OPEN_MODEL_REFUSES_THREE_PROMPTS_THEN_DIES).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "holding",
+        &dying,
+        json!({"model": "{model}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let refusing = dir.path().join("rpc_refuse.py");
+    std::fs::write(
+        &refusing,
+        RPC_ALT_OPEN_REFUSES_THREE_TWO_MODEL_PROMPT_SERVES,
+    )
+    .unwrap();
+    let mut alternate = rpc_spec(
+        "serving",
+        &refusing,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("holding".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // The shared pending claim joins the setup walk after `remaining`
+    // empties: the alternate binds `one` at open and the replayed prompt
+    // carries it to a peer that serves it.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|one|work");
+    assert_eq!(session.active_model().as_deref(), Some("one"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "primary/open|vnd/prime",
+            "primary/prompt|vnd",
+            "primary/prompt|unset",
+            "primary/prompt|unset",
+            "alt/open|three",
+            "alt/open|two",
+            "alt/open|one",
+            "alt/prompt|one",
+        ],
+        "the shared pending claim must be offered before exhaustion: {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+/// An rpc peer that accepts every `session/open` — its only setup slot is
+/// `{modelProvider}`, so unqualified candidates reach the wire unset —
+/// and refuses every `session/prompt` with a quota error, exiting once a
+/// third prompt is logged so a requeueing driver cannot loop forever.
+#[cfg(unix)]
+const RPC_PROVIDER_OPEN_ACCEPTS_PROMPT_REFUSES_THREE: &str = r#"
+import json, os, sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+log = open(os.environ["AWP_CALL_LOG"], "a")
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+    if method == "session/open":
+        log.write("alt/open|{}\n".format(params.get("provider") or "unset"))
+        log.flush()
+        send({"jsonrpc": "2.0", "id": request_id,
+              "result": {"sessionId": "awp-rpc-session"}})
+    elif method == "session/prompt":
+        log.write("alt/prompt|{}\n".format(params.get("provider") or "unset"))
+        log.flush()
+        log.close()
+        seen = sum(1 for logged in open(os.environ["AWP_CALL_LOG"])
+                   if logged.startswith("alt/prompt|"))
+        if seen >= 3:
+            sys.exit(0)
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32000, "message":
+                        "resource_exhausted: quota exceeded for this model"}})
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": None})
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_undeliverable_candidates_leave_the_setup_only_retry_queue() {
+    // Same parked chain as the setup-walk cases, but the alternate's
+    // only model surface is `{modelProvider}` at setup: no slot on it
+    // can carry the unqualified fallbacks. Its model-free open succeeds
+    // and the default prompt returns quota exhaustion — candidates the
+    // lane cannot deliver must wait out its retry queue instead of
+    // reopening the same lane with the identical request until the
+    // chain drains.
+    let dir = TestDirectory::new("rpc-undeliverable-hold");
+    let dying = dir.path().join("rpc_die.py");
+    std::fs::write(&dying, RPC_OPEN_MODEL_REFUSES_THREE_PROMPTS_THEN_DIES).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "holding",
+        &dying,
+        json!({"model": "{model}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let refusing = dir.path().join("rpc_refuse.py");
+    std::fs::write(&refusing, RPC_PROVIDER_OPEN_ACCEPTS_PROMPT_REFUSES_THREE).unwrap();
+    let mut alternate = rpc_spec(
+        "provideronly",
+        &refusing,
+        json!({"provider": "{modelProvider}"}),
+        json!({"text": "{prompt}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("holding".to_owned()),
+            model: Some("vnd/prime".to_owned()),
+            models: Some(vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // One model-free open and one refused prompt prove the lane: the
+    // undeliverable fallbacks leave its retry queue instead of reopening
+    // it with identical requests, and the refusal answers the turn.
+    let error = session.prompt("work".to_owned()).await.unwrap_err();
+    assert_eq!(error.code, "agent_quota_exhausted");
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "primary/open|vnd/prime",
+            "primary/prompt|vnd",
+            "primary/prompt|unset",
+            "primary/prompt|unset",
+            "alt/open|unset",
+            "alt/prompt|unset",
+        ],
+        "an undeliverable candidate must not re-enter the retry queue: {calls_log}"
+    );
+    session.close().await.unwrap();
+}

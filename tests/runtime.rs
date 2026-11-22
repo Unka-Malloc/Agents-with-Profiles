@@ -7680,6 +7680,56 @@ async fn cli_session_init_record_does_not_suppress_fallback() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cli_tool_use_record_preserves_replay_protection() {
+    // A json_lines lane that emits an assistant record carrying its
+    // session binding beside a `message.content` tool_use block, then
+    // exits non-zero: the session-init exemption covers records whose
+    // whole claim is the binding — a tool call is activity the caller
+    // already saw, so replaying the turn on the alternate would
+    // duplicate it. The tool event has no `text` leaf; it must still
+    // count as produced output.
+    let mut primary = cli_spec(
+        "tooling",
+        "sh",
+        &[
+            "-c",
+            "exec 0<&-; \
+             echo '{\"type\":\"assistant\",\"session_id\":\"sess-1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}'; \
+             exit 7",
+        ],
+        PromptChannel::Stdin,
+    );
+    let LaneSpec::Cli(lane) = &mut primary.lane else {
+        panic!("cli_spec builds a cli lane")
+    };
+    lane.json_lines = true;
+    lane.session_id_path = Some("session_id".to_owned());
+    let registry = registry_with_lanes(
+        primary,
+        cli_spec("alive", "echo", &["alt|{prompt}"], PromptChannel::ArgOnly),
+        ProfilePatch {
+            agent: Some("tooling".to_owned()),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.stop_reason, "error");
+    assert!(
+        !outcome.text.contains("alt|"),
+        "alternate must not replay a turn whose tool activity reached the caller: {outcome:?}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn cli_quota_refusal_advances_the_model_chain() {
     // A stderr-only quota refusal is a certain-effect admission
     // rejection: nothing ran, so the turn retries the chain's next entry
@@ -14679,6 +14729,75 @@ async fn rpc_prompt_refusal_walks_the_untried_candidate_to_the_alternate() {
             "c/prompt|backup",
         ],
         "an untried candidate must follow the walk to a carrying lane: \
+         {calls_log}"
+    );
+    session.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_refused_driver_pick_never_heads_the_alternate() {
+    // The provider-only primary binds `vendor/prime` and can carry the
+    // qualified candidates on its prompt too: `vendor/prime` refused,
+    // the retry sends `vendor2/next` on the same session — refused as
+    // well — while unqualified `backup` waits held out of the lane's
+    // walk, never sent. The walk to the alternate must drop every
+    // refused entry: the still-held `vendor2/next` must not head the
+    // replacement's open and prompt while `backup` stays untried.
+    let dir = TestDirectory::new("rpc-refused-pick-fallback");
+    let refusing = dir.path().join("rpc_refusing.py");
+    std::fs::write(&refusing, RPC_PROVIDER_OPEN_ACCEPTS_PROMPTS_REFUSE_THEN_DIE).unwrap();
+    let log = dir.path().join("calls.log");
+    let mut primary = rpc_spec(
+        "provideronly",
+        &refusing,
+        json!({"provider": "{modelProvider}"}),
+        json!({"provider": "{modelProvider}", "text": "{prompt}"}),
+    );
+    attach_call_log(&mut primary, &log);
+    let serving = dir.path().join("rpc_serving.py");
+    std::fs::write(&serving, RPC_MODEL_OPEN_ACCEPTS_ALL_PROMPT_ECHOES).unwrap();
+    let mut alternate = rpc_spec(
+        "carrying",
+        &serving,
+        json!({"model": "{model}"}),
+        json!({"text": "{prompt}", "model": "{model}"}),
+    );
+    attach_call_log(&mut alternate, &log);
+    let registry = registry_with_lanes(
+        primary,
+        alternate,
+        ProfilePatch {
+            agent: Some("provideronly".to_owned()),
+            model: Some("vendor/prime".to_owned()),
+            models: Some(vec!["backup".to_owned(), "vendor2/next".to_owned()]),
+            ..Default::default()
+        },
+    );
+    let agent = registry.resolve("p").unwrap();
+    let (tx, _rx) = events();
+    let session = agent
+        .open_session(SessionRequest::default(), tx)
+        .await
+        .unwrap();
+
+    // Both qualified entries refused on the primary; the untried
+    // `backup` — not the just-refused `vendor2/next` — is what the
+    // alternate binds and serves.
+    let outcome = session.prompt("work".to_owned()).await.unwrap();
+    assert_eq!(outcome.text.trim_end(), "served|backup|work");
+    assert_eq!(session.active_model().as_deref(), Some("backup"));
+    let calls_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls_log.lines().collect::<Vec<_>>(),
+        vec![
+            "a/open|vendor",
+            "a/prompt|vendor",
+            "a/prompt|vendor2",
+            "c/open|backup",
+            "c/prompt|backup",
+        ],
+        "a refused model must never head the alternate's projection: \
          {calls_log}"
     );
     session.close().await.unwrap();

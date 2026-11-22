@@ -2785,7 +2785,9 @@ fn normalized_billable(usage: &serde_json::Value) -> bool {
 /// Whether a raw stream record carries progress text — a non-empty
 /// string at the conventional carriers (`text`, `content`, `delta`,
 /// `message`, `result`, `item.text`, `message.content`,
-/// `message.text`), where a block array counts by its `text` leaves.
+/// `message.text`), where a block array counts by its `text` leaves and
+/// by any non-`text` block it holds: a tool call, a tool result or a
+/// thinking block is activity of its own whether or not it emits text.
 /// A record with no progress claim is bookkeeping-only when a usage
 /// document is its only payload.
 fn record_progress(record: &serde_json::Value) -> bool {
@@ -2797,6 +2799,10 @@ fn record_progress(record: &serde_json::Value) -> bool {
                     .get("text")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|text| !text.trim().is_empty())
+                    || block
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| kind != "text")
             }),
             _ => false,
         }
@@ -3635,6 +3641,25 @@ fn turn_refusal_binds_model(error: &a4aa::AdapterError, probe: &DispatchProbe) -
     }
 }
 
+/// The chain entry the peer could actually refuse: the candidate the
+/// refused turn call carried on the wire, or — for a model-free call —
+/// the session model a setup call bound. A refusal from a lane whose
+/// wire never carried a model answers no chain entry: masked slots and
+/// absent resolutions are scaffolding, not a model the peer saw.
+fn refused_model(
+    request: &TurnRequest,
+    open: &SessionRequest,
+    probe: &DispatchProbe,
+) -> Option<String> {
+    if probe.prompt_model_sent() || probe.turn_model_sent() {
+        request.model.clone().or_else(|| open.config.model.clone())
+    } else if probe.model_setup_sent() {
+        open.config.model.clone()
+    } else {
+        None
+    }
+}
+
 /// Whether a params template consumes one named `{placeholder}` anywhere
 /// in its tree — the same check the lane's own selector discovery runs.
 fn contains_placeholder(template: &serde_json::Value, name: &str) -> bool {
@@ -3867,6 +3892,15 @@ impl VirtualSession {
             // They return to the chain when the lane changes or the
             // turn ends.
             let mut held_unsent: Vec<String> = Vec::new();
+            // Every chain entry a refusal answered this turn, in refusal
+            // order. The retry arm spends the entry it advances past by
+            // scheduling the next one, but the chain itself keeps no
+            // record — so each refusal is journaled here and the
+            // lane-fallback arm spends them all: a still-held refused
+            // entry — the turn-local driver selection above all — would
+            // otherwise ride the lane switch and re-open the alternate
+            // on a model the peer already refused.
+            let mut refused_models: Vec<String> = Vec::new();
             // This turn ends on a re-established session whose stored
             // default is cleared of the refused pending candidate —
             // nothing replays on it; the refusal still answers the turn.
@@ -4372,6 +4406,16 @@ impl VirtualSession {
                                 && !billed
                                 && turn_refusal_binds_model(error, &probe) =>
                         {
+                            // Journal the refused entry before advancing:
+                            // the lane-fallback arm spends this turn's
+                            // whole refusal record, not only the last
+                            // attempt's.
+                            if let Some(refused) = refused_model(&request, &installed_open, &probe)
+                            {
+                                if !refused_models.iter().any(|entry| entry == &refused) {
+                                    refused_models.push(refused);
+                                }
+                            }
                             let mut chain = model_state
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
@@ -4595,24 +4639,16 @@ impl VirtualSession {
                         Err(error)
                             if model_failure(error) && turn_refusal_binds_model(error, &probe) =>
                         {
-                            // The entry the peer could actually refuse:
-                            // the candidate the refused turn call carried
-                            // on the wire, or — for a model-free call —
-                            // the session model a setup call bound. A
-                            // refusal from a lane whose wire never
-                            // carried a model answers no chain entry:
-                            // masked slots and absent resolutions are
-                            // scaffolding, not a model the peer saw.
-                            let refused = if probe.prompt_model_sent() || probe.turn_model_sent() {
-                                request
-                                    .model
-                                    .clone()
-                                    .or_else(|| installed_open.config.model.clone())
-                            } else if probe.model_setup_sent() {
-                                installed_open.config.model.clone()
-                            } else {
-                                None
-                            };
+                            // The entry the peer could actually refuse
+                            // joins this turn's refusal record — the
+                            // earlier attempts' refusals journaled in the
+                            // retry arm are spent alongside it.
+                            if let Some(refused) = refused_model(&request, &installed_open, &probe)
+                            {
+                                if !refused_models.iter().any(|entry| entry == &refused) {
+                                    refused_models.push(refused);
+                                }
+                            }
                             // The chain is only exhausted once every
                             // entry was tried: candidates this lane could
                             // deliver nowhere — still queued behind its
@@ -4620,38 +4656,65 @@ impl VirtualSession {
                             // on the shared claim — were never refused,
                             // so a later lane's slots may still carry
                             // them and the refusal stands only as this
-                            // lane's answer. Billable evidence stays
-                            // decisive: a possibly paid turn never
-                            // replays.
+                            // lane's answer. An entry a refusal spent —
+                            // wherever the chain still holds it — is not
+                            // untried. Billable evidence stays decisive:
+                            // a possibly paid turn never replays.
+                            let refused_entry = |held: &Option<String>| {
+                                held.as_ref().is_some_and(|entry| {
+                                    refused_models.iter().any(|refused| refused == entry)
+                                })
+                            };
                             let untried = !held_unsent.is_empty() || {
                                 let chain = model_state
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner());
                                 !chain.remaining.is_empty()
-                                    || (chain.active.is_some() && chain.active != refused)
+                                    || (chain.active.is_some() && !refused_entry(&chain.active))
                                     || (record_instructions
                                         && chain.pending.is_some()
-                                        && chain.pending != refused)
+                                        && !refused_entry(&chain.pending))
                             };
                             if emitted_billable || probe.wire_billable() || !untried {
                                 break 'lanes outcome;
                             }
-                            // The refused entry is spent wherever the
+                            // Every refused entry is spent wherever the
                             // chain holds it — the same rule a refused
                             // open applies. Left `active`, the walk's
                             // untried pick could never run and the next
-                            // lane would re-open on the model the peer
-                            // just refused; left pending, the claim would
-                            // keep a refused entry queued.
+                            // lane would re-open on a model the peer just
+                            // refused; left pending, the claim would keep
+                            // a refused entry queued.
                             {
                                 let mut chain = model_state
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner());
-                                if chain.active == refused {
+                                if refused_entry(&chain.active) {
                                     chain.active = None;
                                 }
-                                if chain.pending == refused {
+                                if refused_entry(&chain.pending) {
                                     chain.pending = None;
+                                }
+                            }
+                            // The stored turn default is spent with them:
+                            // left holding a refused entry, the next
+                            // implicit prompt would resend it.
+                            {
+                                let mut default = turn_model_default
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                if refused_entry(&default) {
+                                    *default = None;
+                                }
+                            }
+                            // The turn-local driver selection is spent
+                            // too: a scheduled candidate the peer refused
+                            // must not ride the lane switch into the
+                            // alternate's projection ahead of the untried
+                            // chain.
+                            for slot in [&mut pending_bind, &mut driver_model, &mut pending_model] {
+                                if refused_entry(slot) {
+                                    *slot = None;
                                 }
                             }
                             true
@@ -5915,6 +5978,7 @@ mod tests {
                     result_selector: Some("result".to_owned()),
                     result_path: Some("result".to_owned()),
                     usage_path: Some("stats.tokens".to_owned()),
+                    session_id_path: Some("session_id".to_owned()),
                     ..Default::default()
                 })),
                 command: a4aa::CommandSpec {
@@ -5932,6 +5996,7 @@ mod tests {
             serde_json::json!({"type":"usage","stats":{"tokens":{"inputTokens":0,"outputTokens":0}}}),
             serde_json::json!({"type":"result","result":""}),
             serde_json::json!({"type":"result","result":"","usage":{"inputTokens":0,"outputTokens":0}}),
+            serde_json::json!({"type":"system","subtype":"init","session_id":"sess-1"}),
         ] {
             assert!(
                 probe.bookkeeping_raw(&record),
@@ -5942,6 +6007,9 @@ mod tests {
             serde_json::json!({"type":"assistant","message":{"content":"real work","usage":{"inputTokens":0,"outputTokens":0}}}),
             serde_json::json!({"type":"result","result":"real work","usage":{"inputTokens":0,"outputTokens":0}}),
             serde_json::json!({"type":"progress","message":"working"}),
+            // The session binding does not launder real activity: a
+            // textless tool call is still work the caller saw.
+            serde_json::json!({"type":"assistant","session_id":"sess-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}),
         ] {
             assert!(!probe.bookkeeping_raw(&record), "progress record: {record}");
         }
